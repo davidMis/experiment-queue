@@ -6,10 +6,12 @@
 from __future__ import annotations
 
 import argparse
+import codecs
 import json
 import os
 import platform
 import re
+import select
 import shlex
 import shutil
 import socket
@@ -44,6 +46,7 @@ class ExperimentRequest:
     remote: str | None = None
     local_output_root: Path | None = None
     cwd: Path = field(default_factory=Path.cwd)
+    use_pty: bool = False
 
 
 @dataclass(frozen=True)
@@ -134,6 +137,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--pty",
+        action="store_true",
+        help=(
+            "Run the child command in a pseudo-terminal so nested progress bars "
+            "and other TTY-aware output render interactively. stdout and stderr "
+            "are merged into stdout.log in this mode."
+        ),
+    )
+    parser.add_argument(
         "command",
         nargs=argparse.REMAINDER,
         help=(
@@ -168,6 +180,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         remote=args.remote,
         local_output_root=args.local_output_root,
         cwd=Path.cwd(),
+        use_pty=args.pty,
     )
 
     try:
@@ -253,7 +266,13 @@ def run_experiment(request: ExperimentRequest) -> ExperimentResult:
 
     started = time.monotonic()
     try:
-        return_code = launch_and_stream(request.command, cwd, run_dir, run_id)
+        return_code = launch_and_stream(
+            request.command,
+            cwd,
+            run_dir,
+            run_id,
+            use_pty=request.use_pty,
+        )
         if return_code == 0:
             status = "succeeded"
         elif return_code == 130:
@@ -314,6 +333,7 @@ def build_manifest(
         "command": {
             "argv": list(request.command),
             "shell": False,
+            "pty": bool(request.use_pty),
         },
         "paths": {
             "cwd": str(cwd),
@@ -342,8 +362,18 @@ def build_manifest(
     }
 
 
-def launch_and_stream(command: Sequence[str], cwd: Path, run_dir: Path, run_id: str) -> int:
+def launch_and_stream(
+    command: Sequence[str],
+    cwd: Path,
+    run_dir: Path,
+    run_id: str,
+    *,
+    use_pty: bool = False,
+) -> int:
     """Launch a child command and tee stdout/stderr into run log files."""
+
+    if use_pty:
+        return _launch_and_stream_pty(command, cwd, run_dir, run_id)
 
     env = os.environ.copy()
     env["EXPERIMENT_RUN_ID"] = run_id
@@ -387,6 +417,111 @@ def launch_and_stream(command: Sequence[str], cwd: Path, run_dir: Path, run_id: 
         stdout_thread.join()
         stderr_thread.join()
         return return_code
+
+
+def _launch_and_stream_pty(command: Sequence[str], cwd: Path, run_dir: Path, run_id: str) -> int:
+    """Launch a child command under a PTY and tee combined output."""
+
+    if os.name == "nt":
+        raise OSError("PTY mode is not supported on Windows")
+
+    import pty
+
+    env = os.environ.copy()
+    env["EXPERIMENT_RUN_ID"] = run_id
+    env["EXPERIMENT_OUTPUT_DIR"] = str(run_dir)
+
+    stdout_log = run_dir / "stdout.log"
+    stderr_log = run_dir / "stderr.log"
+    stderr_log.write_text(
+        "PTY mode merges child stdout and stderr into stdout.log.\n",
+        encoding="utf-8",
+    )
+
+    master_fd, slave_fd = pty.openpty()
+    _configure_pty_window_size(slave_fd)
+    process = None
+    try:
+        process = subprocess.Popen(
+            list(command),
+            cwd=cwd,
+            env=env,
+            stdin=slave_fd,
+            stdout=slave_fd,
+            stderr=slave_fd,
+            close_fds=True,
+        )
+        os.close(slave_fd)
+        slave_fd = -1
+        decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        with stdout_log.open("w", encoding="utf-8") as log_file:
+            while True:
+                if process.poll() is not None:
+                    ready, _, _ = select.select([master_fd], [], [], 0)
+                    if not ready:
+                        break
+                else:
+                    ready, _, _ = select.select([master_fd], [], [], 0.1)
+                    if not ready:
+                        continue
+                try:
+                    chunk = os.read(master_fd, 4096)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                text = decoder.decode(chunk)
+                if text:
+                    log_file.write(text)
+                    log_file.flush()
+                    sys.stdout.write(text)
+                    sys.stdout.flush()
+            tail = decoder.decode(b"", final=True)
+            if tail:
+                log_file.write(tail)
+                log_file.flush()
+                sys.stdout.write(tail)
+                sys.stdout.flush()
+        try:
+            return_code = process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            return_code = process.wait()
+        return return_code
+    except KeyboardInterrupt:
+        if process is not None:
+            process.terminate()
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+        return 130
+    finally:
+        if slave_fd != -1:
+            os.close(slave_fd)
+        os.close(master_fd)
+
+
+def _configure_pty_window_size(slave_fd: int) -> None:
+    """Give the child PTY a useful size for progress-bar rendering."""
+
+    try:
+        terminal_size = os.get_terminal_size(sys.stdout.fileno())
+        rows = terminal_size.lines
+        columns = terminal_size.columns
+    except (AttributeError, OSError, ValueError):
+        rows = 40
+        columns = 120
+
+    try:
+        import fcntl
+        import struct
+        import termios
+
+        packed_size = struct.pack("HHHH", rows, columns, 0, 0)
+        fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, packed_size)
+    except OSError:
+        return
 
 
 def collect_git_context(cwd: Path) -> dict[str, Any]:

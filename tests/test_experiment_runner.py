@@ -7,6 +7,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -116,6 +117,41 @@ class ExperimentRunnerTests(unittest.TestCase):
                 run_experiment(request)
 
             self.assertFalse((root / "outputs").exists())
+
+    @unittest.skipIf(os.name == "nt", "PTY support is POSIX-only")
+    def test_run_experiment_pty_gives_child_tty_and_records_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            request = ExperimentRequest(
+                name="PTY Progress",
+                command=[
+                    sys.executable,
+                    "-c",
+                    (
+                        "import sys; "
+                        "print('stdout_isatty=' + str(sys.stdout.isatty())); "
+                        "print('stderr_isatty=' + str(sys.stderr.isatty()), file=sys.stderr)"
+                    ),
+                ],
+                output_root=root / "outputs",
+                cwd=root,
+                use_pty=True,
+            )
+
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(
+                io.StringIO()
+            ):
+                result = run_experiment(request)
+
+            self.assertEqual(result.return_code, 0)
+            stdout = (result.run_dir / "stdout.log").read_text(encoding="utf-8")
+            stderr = (result.run_dir / "stderr.log").read_text(encoding="utf-8")
+            self.assertIn("stdout_isatty=True", stdout)
+            self.assertIn("stderr_isatty=True", stdout)
+            self.assertIn("PTY mode merges child stdout and stderr", stderr)
+
+            manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+            self.assertTrue(manifest["command"]["pty"])
 
 
 if __name__ == "__main__":

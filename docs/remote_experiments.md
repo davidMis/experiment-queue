@@ -64,6 +64,28 @@ python scripts/run_experiment.py \
 For training, evaluation, or data generation, replace the command after `--`
 with the exact project command and flags from `README.md`.
 
+## Nested Progress Bars
+
+Use `--pty` when the child command has TTY-aware progress output, such as a
+top-level `tqdm` bar plus per-worker bars:
+
+```sh
+python scripts/run_experiment.py \
+  --pty \
+  --name paired-shard-smoke \
+  --remote mutton2 \
+  -- python scripts/run_paired_resolution_shards_parallel.py \
+    --dataset-prefix pub_s05_pair_smoke \
+    --num-shards 2 \
+    --samples-per-shard 1
+```
+
+PTY mode makes the child process see a real terminal, so progress libraries can
+render nested bars while the runner still records provenance. In this mode the
+child command's stdout and stderr are merged into `stdout.log`, and
+`stderr.log` contains a short note about the merge. Omit `--pty` for commands
+where plain line-oriented logs are preferable.
+
 ## Run Directory Contents
 
 Each run creates a directory under `outputs/experiments/` with a name like:
