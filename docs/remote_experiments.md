@@ -66,12 +66,11 @@ with the exact project command and flags from `README.md`.
 
 ## Nested Progress Bars
 
-Use `--pty` when the child command has TTY-aware progress output, such as a
-top-level `tqdm` bar plus per-worker bars:
+The runner uses PTY mode by default so child commands can render TTY-aware
+progress output, such as a top-level `tqdm` bar plus per-worker bars:
 
 ```sh
 python scripts/run_experiment.py \
-  --pty \
   --name paired-shard-smoke \
   --remote mutton2 \
   -- python scripts/run_paired_resolution_shards_parallel.py \
@@ -83,8 +82,8 @@ python scripts/run_experiment.py \
 PTY mode makes the child process see a real terminal, so progress libraries can
 render nested bars while the runner still records provenance. In this mode the
 child command's stdout and stderr are merged into `stdout.log`, and
-`stderr.log` contains a short note about the merge. Omit `--pty` for commands
-where plain line-oriented logs are preferable.
+`stderr.log` contains a short note about the merge. Use `--no-pty` when plain
+line-oriented logs or separate stdout/stderr files are preferable.
 
 ## Run Directory Contents
 

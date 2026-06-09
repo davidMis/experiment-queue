@@ -19,8 +19,10 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from helmholtz_shared.experiment_runner import (  # noqa: E402
+    DEFAULT_USE_PTY,
     ExperimentError,
     ExperimentRequest,
+    build_arg_parser,
     run_experiment,
     slugify,
 )
@@ -81,6 +83,7 @@ class ExperimentRunnerTests(unittest.TestCase):
             self.assertEqual(manifest["run"]["status"], "succeeded")
             self.assertEqual(manifest["run"]["return_code"], 0)
             self.assertEqual(manifest["run"]["notes"], "unit test smoke run")
+            self.assertEqual(manifest["command"]["pty"], DEFAULT_USE_PTY)
             self.assertEqual(manifest["configs"][0]["copy"], "configs/config.yaml")
             self.assertFalse(manifest["git"]["available"])
             self.assertIn("mutton2:", manifest["sync"]["rsync_pull_command"])
@@ -152,6 +155,47 @@ class ExperimentRunnerTests(unittest.TestCase):
 
             manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
             self.assertTrue(manifest["command"]["pty"])
+
+    def test_no_pty_keeps_stdout_and_stderr_separate(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            request = ExperimentRequest(
+                name="No PTY",
+                command=[
+                    sys.executable,
+                    "-c",
+                    "import sys; print('out'); print('err', file=sys.stderr)",
+                ],
+                output_root=root / "outputs",
+                cwd=root,
+                use_pty=False,
+            )
+
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(
+                io.StringIO()
+            ):
+                result = run_experiment(request)
+
+            self.assertEqual(result.return_code, 0)
+            stdout = (result.run_dir / "stdout.log").read_text(encoding="utf-8")
+            stderr = (result.run_dir / "stderr.log").read_text(encoding="utf-8")
+            self.assertIn("out", stdout)
+            self.assertNotIn("err", stdout)
+            self.assertIn("err", stderr)
+
+            manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+            self.assertFalse(manifest["command"]["pty"])
+
+    def test_cli_pty_defaults_can_be_disabled(self) -> None:
+        parser = build_arg_parser()
+
+        default_args = parser.parse_args(["--", sys.executable, "-c", "print('x')"])
+        self.assertEqual(default_args.use_pty, DEFAULT_USE_PTY)
+
+        no_pty_args = parser.parse_args(
+            ["--no-pty", "--", sys.executable, "-c", "print('x')"]
+        )
+        self.assertFalse(no_pty_args.use_pty)
 
 
 if __name__ == "__main__":

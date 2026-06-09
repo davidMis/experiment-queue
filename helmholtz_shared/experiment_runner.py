@@ -27,6 +27,7 @@ from typing import IO, Any, Iterable, Sequence
 
 DEFAULT_OUTPUT_ROOT = Path("outputs/experiments")
 MANIFEST_NAME = "manifest.json"
+DEFAULT_USE_PTY = True
 
 
 class ExperimentError(RuntimeError):
@@ -46,7 +47,7 @@ class ExperimentRequest:
     remote: str | None = None
     local_output_root: Path | None = None
     cwd: Path = field(default_factory=Path.cwd)
-    use_pty: bool = False
+    use_pty: bool = DEFAULT_USE_PTY
 
 
 @dataclass(frozen=True)
@@ -136,13 +137,26 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "to print concise, actionable error messages."
         ),
     )
-    parser.add_argument(
+    progress_group = parser.add_mutually_exclusive_group()
+    progress_group.add_argument(
         "--pty",
+        dest="use_pty",
         action="store_true",
+        default=DEFAULT_USE_PTY,
         help=(
             "Run the child command in a pseudo-terminal so nested progress bars "
-            "and other TTY-aware output render interactively. stdout and stderr "
-            "are merged into stdout.log in this mode."
+            "and other TTY-aware output render interactively. This is the "
+            "default. stdout and stderr are merged into stdout.log in this mode."
+        ),
+    )
+    progress_group.add_argument(
+        "--no-pty",
+        dest="use_pty",
+        action="store_false",
+        help=(
+            "Run the child command with separate stdout/stderr pipes instead "
+            "of a pseudo-terminal. Use this for plain line-oriented logs or "
+            "when stderr separation matters."
         ),
     )
     parser.add_argument(
@@ -180,7 +194,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         remote=args.remote,
         local_output_root=args.local_output_root,
         cwd=Path.cwd(),
-        use_pty=args.pty,
+        use_pty=args.use_pty,
     )
 
     try:
