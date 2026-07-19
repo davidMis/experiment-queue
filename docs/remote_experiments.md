@@ -64,6 +64,46 @@ python scripts/run_experiment.py \
 For training, evaluation, or data generation, replace the command after `--`
 with the exact project command and flags from `README.md`.
 
+## Invariant Flowers Gate 3 Benchmark
+
+After committing the locally verified invariant model and updating the clean
+remote checkout, the first GPU characterization is the production-width
+`96^3` direct-decoder reference case:
+
+```sh
+cd ~/3D_Helmholtz
+CUDA_VISIBLE_DEVICES=0 .venv/bin/python scripts/run_experiment.py \
+  --name invariant-flowers-phase3-base96-direct \
+  --require-clean \
+  --remote mutton2 \
+  --notes "Gate 3 production-width 96^3 direct-decoder compile, timing, and memory baseline." \
+  -- .venv/bin/python scripts/benchmark_invariant_flowers.py \
+    --preset base \
+    --volume-shape 96 96 96 \
+    --output-shape 96 96 \
+    --core-grid-sizes 48 24 12 \
+    --native-width 160 \
+    --core-widths 320 640 1280 \
+    --integration-shape 96 96 \
+    --basis-p 64 \
+    --decoder surface_moment \
+    --batch-size 1 \
+    --frequency-count 76 \
+    --frequency-max-hz 15 \
+    --benchmarks forward train \
+    --warmup 1 \
+    --iterations 3 \
+    --seed 0
+```
+
+The child writes `invariant_benchmark.json` into the runner-owned experiment
+directory. The runner also retains `stdout.log`, the exact command, git/host
+metadata, device-visible output, and the `rsync` pull command. Inspect this
+first result before launching larger native grids: the production-width full
+native path is intentionally expected to become memory-limited, and Gate 3
+selects the next light-width/rematerialized case from measured headroom rather
+than guessing a safe `512^3` configuration.
+
 ## Nested Progress Bars
 
 The runner uses PTY mode by default so child commands can render TTY-aware
