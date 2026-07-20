@@ -64,7 +64,15 @@ python scripts/run_experiment.py \
 For training, evaluation, or data generation, replace the command after `--`
 with the exact project command and flags from `README.md`.
 
-## Invariant Flowers Gate 3 Benchmark
+## Invariant Flowers Gate 3 Benchmark (Paused)
+
+This experiment sequence is paused as of 2026-07-20. The commands and results
+below are retained for exact provenance; they are not an active run queue and
+should not be repeated on commit `ec74237f`. The restart point is a local
+decoder-boundary refactor described in
+`notes/2026_07_19_discretization_invariant_unet_flowers_plan.md`, followed by a
+new clean-commit `128^3` width-64 comparison. Do not attempt `256^3` before
+that comparison establishes substantial memory headroom.
 
 After committing the locally verified invariant model and updating the clean
 remote checkout, the first GPU characterization is the production-width
@@ -103,6 +111,155 @@ first result before launching larger native grids: the production-width full
 native path is intentionally expected to become memory-limited, and Gate 3
 selects the next light-width/rematerialized case from measured headroom rather
 than guessing a safe `512^3` configuration.
+
+The first result peaked at `49.06 GiB` during training. The matched native-
+block-rematerialization case was run next; forward was omitted because
+rematerialization only changes backward activation storage:
+
+```sh
+cd ~/3D_Helmholtz
+CUDA_VISIBLE_DEVICES=0 .venv/bin/python scripts/run_experiment.py \
+  --name invariant-flowers-phase3-base96-direct-remat \
+  --require-clean \
+  --remote mutton2 \
+  --notes "Gate 3 matched 96^3 native-rematerialization training memory and timing comparison." \
+  -- .venv/bin/python scripts/benchmark_invariant_flowers.py \
+    --preset base \
+    --volume-shape 96 96 96 \
+    --output-shape 96 96 \
+    --core-grid-sizes 48 24 12 \
+    --native-width 160 \
+    --core-widths 320 640 1280 \
+    --integration-shape 96 96 \
+    --basis-p 64 \
+    --decoder surface_moment \
+    --rematerialize-native-blocks \
+    --batch-size 1 \
+    --frequency-count 76 \
+    --frequency-max-hz 15 \
+    --benchmarks train \
+    --warmup 1 \
+    --iterations 3 \
+    --seed 0
+```
+
+The matched rematerialized result saved `6.68 GiB` at a `12.5%` training-time
+penalty. Native width was then isolated while retaining the same core and
+rematerialization settings:
+
+```sh
+cd ~/3D_Helmholtz
+CUDA_VISIBLE_DEVICES=0 .venv/bin/python scripts/run_experiment.py \
+  --name invariant-flowers-phase3-base96-native64-remat \
+  --require-clean \
+  --remote mutton2 \
+  --notes "Gate 3 matched 96^3 light-native-width 64 rematerialized training benchmark." \
+  -- .venv/bin/python scripts/benchmark_invariant_flowers.py \
+    --preset base \
+    --volume-shape 96 96 96 \
+    --output-shape 96 96 \
+    --core-grid-sizes 48 24 12 \
+    --native-width 64 \
+    --core-widths 320 640 1280 \
+    --integration-shape 96 96 \
+    --basis-p 64 \
+    --decoder surface_moment \
+    --rematerialize-native-blocks \
+    --batch-size 1 \
+    --frequency-count 76 \
+    --frequency-max-hz 15 \
+    --benchmarks train \
+    --warmup 1 \
+    --iterations 3 \
+    --seed 0
+```
+
+The width-64 run completed at `39.86 GiB` and `0.2264 s/step`. Relative to the
+matched rematerialized width-160 run, this saves `2.53 GiB` (`6.0%`) and raises
+throughput by `54.0%`. The native-width sensitivity is smaller than the raw
+feature-volume ratio, which indicates that fixed-core/compiler workspace is a
+large part of the training arena. The run also logged failed attempts to
+preallocate `71.24` and `64.11 GiB` before falling back to a `57.70 GiB` pool;
+make sure the GPU is otherwise idle before using the next result as a memory
+gate.
+
+The first `128^3` feasibility run therefore kept width `64`, the `48/24/12`
+core, direct decoder, and native-block rematerialization. It included both
+forward and training measurements because it was the first benchmark at the
+new native shape:
+
+```sh
+cd ~/3D_Helmholtz
+CUDA_VISIBLE_DEVICES=0 .venv/bin/python scripts/run_experiment.py \
+  --name invariant-flowers-phase3-base128-native64-remat \
+  --require-clean \
+  --remote mutton2 \
+  --notes "Gate 3 first 128^3 light-native-width 64 rematerialized forward/training feasibility benchmark; run on an otherwise idle GPU." \
+  -- .venv/bin/python scripts/benchmark_invariant_flowers.py \
+    --preset base \
+    --volume-shape 128 128 128 \
+    --output-shape 128 128 \
+    --core-grid-sizes 48 24 12 \
+    --native-width 64 \
+    --core-widths 320 640 1280 \
+    --integration-shape 96 96 \
+    --basis-p 64 \
+    --decoder surface_moment \
+    --rematerialize-native-blocks \
+    --batch-size 1 \
+    --frequency-count 76 \
+    --frequency-max-hz 15 \
+    --benchmarks forward train \
+    --warmup 1 \
+    --iterations 3 \
+    --seed 0
+```
+
+The synced `128^3` peak, allocator pool, and largest allocation were inspected
+before selecting another case; no direct `256^3` extrapolation was used.
+
+The width-64 `128^3` run succeeded but peaked at `67.33 GiB` of a clean
+`71.24 GiB` pool, leaving only `3.91 GiB` (`5.5%`) headroom. This ruled out a
+`256^3` attempt on the same design. Native-width sensitivity was isolated at
+`128^3` with width `32`, which is valid with the configured eight native heads:
+
+```sh
+cd ~/3D_Helmholtz
+CUDA_VISIBLE_DEVICES=0 .venv/bin/python scripts/run_experiment.py \
+  --name invariant-flowers-phase3-base128-native32-remat \
+  --require-clean \
+  --remote mutton2 \
+  --notes "Gate 3 matched 128^3 native-width 32 rematerialized forward/training memory-margin benchmark; run on an otherwise idle GPU." \
+  -- .venv/bin/python scripts/benchmark_invariant_flowers.py \
+    --preset base \
+    --volume-shape 128 128 128 \
+    --output-shape 128 128 \
+    --core-grid-sizes 48 24 12 \
+    --native-width 32 \
+    --core-widths 320 640 1280 \
+    --integration-shape 96 96 \
+    --basis-p 64 \
+    --decoder surface_moment \
+    --rematerialize-native-blocks \
+    --batch-size 1 \
+    --frequency-count 76 \
+    --frequency-max-hz 15 \
+    --benchmarks forward train \
+    --warmup 1 \
+    --iterations 3 \
+    --seed 0
+```
+
+The synced report was inspected before selecting an architecture change or any
+higher-resolution run.
+
+The matched width-32 result peaked at `67.60 GiB`, effectively unchanged from
+width 64. Do not run another remote width or resolution case on this commit.
+The decoder currently expands width-`320` K0 features to the native grid before
+projecting to native width; that wide intermediate, rather than native width,
+must be removed locally first. After the projection/prolongation boundary is
+refactored and locally verified, commit the change and add a new clean-commit
+`128^3` width-64 comparison command here.
 
 ## Nested Progress Bars
 
