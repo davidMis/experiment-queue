@@ -39,6 +39,15 @@ python scripts/run_experiment.py --help
 
 The runner records provenance for the command placed after `--`.
 
+## Mutton2 Manual-Execution Boundary
+
+The user is the sole operator of `mutton2`. Codex prepares and verifies code
+locally and provides copy-paste commands, but must not connect to, inspect,
+launch on, monitor, or synchronize with that machine. The user runs each stage
+below from the clean remote checkout and then runs the experiment runner's
+printed `pull outputs with:` command from the local workstation. Stop after
+every stage until its synced artifacts have been inspected.
+
 ## Example Remote Command
 
 Use `--require-clean` for expensive runs that must correspond exactly to a git
@@ -64,33 +73,118 @@ python scripts/run_experiment.py \
 For training, evaluation, or data generation, replace the command after `--`
 with the exact project command and flags from `README.md`.
 
-## Invariant Flowers Gate 3 Benchmark (Paused)
+## Cross-Flowers MVP Manual Run Queue
 
-This experiment sequence is paused as of 2026-07-20. The commands and results
-below are retained for exact provenance; they are not an active run queue and
-should not be repeated on commit `ec74237f`. The restart point is a local
-decoder-boundary refactor described in
-`notes/2026_07_19_discretization_invariant_unet_flowers_plan.md`, followed by a
-new clean-commit `128^3` width-64 comparison. Do not attempt `256^3` before
-that comparison establishes substantial memory headroom.
+This queue supersedes the paused learned-native-shell benchmark sequence. The
+active MVP endpoint-restricts the raw scalar wavespeed before the learned lift,
+uses a fixed `48^3/24^3/12^3` core, retains `P = 64` cosine modes, and evaluates
+all 76 bins on `0.0, 0.2, ..., 15.0 Hz`. `cross_flowers` is the primary
+surface-query decoder and `surface_moment` is its fixed-core control. There is
+no direct coefficient-query Cross decoder in this implementation.
 
-After committing the locally verified invariant model and updating the clean
-remote checkout, the first GPU characterization is the production-width
-`96^3` direct-decoder reference case:
+All commands below must be run manually by the user from `~/3D_Helmholtz` on
+`mutton2`, at the intended committed SHA with a clean worktree. Each runner
+copies `notes/2026_07_19_discretization_invariant_cross_flowers.tex` into the
+run directory as the recorded architecture contract.
+
+### Stage 1: Build the full resolution-balanced normalizer
+
+Fit one train-only `(76, 2)` RMS scale. The explicit probabilities give equal
+weight to resolution buckets, not to their unequal row counts. The script
+streams one response at a time, which is the safe setting for `512^2` surfaces.
+It is deterministic and therefore has no seed option.
 
 ```sh
 cd ~/3D_Helmholtz
-CUDA_VISIBLE_DEVICES=0 .venv/bin/python scripts/run_experiment.py \
-  --name invariant-flowers-phase3-base96-direct \
+.venv/bin/python scripts/run_experiment.py \
+  --name cross-flowers-normalizer-76 \
+  --config notes/2026_07_19_discretization_invariant_cross_flowers.tex \
   --require-clean \
   --remote mutton2 \
-  --notes "Gate 3 production-width 96^3 direct-decoder compile, timing, and memory baseline." \
+  --notes "Cross-Flowers train-only endpoint-quadrature RMS normalizer with equal 96/128/256/512 bucket weights." \
+  -- .venv/bin/python scripts/build_resolution_transfer_normalizer.py \
+    --manifest data/resolution_transfer/manifest.json \
+    --data-dir data \
+    --resolutions 96 128 256 512 \
+    --bucket-probability 96=0.25 \
+    --bucket-probability 128=0.25 \
+    --bucket-probability 256=0.25 \
+    --bucket-probability 512=0.25 \
+    --expected-frequency-count 76 \
+    --chunk-rows 1
+```
+
+The child writes
+`pressure_normalizer_resolution_balanced_76.npz` and its provenance sidecar
+`pressure_normalizer_resolution_balanced_76.json` at the top of the runner
+directory. Run the printed `pull outputs with:` command from the local
+workstation and verify the sidecar, SHA-256, bucket response counts, frequency
+grid, scale range, and `production_shard_metadata_validated = true` before
+continuing. Each bucket record must include a metadata SHA-256 for every train
+shard. On `mutton2`, set the path printed by
+the runner for use in later stages:
+
+```sh
+export CROSS_FLOWERS_NORMALIZER_RUN=outputs/experiments/<normalizer-run-id>
+export CROSS_FLOWERS_NORMALIZER="$CROSS_FLOWERS_NORMALIZER_RUN/pressure_normalizer_resolution_balanced_76.npz"
+test -f "$CROSS_FLOWERS_NORMALIZER"
+```
+
+Replace `<normalizer-run-id>` with the exact Stage 1 run-directory basename.
+The normalizer remains an input artifact in its runner directory; do not copy
+it into source-controlled model paths.
+
+### Stage 2: GPU benchmark Cross and the matched control
+
+First benchmark the primary Cross decoder at `96^3`. Run on an otherwise idle
+GPU so allocator statistics are interpretable.
+
+```sh
+cd ~/3D_Helmholtz
+CUDA_VISIBLE_DEVICES=0 XLA_PYTHON_CLIENT_PREALLOCATE=false \
+.venv/bin/python scripts/run_experiment.py \
+  --name cross-flowers-mvp-base96-benchmark \
+  --config notes/2026_07_19_discretization_invariant_cross_flowers.tex \
+  --require-clean \
+  --remote mutton2 \
+  --notes "Core-first Cross-Flowers 96^3 forward/train compile, timing, and memory gate." \
   -- .venv/bin/python scripts/benchmark_invariant_flowers.py \
     --preset base \
     --volume-shape 96 96 96 \
     --output-shape 96 96 \
     --core-grid-sizes 48 24 12 \
-    --native-width 160 \
+    --core-widths 320 640 1280 \
+    --integration-shape 96 96 \
+    --basis-p 64 \
+    --decoder cross_flowers \
+    --cross-query-chunk-size 1024 \
+    --cross-frequency-chunk-size 4 \
+    --batch-size 1 \
+    --frequency-count 76 \
+    --frequency-max-hz 15 \
+    --benchmarks forward train \
+    --warmup 1 \
+    --iterations 3 \
+    --seed 0
+```
+
+After syncing and inspecting its `invariant_benchmark.json`, run the matched
+fixed-core moment control. The only intended model-path change is the decoder.
+
+```sh
+cd ~/3D_Helmholtz
+CUDA_VISIBLE_DEVICES=0 XLA_PYTHON_CLIENT_PREALLOCATE=false \
+.venv/bin/python scripts/run_experiment.py \
+  --name cross-flowers-mvp-base96-surface-moment-benchmark \
+  --config notes/2026_07_19_discretization_invariant_cross_flowers.tex \
+  --require-clean \
+  --remote mutton2 \
+  --notes "Core-first 96^3 surface_moment control matched to the Cross-Flowers GPU benchmark." \
+  -- .venv/bin/python scripts/benchmark_invariant_flowers.py \
+    --preset base \
+    --volume-shape 96 96 96 \
+    --output-shape 96 96 \
+    --core-grid-sizes 48 24 12 \
     --core-widths 320 640 1280 \
     --integration-shape 96 96 \
     --basis-p 64 \
@@ -104,162 +198,150 @@ CUDA_VISIBLE_DEVICES=0 .venv/bin/python scripts/run_experiment.py \
     --seed 0
 ```
 
-The child writes `invariant_benchmark.json` into the runner-owned experiment
-directory. The runner also retains `stdout.log`, the exact command, git/host
-metadata, device-visible output, and the `rsync` pull command. Inspect this
-first result before launching larger native grids: the production-width full
-native path is intentionally expected to become memory-limited, and Gate 3
-selects the next light-width/rematerialized case from measured headroom rather
-than guessing a safe `512^3` configuration.
+Sync each run with its own runner-generated pull instruction. Do not start
+training unless both reports complete with
+`numerical_checks.all_requested_operations_finite = true`, no OOM, and
+acceptable measured GPU headroom for the primary Cross run. The report records
+finite output leaves plus the training loss, gradient norm, metrics, updated
+parameters, and optimizer state used by this gate.
 
-The first result peaked at `49.06 GiB` during training. The matched native-
-block-rematerialization case was run next; forward was omitted because
-rematerialization only changes backward activation storage:
+### Stage 3: Matched four-row overfit gate
 
-```sh
-cd ~/3D_Helmholtz
-CUDA_VISIBLE_DEVICES=0 .venv/bin/python scripts/run_experiment.py \
-  --name invariant-flowers-phase3-base96-direct-remat \
-  --require-clean \
-  --remote mutton2 \
-  --notes "Gate 3 matched 96^3 native-rematerialization training memory and timing comparison." \
-  -- .venv/bin/python scripts/benchmark_invariant_flowers.py \
-    --preset base \
-    --volume-shape 96 96 96 \
-    --output-shape 96 96 \
-    --core-grid-sizes 48 24 12 \
-    --native-width 160 \
-    --core-widths 320 640 1280 \
-    --integration-shape 96 96 \
-    --basis-p 64 \
-    --decoder surface_moment \
-    --rematerialize-native-blocks \
-    --batch-size 1 \
-    --frequency-count 76 \
-    --frequency-max-hz 15 \
-    --benchmarks train \
-    --warmup 1 \
-    --iterations 3 \
-    --seed 0
-```
+The allowed gate size is 1-8 rows; the first comparison uses four rows and 500
+optimizer steps. The trainer defaults to float32 and the approved frequency
+weights: DC `0`, `0.2-7.0 Hz` weight `1`, and `7.2-15.0 Hz` weight `0.1`.
 
-The matched rematerialized result saved `6.68 GiB` at a `12.5%` training-time
-penalty. Native width was then isolated while retaining the same core and
-rematerialization settings:
+Run the Cross model first:
 
 ```sh
 cd ~/3D_Helmholtz
-CUDA_VISIBLE_DEVICES=0 .venv/bin/python scripts/run_experiment.py \
-  --name invariant-flowers-phase3-base96-native64-remat \
+CUDA_VISIBLE_DEVICES=0 XLA_PYTHON_CLIENT_PREALLOCATE=false \
+.venv/bin/python scripts/run_experiment.py \
+  --name cross-flowers-mvp-r096-overfit4 \
+  --config notes/2026_07_19_discretization_invariant_cross_flowers.tex \
   --require-clean \
   --remote mutton2 \
-  --notes "Gate 3 matched 96^3 light-native-width 64 rematerialized training benchmark." \
-  -- .venv/bin/python scripts/benchmark_invariant_flowers.py \
+  --notes "Cross-Flowers r096 four-row/500-step memorization and optimization gate." \
+  -- .venv/bin/python scripts/train_invariant_flowers.py \
+    --train data/resolution_transfer/train/r096 \
+    --normalizer "$CROSS_FLOWERS_NORMALIZER" \
     --preset base \
-    --volume-shape 96 96 96 \
-    --output-shape 96 96 \
+    --decoder cross_flowers \
     --core-grid-sizes 48 24 12 \
-    --native-width 64 \
     --core-widths 320 640 1280 \
     --integration-shape 96 96 \
     --basis-p 64 \
-    --decoder surface_moment \
-    --rematerialize-native-blocks \
+    --cross-query-chunk-size 1024 \
+    --cross-frequency-chunk-size 4 \
     --batch-size 1 \
-    --frequency-count 76 \
-    --frequency-max-hz 15 \
-    --benchmarks train \
-    --warmup 1 \
-    --iterations 3 \
-    --seed 0
+    --overfit \
+    --max-train-rows 4 \
+    --steps 500 \
+    --seed 0 \
+    --log-every 10 \
+    --latest-every 100 \
+    --wandb \
+    --wandb-project Cross-Flowers \
+    --wandb-name cross-flowers-mvp-r096-overfit4 \
+    --wandb-group cross-flowers-mvp-r096-overfit \
+    --wandb-tags cross-flowers mvp r096 overfit
 ```
 
-The width-64 run completed at `39.86 GiB` and `0.2264 s/step`. Relative to the
-matched rematerialized width-160 run, this saves `2.53 GiB` (`6.0%`) and raises
-throughput by `54.0%`. The native-width sensitivity is smaller than the raw
-feature-volume ratio, which indicates that fixed-core/compiler workspace is a
-large part of the training arena. The run also logged failed attempts to
-preallocate `71.24` and `64.11 GiB` before falling back to a `57.70 GiB` pool;
-make sure the GPU is otherwise idle before using the next result as a memory
-gate.
-
-The first `128^3` feasibility run therefore kept width `64`, the `48/24/12`
-core, direct decoder, and native-block rematerialization. It included both
-forward and training measurements because it was the first benchmark at the
-new native shape:
+After syncing and inspecting it, run the same gate with the control:
 
 ```sh
 cd ~/3D_Helmholtz
-CUDA_VISIBLE_DEVICES=0 .venv/bin/python scripts/run_experiment.py \
-  --name invariant-flowers-phase3-base128-native64-remat \
+CUDA_VISIBLE_DEVICES=0 XLA_PYTHON_CLIENT_PREALLOCATE=false \
+.venv/bin/python scripts/run_experiment.py \
+  --name cross-flowers-mvp-r096-surface-moment-overfit4 \
+  --config notes/2026_07_19_discretization_invariant_cross_flowers.tex \
   --require-clean \
   --remote mutton2 \
-  --notes "Gate 3 first 128^3 light-native-width 64 rematerialized forward/training feasibility benchmark; run on an otherwise idle GPU." \
-  -- .venv/bin/python scripts/benchmark_invariant_flowers.py \
+  --notes "surface_moment r096 four-row/500-step control for the Cross-Flowers memorization gate." \
+  -- .venv/bin/python scripts/train_invariant_flowers.py \
+    --train data/resolution_transfer/train/r096 \
+    --normalizer "$CROSS_FLOWERS_NORMALIZER" \
     --preset base \
-    --volume-shape 128 128 128 \
-    --output-shape 128 128 \
+    --decoder surface_moment \
     --core-grid-sizes 48 24 12 \
-    --native-width 64 \
     --core-widths 320 640 1280 \
     --integration-shape 96 96 \
     --basis-p 64 \
-    --decoder surface_moment \
-    --rematerialize-native-blocks \
     --batch-size 1 \
-    --frequency-count 76 \
-    --frequency-max-hz 15 \
-    --benchmarks forward train \
-    --warmup 1 \
-    --iterations 3 \
-    --seed 0
+    --overfit \
+    --max-train-rows 4 \
+    --steps 500 \
+    --seed 0 \
+    --log-every 10 \
+    --latest-every 100 \
+    --wandb \
+    --wandb-project Cross-Flowers \
+    --wandb-name cross-flowers-mvp-r096-surface-moment-overfit4 \
+    --wandb-group cross-flowers-mvp-r096-overfit \
+    --wandb-tags surface-moment control mvp r096 overfit
 ```
 
-The synced `128^3` peak, allocator pool, and largest allocation were inspected
-before selecting another case; no direct `256^3` extrapolation was used.
+Each run writes `training/config.json`, `training/summary.json`, and
+`training/checkpoints/{best,latest}.msgpack` under its runner directory. Sync
+both runs. The gate passes only if losses and gradient norms remain finite,
+the Cross coefficient and reconstructed-surface errors decrease substantially,
+checkpoints can be read, and the Cross behavior is credible relative to the
+matched control. Stop to diagnose architecture, normalization, or optimization
+if those conditions fail.
 
-The width-64 `128^3` run succeeded but peaked at `67.33 GiB` of a clean
-`71.24 GiB` pool, leaving only `3.91 GiB` (`5.5%`) headroom. This ruled out a
-`256^3` attempt on the same design. Native-width sensitivity was isolated at
-`128^3` with width `32`, which is valid with the configured eight native heads:
+### Stage 4: First 2,000-step pilot
+
+Launch this full-r096 Cross pilot only after Stage 3 passes and its synced
+artifacts have been reviewed. It uses the complete r096 training bucket and
+same-resolution validation bucket; multi-resolution bucket mixing is a later
+stage.
 
 ```sh
 cd ~/3D_Helmholtz
-CUDA_VISIBLE_DEVICES=0 .venv/bin/python scripts/run_experiment.py \
-  --name invariant-flowers-phase3-base128-native32-remat \
+CUDA_VISIBLE_DEVICES=0 XLA_PYTHON_CLIENT_PREALLOCATE=false \
+.venv/bin/python scripts/run_experiment.py \
+  --name cross-flowers-mvp-r096-pilot2k \
+  --config notes/2026_07_19_discretization_invariant_cross_flowers.tex \
   --require-clean \
   --remote mutton2 \
-  --notes "Gate 3 matched 128^3 native-width 32 rematerialized forward/training memory-margin benchmark; run on an otherwise idle GPU." \
-  -- .venv/bin/python scripts/benchmark_invariant_flowers.py \
+  --notes "First gated Cross-Flowers r096 full-train/validation 2,000-step pilot." \
+  -- .venv/bin/python scripts/train_invariant_flowers.py \
+    --train data/resolution_transfer/train/r096 \
+    --val data/resolution_transfer/val/r096 \
+    --normalizer "$CROSS_FLOWERS_NORMALIZER" \
     --preset base \
-    --volume-shape 128 128 128 \
-    --output-shape 128 128 \
+    --decoder cross_flowers \
     --core-grid-sizes 48 24 12 \
-    --native-width 32 \
     --core-widths 320 640 1280 \
     --integration-shape 96 96 \
     --basis-p 64 \
-    --decoder surface_moment \
-    --rematerialize-native-blocks \
+    --cross-query-chunk-size 1024 \
+    --cross-frequency-chunk-size 4 \
     --batch-size 1 \
-    --frequency-count 76 \
-    --frequency-max-hz 15 \
-    --benchmarks forward train \
-    --warmup 1 \
-    --iterations 3 \
-    --seed 0
+    --pilot-2k \
+    --steps 2000 \
+    --seed 0 \
+    --log-every 10 \
+    --eval-every 100 \
+    --val-batches 2 \
+    --latest-every 250 \
+    --save-every 500 \
+    --wandb \
+    --wandb-project Cross-Flowers \
+    --wandb-name cross-flowers-mvp-r096-pilot2k \
+    --wandb-group cross-flowers-mvp-r096 \
+    --wandb-tags cross-flowers mvp r096 pilot2k
 ```
 
-The synced report was inspected before selecting an architecture change or any
-higher-resolution run.
+Run the printed `pull outputs with:` command locally after completion and
+review `training/summary.json`, validation curves, per-band errors, checkpoint
+artifacts, route diagnostics, GPU utilization, and step time before extending
+training or adding `128/256/512` buckets.
 
-The matched width-32 result peaked at `67.60 GiB`, effectively unchanged from
-width 64. Do not run another remote width or resolution case on this commit.
-The decoder currently expands width-`320` K0 features to the native grid before
-projecting to native width; that wide intermediate, rather than native width,
-must be removed locally first. After the projection/prolongation boundary is
-refactored and locally verified, commit the change and add a new clean-commit
-`128^3` width-64 comparison command here.
+Historical learned-native-shell results remain available in
+`notes/2026_07_19_discretization_invariant_unet_flowers_plan.md`. Their
+`--native-width` and `--rematerialize-native-blocks` commands do not apply to
+the core-first Cross-Flowers architecture and should not be repeated.
 
 ## Nested Progress Bars
 
