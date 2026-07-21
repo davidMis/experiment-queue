@@ -419,6 +419,163 @@ checkpoint artifacts, route diagnostics, GPU utilization, and step time before
 evaluating this checkpoint on other resolutions or adding mixed-resolution
 training.
 
+### Stage 5: Native multi-resolution validation and mixed-bucket smoke
+
+These runs move from r096 training to the first resolution-transfer evidence
+without opening the test split. First, evaluate the exact best r096 checkpoint
+on every complete validation bucket at its native input and receiver shape.
+Then repeat on the same ordered rows and native targets after conservatively
+restricting only the wavespeed input to `96^3`. The difference between those
+two runs is the matched fine-input-utilization diagnostic. Because the
+production validation buckets contain independent media across resolutions,
+this is a distributional resolution-transfer study, not paired solver
+convergence evidence; the paired diagnostic dataset remains a separate later
+evaluation.
+
+Set the already completed artifact paths on `mutton2`:
+
+```sh
+cd ~/3D_Helmholtz
+export CROSS_FLOWERS_NORMALIZER_RUN=outputs/experiments/20260721_005852_cross-flowers-normalizer-76_e1977484
+export CROSS_FLOWERS_NORMALIZER="$CROSS_FLOWERS_NORMALIZER_RUN/pressure_normalizer_resolution_balanced_76.npz"
+export CROSS_FLOWERS_R096_RUN=outputs/experiments/20260721_033723_cross-flowers-mvp-r096-long80k_f2cc9b40
+export CROSS_FLOWERS_R096_BEST="$CROSS_FLOWERS_R096_RUN/training/checkpoints/best.msgpack"
+test -f "$CROSS_FLOWERS_NORMALIZER" && test -f "$CROSS_FLOWERS_R096_BEST"
+```
+
+Run the native all-validation-row evaluation:
+
+```sh
+cd ~/3D_Helmholtz
+CUDA_VISIBLE_DEVICES=0 XLA_PYTHON_CLIENT_PREALLOCATE=false \
+.venv/bin/python scripts/run_experiment.py \
+  --name cross-flowers-r096-best-native-multires-val \
+  --config notes/2026_07_19_discretization_invariant_cross_flowers.tex \
+  --require-clean \
+  --remote mutton2 \
+  --notes "Best r096 checkpoint evaluated on all native 96/128/256/512 validation rows; test split remains sealed." \
+  -- .venv/bin/python scripts/eval_invariant_flowers.py \
+    --checkpoint "$CROSS_FLOWERS_R096_BEST" \
+    --config "$CROSS_FLOWERS_R096_RUN/training/config.json" \
+    --normalizer "$CROSS_FLOWERS_NORMALIZER" \
+    --data-bucket r096 data/resolution_transfer/val/r096 \
+    --data-bucket r128 data/resolution_transfer/val/r128 \
+    --data-bucket r256 data/resolution_transfer/val/r256 \
+    --data-bucket r512 data/resolution_transfer/val/r512 \
+    --batch-size 1 \
+    --panel-row 0 \
+    --panel-frequencies-hz 1 5 10 15 \
+    --wandb \
+    --wandb-project Cross-Flowers \
+    --wandb-name cross-flowers-r096-best-native-multires-val \
+    --wandb-group cross-flowers-resolution-transfer-r096 \
+    --wandb-tags cross-flowers r096-checkpoint multires validation native-input
+```
+
+Run the matched restricted-input control on the identical rows and native
+receiver grids:
+
+```sh
+cd ~/3D_Helmholtz
+CUDA_VISIBLE_DEVICES=0 XLA_PYTHON_CLIENT_PREALLOCATE=false \
+.venv/bin/python scripts/run_experiment.py \
+  --name cross-flowers-r096-best-restrict96-multires-val \
+  --config notes/2026_07_19_discretization_invariant_cross_flowers.tex \
+  --require-clean \
+  --remote mutton2 \
+  --notes "Matched validation control for the best r096 checkpoint: inputs restricted to 96^3, native targets and outputs retained." \
+  -- .venv/bin/python scripts/eval_invariant_flowers.py \
+    --checkpoint "$CROSS_FLOWERS_R096_BEST" \
+    --config "$CROSS_FLOWERS_R096_RUN/training/config.json" \
+    --normalizer "$CROSS_FLOWERS_NORMALIZER" \
+    --data-bucket r096 data/resolution_transfer/val/r096 \
+    --data-bucket r128 data/resolution_transfer/val/r128 \
+    --data-bucket r256 data/resolution_transfer/val/r256 \
+    --data-bucket r512 data/resolution_transfer/val/r512 \
+    --input-restrict-to 96 \
+    --batch-size 1 \
+    --panel-row 0 \
+    --panel-frequencies-hz 1 5 10 15 \
+    --wandb \
+    --wandb-project Cross-Flowers \
+    --wandb-name cross-flowers-r096-best-restrict96-multires-val \
+    --wandb-group cross-flowers-resolution-transfer-r096 \
+    --wandb-tags cross-flowers r096-checkpoint multires validation restricted-input
+```
+
+Each evaluation writes `summary.json`, row/frequency/mode-shell CSV files, two
+aggregate plots, and real-pressure panels under the runner's `evaluation/`
+directory. Metrics include the normalized training convention and physical-unit
+complex diagnostics, with modeled/auxiliary-band and PPW-valid/underresolved
+summaries. Pull both runner directories before comparing native-minus-restricted
+errors on the same bucket and frequency.
+
+Finally, run a short from-scratch shared-state smoke before committing to a
+mixed-resolution overnight run. Each optimizer update contains one homogeneous
+bucket, all four shape-specialized call sites update the same parameter and
+optimizer state, and equal bucket probabilities match the normalizer. Training
+omits the large native receiver target after CPU coefficient projection; native
+surface metrics are still computed for validation. Three synchronized
+post-compilation steps per bucket provide honest feasibility timings.
+
+```sh
+cd ~/3D_Helmholtz
+CUDA_VISIBLE_DEVICES=0 XLA_PYTHON_CLIENT_PREALLOCATE=false \
+.venv/bin/python scripts/run_experiment.py \
+  --name cross-flowers-mixed-r096-r128-r256-r512-smoke100 \
+  --config notes/2026_07_19_discretization_invariant_cross_flowers.tex \
+  --require-clean \
+  --remote mutton2 \
+  --notes "100-step equal-bucket mixed-resolution shared-state Cross-Flowers compile, memory, timing, and validation smoke." \
+  -- .venv/bin/python scripts/train_invariant_flowers.py \
+    --train-bucket r096 data/resolution_transfer/train/r096 \
+    --train-bucket r128 data/resolution_transfer/train/r128 \
+    --train-bucket r256 data/resolution_transfer/train/r256 \
+    --train-bucket r512 data/resolution_transfer/train/r512 \
+    --val-bucket r096 data/resolution_transfer/val/r096 \
+    --val-bucket r128 data/resolution_transfer/val/r128 \
+    --val-bucket r256 data/resolution_transfer/val/r256 \
+    --val-bucket r512 data/resolution_transfer/val/r512 \
+    --train-bucket-weight r096=0.25 \
+    --train-bucket-weight r128=0.25 \
+    --train-bucket-weight r256=0.25 \
+    --train-bucket-weight r512=0.25 \
+    --normalizer "$CROSS_FLOWERS_NORMALIZER" \
+    --preset base \
+    --decoder cross_flowers \
+    --core-grid-sizes 48 24 12 \
+    --core-widths 320 640 1280 \
+    --integration-shape 96 96 \
+    --basis-p 64 \
+    --coefficient-output-init-std 0.001 \
+    --cross-query-chunk-size 1024 \
+    --cross-frequency-chunk-size 4 \
+    --batch-size 1 \
+    --coefficient-only-training \
+    --steps 100 \
+    --seed 0 \
+    --learning-rate 0.0001 \
+    --schedule constant \
+    --warmup-steps 0 \
+    --log-every 10 \
+    --eval-every 100 \
+    --val-batches 1 \
+    --latest-every 0 \
+    --save-every 0 \
+    --bucket-timing-samples 3 \
+    --wandb \
+    --wandb-project Cross-Flowers \
+    --wandb-name cross-flowers-mixed-r096-r128-r256-r512-smoke100 \
+    --wandb-group cross-flowers-mixed-resolution \
+    --wandb-tags cross-flowers multires shared-state smoke feasibility
+```
+
+The smoke passes only if every bucket has a nonzero update count, all four
+first-compile and steady-step timing records are present, the r512 path fits,
+all training/validation metrics are finite, and both `best.msgpack` and
+`latest.msgpack` are written. Review this result before setting the length and
+schedule of the first full mixed-resolution run.
+
 Historical learned-native-shell results remain available in
 `notes/2026_07_19_discretization_invariant_unet_flowers_plan.md`. Their
 `--native-width` and `--rematerialize-native-blocks` commands do not apply to
