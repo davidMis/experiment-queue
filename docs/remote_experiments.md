@@ -295,10 +295,69 @@ CUDA_VISIBLE_DEVICES=0 XLA_PYTHON_CLIENT_PREALLOCATE=false \
 Each run writes `training/config.json`, `training/summary.json`, and
 `training/checkpoints/{best,latest}.msgpack` under its runner directory. Sync
 both runs. The gate passes only if losses and gradient norms remain finite,
-the aggregate four-row Cross coefficient and reconstructed-surface errors decrease substantially,
+the aggregate four-row Cross coefficient and reconstructed-surface errors
+decrease substantially,
 checkpoints can be read, and the Cross behavior is credible relative to the
 matched control. Stop to diagnose architecture, normalization, or optimization
 if those conditions fail.
+
+### Stage 3b: Four-row constant-rate capacity diagnostic
+
+The small-initialization Cross and moment runs reached aggregate losses
+`0.972556` and `0.995335`, respectively. Cross learned about `5.9x` more by
+improvement below the zero baseline, so the route-free control does not support
+a Cross-specific optimization failure. Neither run memorized the four rows.
+The original 500-step schedule spent 100 steps warming up and decayed to about
+`1e-5` as the Cross curve began accelerating. Test that schedule hypothesis
+before changing the objective or architecture: keep every model, data, loss,
+seed, clipping, and optimizer setting fixed, but use a fresh 2,000-step
+constant-`1e-4` run with no warmup. This remains a four-row capacity diagnostic,
+not the full-data pilot in Stage 4. Evaluation records both the four-row mean
+and each fixed row separately.
+
+```sh
+cd ~/3D_Helmholtz
+CUDA_VISIBLE_DEVICES=0 XLA_PYTHON_CLIENT_PREALLOCATE=false \
+.venv/bin/python scripts/run_experiment.py \
+  --name cross-flowers-mvp-r096-overfit4-constant2k \
+  --config notes/2026_07_19_discretization_invariant_cross_flowers.tex \
+  --require-clean \
+  --remote mutton2 \
+  --notes "Cross-Flowers four-row capacity diagnostic with small initialization and a constant 1e-4 learning rate for 2,000 steps." \
+  -- .venv/bin/python scripts/train_invariant_flowers.py \
+    --train data/resolution_transfer/train/r096 \
+    --normalizer "$CROSS_FLOWERS_NORMALIZER" \
+    --preset base \
+    --decoder cross_flowers \
+    --core-grid-sizes 48 24 12 \
+    --core-widths 320 640 1280 \
+    --integration-shape 96 96 \
+    --basis-p 64 \
+    --coefficient-output-init-std 0.001 \
+    --cross-query-chunk-size 1024 \
+    --cross-frequency-chunk-size 4 \
+    --batch-size 1 \
+    --overfit \
+    --max-train-rows 4 \
+    --steps 2000 \
+    --seed 0 \
+    --learning-rate 0.0001 \
+    --schedule constant \
+    --warmup-steps 0 \
+    --log-every 10 \
+    --eval-every 10 \
+    --latest-every 250 \
+    --save-every 500 \
+    --wandb \
+    --wandb-project Cross-Flowers \
+    --wandb-name cross-flowers-mvp-r096-overfit4-constant2k \
+    --wandb-group cross-flowers-mvp-r096-overfit-optimizer \
+    --wandb-tags cross-flowers mvp r096 overfit constant-lr capacity
+```
+
+Sync and inspect this run before Stage 4. The diagnostic passes only if all
+four row losses fall substantially and broad frequency bands improve; a lower
+mean driven by one row or only the first few frequencies is not memorization.
 
 ### Stage 4: First 2,000-step pilot
 
