@@ -210,18 +210,25 @@ parameters, and optimizer state used by this gate.
 The allowed gate size is 1-8 rows; the first comparison uses four rows and 500
 optimizer steps. The trainer defaults to float32 and the approved frequency
 weights: DC `0`, `0.2-7.0 Hz` weight `1`, and `7.2-15.0 Hz` weight `0.1`.
+The first matched attempt collapsed toward the zero-prediction loss after
+Xavier output initialization produced losses of `46.94` (Cross) and `11.77`
+(moment control). The rerun therefore uses a shared coefficient-output kernel
+standard deviation of `1e-3`, chosen to match the roughly `1e-2` per-mode
+target scale after summing 128 hidden inputs. Every evaluation traverses the
+same four eligible rows one at a time, and `best.msgpack` is selected by their
+aggregate loss rather than the most recently sampled training row.
 
-Run the Cross model first:
+Run the revised Cross model first:
 
 ```sh
 cd ~/3D_Helmholtz
 CUDA_VISIBLE_DEVICES=0 XLA_PYTHON_CLIENT_PREALLOCATE=false \
 .venv/bin/python scripts/run_experiment.py \
-  --name cross-flowers-mvp-r096-overfit4 \
+  --name cross-flowers-mvp-r096-overfit4-smallinit \
   --config notes/2026_07_19_discretization_invariant_cross_flowers.tex \
   --require-clean \
   --remote mutton2 \
-  --notes "Cross-Flowers r096 four-row/500-step memorization and optimization gate." \
+  --notes "Cross-Flowers r096 four-row/500-step rerun with 1e-3 coefficient-output initialization and fixed aggregate evaluation." \
   -- .venv/bin/python scripts/train_invariant_flowers.py \
     --train data/resolution_transfer/train/r096 \
     --normalizer "$CROSS_FLOWERS_NORMALIZER" \
@@ -231,6 +238,7 @@ CUDA_VISIBLE_DEVICES=0 XLA_PYTHON_CLIENT_PREALLOCATE=false \
     --core-widths 320 640 1280 \
     --integration-shape 96 96 \
     --basis-p 64 \
+    --coefficient-output-init-std 0.001 \
     --cross-query-chunk-size 1024 \
     --cross-frequency-chunk-size 4 \
     --batch-size 1 \
@@ -239,12 +247,13 @@ CUDA_VISIBLE_DEVICES=0 XLA_PYTHON_CLIENT_PREALLOCATE=false \
     --steps 500 \
     --seed 0 \
     --log-every 10 \
+    --eval-every 10 \
     --latest-every 100 \
     --wandb \
     --wandb-project Cross-Flowers \
-    --wandb-name cross-flowers-mvp-r096-overfit4 \
-    --wandb-group cross-flowers-mvp-r096-overfit \
-    --wandb-tags cross-flowers mvp r096 overfit
+    --wandb-name cross-flowers-mvp-r096-overfit4-smallinit \
+    --wandb-group cross-flowers-mvp-r096-overfit-smallinit \
+    --wandb-tags cross-flowers mvp r096 overfit small-init
 ```
 
 After syncing and inspecting it, run the same gate with the control:
@@ -253,11 +262,11 @@ After syncing and inspecting it, run the same gate with the control:
 cd ~/3D_Helmholtz
 CUDA_VISIBLE_DEVICES=0 XLA_PYTHON_CLIENT_PREALLOCATE=false \
 .venv/bin/python scripts/run_experiment.py \
-  --name cross-flowers-mvp-r096-surface-moment-overfit4 \
+  --name cross-flowers-mvp-r096-surface-moment-overfit4-smallinit \
   --config notes/2026_07_19_discretization_invariant_cross_flowers.tex \
   --require-clean \
   --remote mutton2 \
-  --notes "surface_moment r096 four-row/500-step control for the Cross-Flowers memorization gate." \
+  --notes "surface_moment r096 four-row/500-step control rerun with 1e-3 coefficient-output initialization and fixed aggregate evaluation." \
   -- .venv/bin/python scripts/train_invariant_flowers.py \
     --train data/resolution_transfer/train/r096 \
     --normalizer "$CROSS_FLOWERS_NORMALIZER" \
@@ -267,24 +276,26 @@ CUDA_VISIBLE_DEVICES=0 XLA_PYTHON_CLIENT_PREALLOCATE=false \
     --core-widths 320 640 1280 \
     --integration-shape 96 96 \
     --basis-p 64 \
+    --coefficient-output-init-std 0.001 \
     --batch-size 1 \
     --overfit \
     --max-train-rows 4 \
     --steps 500 \
     --seed 0 \
     --log-every 10 \
+    --eval-every 10 \
     --latest-every 100 \
     --wandb \
     --wandb-project Cross-Flowers \
-    --wandb-name cross-flowers-mvp-r096-surface-moment-overfit4 \
-    --wandb-group cross-flowers-mvp-r096-overfit \
-    --wandb-tags surface-moment control mvp r096 overfit
+    --wandb-name cross-flowers-mvp-r096-surface-moment-overfit4-smallinit \
+    --wandb-group cross-flowers-mvp-r096-overfit-smallinit \
+    --wandb-tags surface-moment control mvp r096 overfit small-init
 ```
 
 Each run writes `training/config.json`, `training/summary.json`, and
 `training/checkpoints/{best,latest}.msgpack` under its runner directory. Sync
 both runs. The gate passes only if losses and gradient norms remain finite,
-the Cross coefficient and reconstructed-surface errors decrease substantially,
+the aggregate four-row Cross coefficient and reconstructed-surface errors decrease substantially,
 checkpoints can be read, and the Cross behavior is credible relative to the
 matched control. Stop to diagnose architecture, normalization, or optimization
 if those conditions fail.
