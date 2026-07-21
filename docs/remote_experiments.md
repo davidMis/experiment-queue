@@ -355,26 +355,31 @@ CUDA_VISIBLE_DEVICES=0 XLA_PYTHON_CLIENT_PREALLOCATE=false \
     --wandb-tags cross-flowers mvp r096 overfit constant-lr capacity
 ```
 
-Sync and inspect this run before Stage 4. The diagnostic passes only if all
-four row losses fall substantially and broad frequency bands improve; a lower
-mean driven by one row or only the first few frequencies is not memorization.
+The completed run reached best aggregate loss `0.828887` at step 1980. It
+learned strongly through `1 Hz`, partially through `3 Hz`, and not measurably
+above `3 Hz`. This establishes a functioning capacity path without easy
+full-band memorization. Constant `1e-4` also produced large clipped gradients
+and an oscillatory curve, so it is not the long-run schedule.
 
-### Stage 4: First 2,000-step pilot
+### Stage 4: Overnight full-r096 training
 
-Launch this full-r096 Cross pilot only after Stage 3 passes and its synced
-artifacts have been reviewed. It uses the complete r096 training bucket and
-same-resolution validation bucket; multi-resolution bucket mixing is a later
-stage.
+This is the first substantial learning run after the finite GPU, initialization,
+and capacity diagnostics. It uses the complete 9,000-row r096 training bucket
+and a fixed 32-example r096 validation panel. It does not claim resolution
+generalization; multi-resolution training and same-checkpoint transfer tests
+follow only after its artifacts are reviewed. The measured Cross training time
+is approximately `0.50 s/step`; 80,000 steps plus randomized data loading,
+validation, and checkpointing should take roughly 11.5--12.5 hours.
 
 ```sh
 cd ~/3D_Helmholtz
 CUDA_VISIBLE_DEVICES=0 XLA_PYTHON_CLIENT_PREALLOCATE=false \
 .venv/bin/python scripts/run_experiment.py \
-  --name cross-flowers-mvp-r096-pilot2k \
+  --name cross-flowers-mvp-r096-long80k \
   --config notes/2026_07_19_discretization_invariant_cross_flowers.tex \
   --require-clean \
   --remote mutton2 \
-  --notes "First gated Cross-Flowers r096 full-train/validation 2,000-step pilot." \
+  --notes "First overnight Cross-Flowers full-r096 train/validation run: 80k steps with cosine 1e-4 to 1e-5." \
   -- .venv/bin/python scripts/train_invariant_flowers.py \
     --train data/resolution_transfer/train/r096 \
     --val data/resolution_transfer/val/r096 \
@@ -385,28 +390,34 @@ CUDA_VISIBLE_DEVICES=0 XLA_PYTHON_CLIENT_PREALLOCATE=false \
     --core-widths 320 640 1280 \
     --integration-shape 96 96 \
     --basis-p 64 \
+    --coefficient-output-init-std 0.001 \
     --cross-query-chunk-size 1024 \
     --cross-frequency-chunk-size 4 \
     --batch-size 1 \
-    --pilot-2k \
-    --steps 2000 \
+    --steps 80000 \
     --seed 0 \
-    --log-every 10 \
-    --eval-every 100 \
-    --val-batches 2 \
-    --latest-every 250 \
-    --save-every 500 \
+    --learning-rate 0.0001 \
+    --schedule cosine \
+    --warmup-steps 1000 \
+    --decay-steps 80000 \
+    --cosine-min-learning-rate 0.00001 \
+    --log-every 50 \
+    --eval-every 500 \
+    --val-batches 32 \
+    --latest-every 1000 \
+    --save-every 20000 \
     --wandb \
     --wandb-project Cross-Flowers \
-    --wandb-name cross-flowers-mvp-r096-pilot2k \
-    --wandb-group cross-flowers-mvp-r096 \
-    --wandb-tags cross-flowers mvp r096 pilot2k
+    --wandb-name cross-flowers-mvp-r096-long80k \
+    --wandb-group cross-flowers-mvp-r096-long \
+    --wandb-tags cross-flowers mvp r096 full-data overnight long80k
 ```
 
 Run the printed `pull outputs with:` command locally after completion and
-review `training/summary.json`, validation curves, per-band errors, checkpoint
-artifacts, route diagnostics, GPU utilization, and step time before extending
-training or adding `128/256/512` buckets.
+review `training/summary.json`, train/validation curves, per-band errors,
+checkpoint artifacts, route diagnostics, GPU utilization, and step time before
+evaluating this checkpoint on other resolutions or adding mixed-resolution
+training.
 
 Historical learned-native-shell results remain available in
 `notes/2026_07_19_discretization_invariant_unet_flowers_plan.md`. Their
