@@ -576,6 +576,100 @@ all training/validation metrics are finite, and both `best.msgpack` and
 `latest.msgpack` are written. Review this result before setting the length and
 schedule of the first full mixed-resolution run.
 
+### Stage 6: First full mixed-resolution MVP
+
+The Stage 5 smoke passed at clean commit `33084a32`: all four buckets compiled,
+completed nonzero shared-state updates, remained finite, and wrote matching
+best/latest checkpoints. Steady accelerator step times were approximately
+`0.50--0.55 s` for every resolution. The first full run uses `240,000` updates
+and is expected to take roughly `36--44` hours after randomized input/target
+I/O, native validation, and checkpoint overhead are included.
+
+Train from scratch so the effect of the mixed sampling distribution remains
+interpretable. Sample in proportion to the `9000/4500/900/180` available
+training pairs, equivalently weights `50/25/5/1`. This gives probabilities
+`0.617284/0.308642/0.061728/0.012346` and the same expected `16.46` draws per
+training pair over 240k steps. The existing resolution-balanced normalizer
+remains appropriate: it supplies stable per-frequency scales, while the
+relative objective and explicit sampler define the training distribution.
+Eight fixed validation batches per bucket retain visibility into every
+resolution; aggregate checkpoint selection uses the same proportional bucket
+weights. The complete validation buckets are evaluated separately after
+training.
+
+```sh
+cd ~/3D_Helmholtz
+export CROSS_FLOWERS_NORMALIZER_RUN=outputs/experiments/20260721_005852_cross-flowers-normalizer-76_e1977484
+export CROSS_FLOWERS_NORMALIZER="$CROSS_FLOWERS_NORMALIZER_RUN/pressure_normalizer_resolution_balanced_76.npz"
+test -f "$CROSS_FLOWERS_NORMALIZER"
+
+CUDA_VISIBLE_DEVICES=0 XLA_PYTHON_CLIENT_PREALLOCATE=false \
+.venv/bin/python scripts/run_experiment.py \
+  --name cross-flowers-mixed-r096-r128-r256-r512-proportional-long240k \
+  --config notes/2026_07_19_discretization_invariant_cross_flowers.tex \
+  --require-clean \
+  --remote mutton2 \
+  --notes "First full data-proportional mixed-resolution Cross-Flowers run: 240k from-scratch steps with retained checkpoints every 80k." \
+  -- .venv/bin/python scripts/train_invariant_flowers.py \
+    --train-bucket r096 data/resolution_transfer/train/r096 \
+    --train-bucket r128 data/resolution_transfer/train/r128 \
+    --train-bucket r256 data/resolution_transfer/train/r256 \
+    --train-bucket r512 data/resolution_transfer/train/r512 \
+    --val-bucket r096 data/resolution_transfer/val/r096 \
+    --val-bucket r128 data/resolution_transfer/val/r128 \
+    --val-bucket r256 data/resolution_transfer/val/r256 \
+    --val-bucket r512 data/resolution_transfer/val/r512 \
+    --train-bucket-weight r096=9000 \
+    --train-bucket-weight r128=4500 \
+    --train-bucket-weight r256=900 \
+    --train-bucket-weight r512=180 \
+    --normalizer "$CROSS_FLOWERS_NORMALIZER" \
+    --preset base \
+    --decoder cross_flowers \
+    --core-grid-sizes 48 24 12 \
+    --core-widths 320 640 1280 \
+    --integration-shape 96 96 \
+    --basis-p 64 \
+    --coefficient-output-init-std 0.001 \
+    --cross-query-chunk-size 1024 \
+    --cross-frequency-chunk-size 4 \
+    --batch-size 1 \
+    --coefficient-only-training \
+    --steps 240000 \
+    --seed 0 \
+    --learning-rate 0.0001 \
+    --schedule cosine \
+    --warmup-steps 1000 \
+    --decay-steps 240000 \
+    --cosine-min-learning-rate 0.00001 \
+    --log-every 50 \
+    --eval-every 1000 \
+    --val-batches 8 \
+    --latest-every 1000 \
+    --save-every 80000 \
+    --wandb \
+    --wandb-project Cross-Flowers \
+    --wandb-name cross-flowers-mixed-r096-r128-r256-r512-proportional-long240k \
+    --wandb-group cross-flowers-mixed-resolution \
+    --wandb-tags cross-flowers multires shared-state full-data proportional-sampling long240k
+```
+
+The immutable checkpoints at steps 80k, 160k, and 240k enable trajectory
+comparisons. The 80k checkpoint is only roughly comparable with the prior 80k
+r096-only run: it will contain about `49,383` r096 updates plus updates from the
+other resolutions, and its continuous 240k cosine schedule is still near
+`7.8e-5` rather than the prior run's terminal `1e-5`. This is deliberate; a
+single continuous decay is preferable to spending the final 160k steps pinned
+at the minimum learning rate.
+
+After syncing the run, inspect the aggregate and per-bucket validation curves,
+realized bucket counts against their multinomial expectations, route
+diagnostics, and checkpoint integrity. Then apply
+the Stage 5 standalone evaluator to the selected best checkpoint twice: once
+with native inputs and once with `--input-restrict-to 96`. That matched pair is
+the first test of whether mixed training converts shape-compatible zero-shot
+transfer into useful fine-input utilization. Keep the test split sealed.
+
 Historical learned-native-shell results remain available in
 `notes/2026_07_19_discretization_invariant_unet_flowers_plan.md`. Their
 `--native-width` and `--rematerialize-native-blocks` commands do not apply to
