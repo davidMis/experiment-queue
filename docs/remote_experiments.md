@@ -860,6 +860,13 @@ about `132 h` (`5.5 days`) of trainer time.
 The schedule-only continuation support must be committed and checked out
 cleanly on `mutton2` before launching. Set and verify the source artifacts:
 
+An initial launch from commit `76cd7ab3` was rejected during preflight before
+checkpoint restoration or training because the saved JSON lists were compared
+directly with equivalent runtime tuples. Do not retry from that commit. The
+corrected validator canonicalizes those containers without relaxing any
+semantic compatibility check; after pulling the correction, the launch command
+below is unchanged.
+
 ```sh
 cd ~/3D_Helmholtz
 export CROSS_FLOWERS_NORMALIZER_RUN=outputs/experiments/20260721_005852_cross-flowers-normalizer-76_e1977484
