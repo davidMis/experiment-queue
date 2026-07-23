@@ -670,6 +670,286 @@ with native inputs and once with `--input-restrict-to 96`. That matched pair is
 the first test of whether mixed training converts shape-compatible zero-shot
 transfer into useful fine-input utilization. Keep the test split sealed.
 
+### Stage 7: Complete validation of the selected mixed checkpoint
+
+The 240k run completed cleanly at commit `33084a32` in `31.75 h`. It realized
+`148001/74066/14939/2994` bucket updates and selected step 239k with fixed-panel
+aggregate validation loss `0.087424`. All four per-bucket validation losses
+also reached their minima at step 239k. Because checkpoint selection used only
+eight fixed rows per resolution, run the complete validation evaluator before
+comparing to the r096-only checkpoint.
+
+The complete native-input evaluation subsequently succeeded as
+`20260723_175710_cross-flowers-mixed240k-best-native-multires-val_33084a32`.
+It covered all `500/250/50/10` validation rows and achieved normalized
+coefficient relative L2 `0.23292/0.22887/0.20831/0.21442`. These are
+`15.8/16.1/17.0/16.7%` below the earlier r096-only checkpoint on the identical
+rows. Every row, non-DC frequency bin, and weighted mode shell improved. The
+matched restrict-input-to-96 control also completed as
+`20260723_181255_cross-flowers-mixed240k-best-restrict96-multires-val_33084a32`.
+It changed active physical coefficient relative L2 by only
+`+0.185/-0.051/+0.083%` at r128/r256/r512. All auxiliary high-frequency bins
+favored native input, but band-level gains remained below `0.9%`, while the
+modeled band was neutral or favored restriction at r256/r512. Stage 7 is
+complete: the model is a strong shared multi-resolution operator but does not
+yet demonstrate material fine-input utilization. Do not open the test split.
+
+Set the completed artifacts on `mutton2`:
+
+```sh
+cd ~/3D_Helmholtz
+export CROSS_FLOWERS_NORMALIZER_RUN=outputs/experiments/20260721_005852_cross-flowers-normalizer-76_e1977484
+export CROSS_FLOWERS_NORMALIZER="$CROSS_FLOWERS_NORMALIZER_RUN/pressure_normalizer_resolution_balanced_76.npz"
+export CROSS_FLOWERS_MIXED_RUN=outputs/experiments/20260721_221249_cross-flowers-mixed-r096-r128-r256-r512-proportional-long240k_33084a32
+export CROSS_FLOWERS_MIXED_BEST="$CROSS_FLOWERS_MIXED_RUN/training/checkpoints/best.msgpack"
+test -f "$CROSS_FLOWERS_NORMALIZER" && test -f "$CROSS_FLOWERS_MIXED_BEST"
+```
+
+First evaluate every validation row with its native input:
+
+```sh
+cd ~/3D_Helmholtz
+CUDA_VISIBLE_DEVICES=0 XLA_PYTHON_CLIENT_PREALLOCATE=false \
+.venv/bin/python scripts/run_experiment.py \
+  --name cross-flowers-mixed240k-best-native-multires-val \
+  --config notes/2026_07_19_discretization_invariant_cross_flowers.tex \
+  --require-clean \
+  --remote mutton2 \
+  --notes "Selected step-239k proportional mixed-resolution checkpoint evaluated on every native validation row." \
+  -- .venv/bin/python scripts/eval_invariant_flowers.py \
+    --checkpoint "$CROSS_FLOWERS_MIXED_BEST" \
+    --config "$CROSS_FLOWERS_MIXED_RUN/training/config.json" \
+    --normalizer "$CROSS_FLOWERS_NORMALIZER" \
+    --data-bucket r096 data/resolution_transfer/val/r096 \
+    --data-bucket r128 data/resolution_transfer/val/r128 \
+    --data-bucket r256 data/resolution_transfer/val/r256 \
+    --data-bucket r512 data/resolution_transfer/val/r512 \
+    --batch-size 1 \
+    --panel-row 0 \
+    --panel-frequencies-hz 1 5 10 15 \
+    --wandb \
+    --wandb-project Cross-Flowers \
+    --wandb-name cross-flowers-mixed240k-best-native-multires-val \
+    --wandb-group cross-flowers-resolution-transfer-mixed240k \
+    --wandb-tags cross-flowers mixed240k multires validation native-input
+```
+
+For exact provenance, the completed restricted-input control used the following
+command on the identical rows, native targets, and native output grids:
+
+```sh
+cd ~/3D_Helmholtz
+CUDA_VISIBLE_DEVICES=0 XLA_PYTHON_CLIENT_PREALLOCATE=false \
+.venv/bin/python scripts/run_experiment.py \
+  --name cross-flowers-mixed240k-best-restrict96-multires-val \
+  --config notes/2026_07_19_discretization_invariant_cross_flowers.tex \
+  --require-clean \
+  --remote mutton2 \
+  --notes "Matched control for selected step-239k mixed checkpoint: inputs restricted to 96^3, native targets and outputs retained." \
+  -- .venv/bin/python scripts/eval_invariant_flowers.py \
+    --checkpoint "$CROSS_FLOWERS_MIXED_BEST" \
+    --config "$CROSS_FLOWERS_MIXED_RUN/training/config.json" \
+    --normalizer "$CROSS_FLOWERS_NORMALIZER" \
+    --data-bucket r096 data/resolution_transfer/val/r096 \
+    --data-bucket r128 data/resolution_transfer/val/r128 \
+    --data-bucket r256 data/resolution_transfer/val/r256 \
+    --data-bucket r512 data/resolution_transfer/val/r512 \
+    --input-restrict-to 96 \
+    --batch-size 1 \
+    --panel-row 0 \
+    --panel-frequencies-hz 1 5 10 15 \
+    --wandb \
+    --wandb-project Cross-Flowers \
+    --wandb-name cross-flowers-mixed240k-best-restrict96-multires-val \
+    --wandb-group cross-flowers-resolution-transfer-mixed240k \
+    --wandb-tags cross-flowers mixed240k multires validation restricted-input
+```
+
+Both recorded runs were pulled and inspected. The native result establishes
+complete-row accuracy; the paired restricted result establishes only weak,
+high-frequency use of information unavailable on the `96^3` input grid.
+
+### Deferred Stage 8: Discarded-detail relevance diagnostic
+
+Status: recommended for a future work session and explicitly not scheduled on
+2026-07-23. Do not launch a new long training run or open the test split as part
+of this stage.
+
+The purpose is to distinguish three explanations for the small native-input
+gain:
+
+1. restriction removes very little wavespeed detail under the current GRF law;
+2. removed detail exists but is weakly relevant to the selected surface
+   observable and `P=64` output contract; or
+3. label-relevant detail exists, but the raw one-channel native Cross memory
+   does not use it effectively.
+
+First implement an inexpensive validation-only screening analysis using the
+same r128/r256/r512 rows as Stage 7. For each native wavespeed `x_h`, apply the
+exact production restriction `R_{h->96}`, prolong it back to the native grid,
+and define
+
+```text
+d_h = x_h - P_{96->h} R_{h->96} x_h.
+```
+
+Record at least:
+
+- absolute detail RMS in physical wavespeed units;
+- detail RMS relative to the centered native wavespeed contrast;
+- a gradient/seminorm or banded spatial-frequency detail measure;
+- paired native gain `error_restricted - error_native` for the full active
+  objective, modeled `0.2--7 Hz` band, auxiliary `7.2--15 Hz` band, and
+  representative cosine shells.
+
+Report row-matched scatter plots, Spearman and Pearson correlations, quartile
+bins, and bootstrap intervals separately by resolution. Treat r512 as
+descriptive because it has only 10 validation rows. r096 is the numerical
+identity control. Preserve row identifiers, source metadata, input hashes, and
+the exact restriction/prolongation metadata. This stage uses validation data
+only and does not retrain the model.
+
+The correlation screen cannot by itself establish whether discarded input
+detail changes the true response. If it finds negligible detail, do not add a
+learned native shell. If it finds substantial detail with no clear native gain,
+run a small solver-backed validation counterfactual before changing the
+architecture: on selected r128/r256 cases, retain the existing native target
+and generate a second native-grid response for
+`P_{96->h} R_{h->96} x_h` under the identical source, CPML, frequency, and
+receiver contract. The resulting true response difference directly measures
+label-relevant fine-input information. A material true difference absent from
+the network prediction supports strengthening the native path; a negligible
+true difference points instead to the data/observable contract.
+
+No executable Stage 8 command is recorded yet because the screening artifact
+and its tests have not been implemented. When this study is resumed, implement
+and verify it locally, then package any GPU/solver work through
+`scripts/run_experiment.py --require-clean --remote mutton2`.
+
+### Stage 9: 1M-update constant-rate saturation continuation
+
+This user-authorized experiment is independent of deferred Stage 8. Its purpose
+is to measure the accuracy floor at constant learning rate `3e-5` and determine
+when validation error begins a sustained increase while training error
+continues to improve.
+
+Use the selected step-239k checkpoint SHA
+`1b92c4d840b9bc0f8f124a5f669b0625744ab8ebee7a82e60ab7d8716365e49e`.
+Run 1,000,000 additional optimizer updates, so the trainer's absolute
+`--steps` target is 1,239,000. Preserve parameters, AdamW moments, optimizer
+count, global step, data, `50/25/5/1` bucket distribution, loss, normalizer,
+seed, and batch size. The explicit schedule-change override replaces only the
+completed cosine schedule with constant `3e-5` and no warmup. It starts a new
+experiment/W&B run rather than appending to the original W&B run.
+
+Immutable checkpoints are measured from the continuation boundary:
+
+| Additional updates | Global step | Checkpoint |
+|---:|---:|---|
+| 250,000 | 489,000 | `step_00489000.msgpack` |
+| 500,000 | 739,000 | `step_00739000.msgpack` |
+| 750,000 | 989,000 | `step_00989000.msgpack` |
+| 1,000,000 | 1,239,000 | `step_01239000.msgpack` |
+
+`latest.msgpack` is overwritten every 1,000 global steps for recovery.
+`best.msgpack` initially preserves the source best and is replaced only by a
+lower fixed-panel validation loss. Validation remains eight fixed batches per
+resolution every 1,000 steps. At the preceding measured throughput, expect
+about `132 h` (`5.5 days`) of trainer time.
+
+The schedule-only continuation support must be committed and checked out
+cleanly on `mutton2` before launching. Set and verify the source artifacts:
+
+```sh
+cd ~/3D_Helmholtz
+export CROSS_FLOWERS_NORMALIZER_RUN=outputs/experiments/20260721_005852_cross-flowers-normalizer-76_e1977484
+export CROSS_FLOWERS_NORMALIZER="$CROSS_FLOWERS_NORMALIZER_RUN/pressure_normalizer_resolution_balanced_76.npz"
+export CROSS_FLOWERS_MIXED_RUN=outputs/experiments/20260721_221249_cross-flowers-mixed-r096-r128-r256-r512-proportional-long240k_33084a32
+export CROSS_FLOWERS_MIXED_BEST="$CROSS_FLOWERS_MIXED_RUN/training/checkpoints/best.msgpack"
+test -f "$CROSS_FLOWERS_NORMALIZER" &&
+test -f "$CROSS_FLOWERS_MIXED_BEST" &&
+test -f "$CROSS_FLOWERS_MIXED_RUN/training/checkpoints/best.json"
+```
+
+Launch manually on `mutton2`:
+
+```sh
+cd ~/3D_Helmholtz
+CUDA_VISIBLE_DEVICES=0 XLA_PYTHON_CLIENT_PREALLOCATE=false \
+.venv/bin/python scripts/run_experiment.py \
+  --name cross-flowers-mixed239k-constant3e-5-continuation1m \
+  --config notes/2026_07_19_discretization_invariant_cross_flowers.tex \
+  --require-clean \
+  --remote mutton2 \
+  --notes "One million additional mixed-resolution updates from selected step 239k; preserve AdamW state, switch to constant LR 3e-5, measure saturation and overfitting." \
+  -- .venv/bin/python scripts/train_invariant_flowers.py \
+    --train-bucket r096 data/resolution_transfer/train/r096 \
+    --train-bucket r128 data/resolution_transfer/train/r128 \
+    --train-bucket r256 data/resolution_transfer/train/r256 \
+    --train-bucket r512 data/resolution_transfer/train/r512 \
+    --val-bucket r096 data/resolution_transfer/val/r096 \
+    --val-bucket r128 data/resolution_transfer/val/r128 \
+    --val-bucket r256 data/resolution_transfer/val/r256 \
+    --val-bucket r512 data/resolution_transfer/val/r512 \
+    --train-bucket-weight r096=9000 \
+    --train-bucket-weight r128=4500 \
+    --train-bucket-weight r256=900 \
+    --train-bucket-weight r512=180 \
+    --normalizer "$CROSS_FLOWERS_NORMALIZER" \
+    --preset base \
+    --decoder cross_flowers \
+    --core-grid-sizes 48 24 12 \
+    --core-widths 320 640 1280 \
+    --integration-shape 96 96 \
+    --basis-p 64 \
+    --coefficient-output-init-std 0.001 \
+    --cross-query-chunk-size 1024 \
+    --cross-frequency-chunk-size 4 \
+    --batch-size 1 \
+    --coefficient-only-training \
+    --steps 1239000 \
+    --seed 0 \
+    --optimizer adamw \
+    --weight-decay 0.0001 \
+    --clip-norm 1.0 \
+    --learning-rate 0.00003 \
+    --schedule constant \
+    --warmup-steps 0 \
+    --resume-from "$CROSS_FLOWERS_MIXED_BEST" \
+    --allow-resume-schedule-change \
+    --log-every 50 \
+    --eval-every 1000 \
+    --val-batches 8 \
+    --latest-every 1000 \
+    --save-every 250000 \
+    --save-every-relative-to-start \
+    --wandb \
+    --wandb-project Cross-Flowers \
+    --wandb-name cross-flowers-mixed239k-constant3e-5-continuation1m \
+    --wandb-group cross-flowers-mixed-resolution-long-horizon \
+    --wandb-tags cross-flowers multires continuation constant-lr saturation overfit long1m
+```
+
+At startup, verify that the trainer prints:
+
+```text
+validated optimizer-schedule-only resume override
+steps=239000->1239000
+```
+
+The first continuation evaluation occurs at global step 240,000. Because the
+learning rate jumps from the source cosine floor near `1e-5` to `3e-5`, treat
+an early transient separately from persistent overfitting. After completion,
+inspect the 1k-step validation trajectory and require a sustained validation
+increase alongside improving smoothed training loss before declaring
+overfitting. Then run complete all-row validation on the source, four immutable
+trajectory checkpoints, continuation best, and final checkpoint as needed.
+Keep the test split sealed.
+
+Use the exact `rsync` pull command printed by the runner to synchronize the
+completed run directory. The expected directory name begins with
+`outputs/experiments/<timestamp>_cross-flowers-mixed239k-constant3e-5-continuation1m_`.
+
 Historical learned-native-shell results remain available in
 `notes/2026_07_19_discretization_invariant_unet_flowers_plan.md`. Their
 `--native-width` and `--rematerialize-native-blocks` commands do not apply to
