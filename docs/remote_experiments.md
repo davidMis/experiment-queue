@@ -73,9 +73,9 @@ python scripts/run_experiment.py \
 For training, evaluation, or data generation, replace the command after `--`
 with the exact project command and flags from `README.md`.
 
-## Cross-Flowers MVP Manual Run Queue
+## Cross-Flowers MVP Manual Run Record
 
-This queue supersedes the paused learned-native-shell benchmark sequence. The
+This record superseded the paused learned-native-shell benchmark sequence. The
 historical first MVP endpoint-restricts the raw scalar wavespeed before the
 learned lift, uses a fixed `48^3/24^3/12^3` core, retains `P = 64` cosine
 modes, and evaluates all 76 bins on `0.0, 0.2, ..., 15.0 Hz`.
@@ -83,17 +83,24 @@ modes, and evaluates all 76 bins on `0.0, 0.2, ..., 15.0 Hz`.
 its fixed-core control. There is no direct coefficient-query Cross decoder in
 this implementation.
 
-As of 2026-07-29, fresh models instead learn and output the 71 bins
+The fresh Stage 10--12 models instead learn and output the 71 bins
 `1.0, 1.2, ..., 15.0 Hz`; DC and `0.2/0.4/0.6/0.8 Hz` are excluded. The
 Stage 1--9 commands are retained as provenance for completed runs and
 compatible continuations of their historical checkpoints. Stages 10--12 are
 the fresh 71-bin series after the trainer, normalizer selection, checkpoint
 metadata, and evaluator migration.
 
-All commands below must be run manually by the user from `~/3D_Helmholtz` on
-`mutton2`, at the intended committed SHA with a clean worktree. Each runner
-copies `notes/2026_07_19_discretization_invariant_cross_flowers.tex` into the
-run directory as the recorded architecture contract.
+Status as of 2026-07-30: the user reports that Stages 10--12 are all running.
+Do not relaunch them or launch any other stage. After they finish, the only
+active work in this runbook is to synchronize, validate, and analyze those
+three runs. The next architecture phase is Cross-Warp, whose primitive has not
+yet been shared; this runbook does not define that phase.
+
+The commands below are retained as exact provenance. Commands that were
+launched were run manually by the user from `~/3D_Helmholtz` on `mutton2`, at
+the intended committed SHA with a clean worktree. Each runner copies
+`notes/2026_07_19_discretization_invariant_cross_flowers.tex` into the run
+directory as the recorded architecture contract.
 
 ### Stage 1: Build the full resolution-balanced normalizer
 
@@ -777,11 +784,12 @@ Both recorded runs were pulled and inspected. The native result establishes
 complete-row accuracy; the paired restricted result establishes only weak,
 high-frequency use of information unavailable on the `96^3` input grid.
 
-### Deferred Stage 8: Discarded-detail relevance diagnostic
+### Superseded Stage 8: Discarded-detail relevance diagnostic
 
-Status: recommended for a future work session and explicitly not scheduled on
-2026-07-23. Do not launch a new long training run or open the test split as part
-of this stage.
+Status: proposed on 2026-07-23 but superseded on 2026-07-30 by the pending
+Cross-Warp direction. Do not implement or launch this stage unless the user
+explicitly reactivates it after sharing the new primitive. Keep the test split
+sealed.
 
 The purpose is to distinguish three explanations for the small native-input
 gain:
@@ -829,19 +837,16 @@ label-relevant fine-input information. A material true difference absent from
 the network prediction supports strengthening the native path; a negligible
 true difference points instead to the data/observable contract.
 
-No executable Stage 8 command is recorded yet because the screening artifact
-and its tests have not been implemented. When this study is resumed, implement
-and verify it locally, then package any GPU/solver work through
-`scripts/run_experiment.py --require-clean --remote mutton2`.
+No executable Stage 8 command is recorded because the screening artifact and
+its tests were not implemented before the proposal was superseded.
 
 ### Stage 9: 1M-update constant-rate saturation continuation
 
 This is an archived pre-scope-change recipe. **Do not launch it under the
 current project contract:** it preserves the historical 76-bin outputs and
 uses only the original training pool. It is retained solely to document the
-previously authorized saturation design and resume semantics. Any future
-saturation study must instead start from a 71-bin checkpoint and include every
-confirmed original and additive training shard.
+previously authorized saturation design and resume semantics. No replacement
+saturation study is active.
 
 Use the selected step-239k checkpoint SHA
 `1b92c4d840b9bc0f8f124a5f669b0625744ab8ebee7a82e60ab7d8716365e49e`.
@@ -1012,8 +1017,8 @@ probabilities. If the additive manifest matches the planned
 expected draws over 240k updates. If more rows completed, the actual recorded
 lengths determine the probabilities automatically.
 
-Run manually on `mutton2` only after committing this implementation and
-checking out that clean commit:
+Launch command retained for provenance. Stage 10 is already running; do not
+relaunch it:
 
 ```sh
 cd ~/3D_Helmholtz
@@ -1113,8 +1118,8 @@ The explicit `--low-resolution-high-band-weight 0` override is recorded in
 `config.json` as both a scalar and resolved per-resolution vectors. It does not
 change the project default used by Stage 10.
 
-Run manually on `mutton2` only after committing this implementation and
-checking out that clean commit:
+Launch command retained for provenance. Stage 11 is already running; do not
+relaunch it:
 
 ```sh
 cd ~/3D_Helmholtz
@@ -1217,8 +1222,8 @@ adequate operator representation. The Cross chunk flags are retained below
 only so the nonselected branch's recorded settings match Stage 10; they do not
 create Cross parameters or computation in the surface-moment model.
 
-Run manually on `mutton2` only after committing this implementation and
-checking out that clean commit:
+Launch command retained for provenance. Stage 12 is already running; do not
+relaunch it:
 
 ```sh
 cd ~/3D_Helmholtz
