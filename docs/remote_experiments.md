@@ -76,11 +76,19 @@ with the exact project command and flags from `README.md`.
 ## Cross-Flowers MVP Manual Run Queue
 
 This queue supersedes the paused learned-native-shell benchmark sequence. The
-active MVP endpoint-restricts the raw scalar wavespeed before the learned lift,
-uses a fixed `48^3/24^3/12^3` core, retains `P = 64` cosine modes, and evaluates
-all 76 bins on `0.0, 0.2, ..., 15.0 Hz`. `cross_flowers` is the primary
-surface-query decoder and `surface_moment` is its fixed-core control. There is
-no direct coefficient-query Cross decoder in this implementation.
+historical first MVP endpoint-restricts the raw scalar wavespeed before the
+learned lift, uses a fixed `48^3/24^3/12^3` core, retains `P = 64` cosine
+modes, and evaluates all 76 bins on `0.0, 0.2, ..., 15.0 Hz`.
+`cross_flowers` is the primary surface-query decoder and `surface_moment` is
+its fixed-core control. There is no direct coefficient-query Cross decoder in
+this implementation.
+
+As of 2026-07-29, fresh models instead learn and output the 71 bins
+`1.0, 1.2, ..., 15.0 Hz`; DC and `0.2/0.4/0.6/0.8 Hz` are excluded. The
+Stage 1--9 commands are retained as provenance for completed runs and
+compatible continuations of their historical checkpoints. Stage 10 is the
+fresh 71-bin successor after the trainer, normalizer selection, checkpoint
+metadata, and evaluator migration.
 
 All commands below must be run manually by the user from `~/3D_Helmholtz` on
 `mutton2`, at the intended committed SHA with a clean worktree. Each runner
@@ -208,8 +216,8 @@ parameters, and optimizer state used by this gate.
 ### Stage 3: Matched four-row overfit gate
 
 The allowed gate size is 1-8 rows; the first comparison uses four rows and 500
-optimizer steps. The trainer defaults to float32 and the approved frequency
-weights: DC `0`, `0.2-7.0 Hz` weight `1`, and `7.2-15.0 Hz` weight `0.1`.
+optimizer steps. This historical r096 gate used DC weight `0`,
+`0.2-7.0 Hz` weight `1`, and `7.2-15.0 Hz` weight `0.1`.
 The first matched attempt collapsed toward the zero-prediction loss after
 Xavier output initialization produced losses of `46.94` (Cross) and `11.77`
 (moment control). The rerun therefore uses a shared coefficient-output kernel
@@ -799,7 +807,7 @@ Record at least:
 - detail RMS relative to the centered native wavespeed contrast;
 - a gradient/seminorm or banded spatial-frequency detail measure;
 - paired native gain `error_restricted - error_native` for the full active
-  objective, modeled `0.2--7 Hz` band, auxiliary `7.2--15 Hz` band, and
+  objective, retained `1.0--7.0 Hz` band, high `7.2--15 Hz` band, and
   representative cosine shells.
 
 Report row-matched scatter plots, Spearman and Pearson correlations, quartile
@@ -859,6 +867,13 @@ about `132 h` (`5.5 days`) of trainer time.
 
 The schedule-only continuation support must be committed and checked out
 cleanly on `mutton2` before launching. Set and verify the source artifacts:
+
+This continuation intentionally preserves the historical checkpoint's shared
+high-band weight `0.1` at every resolution. When `--resume-from` is used
+without an explicit `--frequency-loss-weights` vector, the trainer reuses the
+originating loss record rather than applying the new fresh-run default.
+It also preserves the historical 76-bin output grid and therefore is not a
+fresh model under the 71-bin publication contract.
 
 An initial launch from commit `76cd7ab3` was rejected during preflight before
 checkpoint restoration or training because the saved JSON lists were compared
@@ -956,6 +971,119 @@ Keep the test split sealed.
 Use the exact `rsync` pull command printed by the runner to synchronize the
 completed run directory. The expected directory name begins with
 `outputs/experiments/<timestamp>_cross-flowers-mixed239k-constant3e-5-continuation1m_`.
+
+### Stage 10: Fresh 71-bin proportional all-shard 240k run
+
+This is the active fresh-model experiment. It repeats the architecture,
+optimizer, 240k cosine schedule, seed, fixed validation panels, and checkpoint
+cadence of Stage 6, with exactly three scientific changes:
+
+1. the model sees and outputs only `1.0, 1.2, ..., 15.0 Hz` (`71` bins);
+2. `7.2-15.0 Hz` has weight `0.1` at r096/r128 and weight `1` at r256/r512;
+3. every training bucket includes the original directory and both completed
+   additive shards.
+
+The acoustic arrays remain immutable 76-bin files. The loader selects stored
+indices `5..75` before normalization or coefficient projection. The original
+train-only normalizer is selected identically in memory, with source/effective
+scale hashes and the exact indices written to `config.json`.
+
+Use `--train-bucket-weight-by-size` rather than copied numeric weights. The
+trainer counts all rows in the three paths per bucket and records the resulting
+probabilities. If the additive manifest matches the planned
+`18000/9000/1800/360` addition, the combined counts are
+`27000/13500/2700/540`, the resolution probabilities remain
+`50/25/5/1` after normalization, and each training row receives about `5.49`
+expected draws over 240k updates. If more rows completed, the actual recorded
+lengths determine the probabilities automatically.
+
+Run manually on `mutton2` only after committing this implementation and
+checking out that clean commit:
+
+```sh
+cd ~/3D_Helmholtz
+export CROSS_FLOWERS_NORMALIZER_RUN=outputs/experiments/20260721_005852_cross-flowers-normalizer-76_e1977484
+export CROSS_FLOWERS_NORMALIZER="$CROSS_FLOWERS_NORMALIZER_RUN/pressure_normalizer_resolution_balanced_76.npz"
+test -f "$CROSS_FLOWERS_NORMALIZER"
+test -f data/resolution_transfer/manifest.json
+test -f data/resolution_transfer_train_add2x_20260724/manifest.json
+
+CUDA_VISIBLE_DEVICES=0 XLA_PYTHON_CLIENT_PREALLOCATE=false \
+.venv/bin/python scripts/run_experiment.py \
+  --name cross-flowers-mixed-r096-r128-r256-r512-proportional-allshards-freq1to15-long240k \
+  --config notes/2026_07_19_discretization_invariant_cross_flowers.tex \
+  --require-clean \
+  --remote mutton2 \
+  --notes "Fresh 71-bin Cross-Flowers 240k run using every original/additive training shard, data-proportional bucket sampling, and high-band downweighting only at r096/r128." \
+  -- .venv/bin/python scripts/train_invariant_flowers.py \
+    --train-bucket r096 \
+      data/resolution_transfer/train/r096 \
+      data/resolution_transfer_train_add2x_20260724/train/r096_shard0000 \
+      data/resolution_transfer_train_add2x_20260724/train/r096_shard0001 \
+    --train-bucket r128 \
+      data/resolution_transfer/train/r128 \
+      data/resolution_transfer_train_add2x_20260724/train/r128_shard0000 \
+      data/resolution_transfer_train_add2x_20260724/train/r128_shard0001 \
+    --train-bucket r256 \
+      data/resolution_transfer/train/r256 \
+      data/resolution_transfer_train_add2x_20260724/train/r256_shard0000 \
+      data/resolution_transfer_train_add2x_20260724/train/r256_shard0001 \
+    --train-bucket r512 \
+      data/resolution_transfer/train/r512 \
+      data/resolution_transfer_train_add2x_20260724/train/r512_shard0000 \
+      data/resolution_transfer_train_add2x_20260724/train/r512_shard0001 \
+    --val-bucket r096 data/resolution_transfer/val/r096 \
+    --val-bucket r128 data/resolution_transfer/val/r128 \
+    --val-bucket r256 data/resolution_transfer/val/r256 \
+    --val-bucket r512 data/resolution_transfer/val/r512 \
+    --train-bucket-weight-by-size \
+    --normalizer "$CROSS_FLOWERS_NORMALIZER" \
+    --preset base \
+    --decoder cross_flowers \
+    --core-grid-sizes 48 24 12 \
+    --core-widths 320 640 1280 \
+    --integration-shape 96 96 \
+    --basis-p 64 \
+    --coefficient-output-init-std 0.001 \
+    --cross-query-chunk-size 1024 \
+    --cross-frequency-chunk-size 4 \
+    --batch-size 1 \
+    --coefficient-only-training \
+    --steps 240000 \
+    --seed 0 \
+    --learning-rate 0.0001 \
+    --schedule cosine \
+    --warmup-steps 1000 \
+    --decay-steps 240000 \
+    --cosine-min-learning-rate 0.00001 \
+    --log-every 50 \
+    --eval-every 1000 \
+    --val-batches 8 \
+    --latest-every 1000 \
+    --save-every 80000 \
+    --wandb \
+    --wandb-project Cross-Flowers \
+    --wandb-name cross-flowers-mixed-r096-r128-r256-r512-proportional-allshards-freq1to15-long240k \
+    --wandb-group cross-flowers-mixed-resolution \
+    --wandb-tags cross-flowers multires shared-state all-shards proportional-sampling freq1to15 resolution-specific-frequency-weights long240k
+```
+
+Before leaving the run unattended, verify the startup record reports:
+
+- model frequencies `1.0..15.0 Hz` with count `71`;
+- selected stored indices `5..75` for all train and validation shards;
+- `27000/13500/2700/540` eligible rows if the completed manifest matches the
+  planned expansion, or the actual larger counts otherwise;
+- high-band weights `0.1/0.1/1.0/1.0` for r096/r128/r256/r512;
+- nonzero data-proportional sampling probabilities for every bucket;
+- a clean Git commit and W&B run name matching the runner name.
+
+Expected artifacts are under
+`outputs/experiments/<timestamp>_cross-flowers-mixed-r096-r128-r256-r512-proportional-allshards-freq1to15-long240k_<sha>/training/`,
+including `config.json`, `checkpoints/latest.msgpack`,
+`checkpoints/best.msgpack`, and immutable 80k/160k/240k checkpoints. Use the
+runner-generated `pull outputs with:` command from the local workstation after
+completion.
 
 Historical learned-native-shell results remain available in
 `notes/2026_07_19_discretization_invariant_unet_flowers_plan.md`. Their
