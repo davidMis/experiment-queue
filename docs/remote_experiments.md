@@ -102,6 +102,14 @@ The runner prints an exact `pull outputs with:` command when `--remote
 mutton2` is supplied. David runs that command from the local workstation.
 Codex must not run it.
 
+## Local Artifact Closeout
+
+Synchronization does not authorize cleanup. Keep the complete local run until
+its provenance is verified and its scientific decision is recorded. Later
+compaction follows `artifact_retention.md` and the exact registry/receipt
+workflow there. Active, ambiguous, or dependency-held runs remain protected,
+and root `data/` is never part of experiment-output cleanup.
+
 ## Archived Phase Runbooks
 
 - Cross-Flowers exact commands and historical statuses:
