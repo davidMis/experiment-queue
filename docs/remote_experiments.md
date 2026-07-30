@@ -86,8 +86,8 @@ this implementation.
 As of 2026-07-29, fresh models instead learn and output the 71 bins
 `1.0, 1.2, ..., 15.0 Hz`; DC and `0.2/0.4/0.6/0.8 Hz` are excluded. The
 Stage 1--9 commands are retained as provenance for completed runs and
-compatible continuations of their historical checkpoints. Stage 10 is the
-fresh 71-bin successor after the trainer, normalizer selection, checkpoint
+compatible continuations of their historical checkpoints. Stages 10--12 are
+the fresh 71-bin series after the trainer, normalizer selection, checkpoint
 metadata, and evaluator migration.
 
 All commands below must be run manually by the user from `~/3D_Helmholtz` on
@@ -976,9 +976,10 @@ completed run directory. The expected directory name begins with
 
 ### Stage 10: Fresh 71-bin proportional all-shard 240k run
 
-This is the reference run in the active fresh-model pair. It repeats the
-architecture, optimizer, 240k cosine schedule, seed, fixed validation panels,
-and checkpoint cadence of Stage 6, with exactly three scientific changes:
+This is the reference run in the active fresh-model three-run series. It
+repeats the architecture, optimizer, 240k cosine schedule, seed, fixed
+validation panels, and checkpoint cadence of Stage 6, with exactly three
+scientific changes:
 
 1. the model sees and outputs only `1.0, 1.2, ..., 15.0 Hz` (`71` bins);
 2. `7.2-15.0 Hz` has weight `0.1` at r096/r128 and weight `1` at r256/r512;
@@ -1197,6 +1198,112 @@ Expected artifacts are under
 `outputs/experiments/<timestamp>_cross-flowers-mixed-r096-r128-r256-r512-proportional-allshards-freq1to15-lowres-highband0-long240k_<sha>/training/`.
 Use the runner-generated `pull outputs with:` command from the local workstation
 after completion.
+
+### Stage 12: Matched fixed-core surface-moment decoder control
+
+This is a from-scratch decoder control matched to the Stage 10 reference. It
+uses the same 71-bin output grid, all original and additive training shards,
+normalizer, actual-size proportional bucket sampling, resolution-specific
+frequency weights, fixed core, coefficient representation, initialization,
+optimizer, schedule, seed, validation panels, logging, and checkpoint cadence.
+The only scientific architecture change is
+`--decoder surface_moment` instead of `--decoder cross_flowers`.
+
+The control reads decoded `core_k0` on the fixed `96 x 96` physical integration
+surface and therefore remains resolution invariant, but it has no direct path
+to the `native_raw` memory. It tests whether Cross routing improves held-out
+accuracy enough to justify its cost and whether the fixed core alone is an
+adequate operator representation. The Cross chunk flags are retained below
+only so the nonselected branch's recorded settings match Stage 10; they do not
+create Cross parameters or computation in the surface-moment model.
+
+Run manually on `mutton2` only after committing this implementation and
+checking out that clean commit:
+
+```sh
+cd ~/3D_Helmholtz
+export CROSS_FLOWERS_NORMALIZER_RUN=outputs/experiments/20260721_005852_cross-flowers-normalizer-76_e1977484
+export CROSS_FLOWERS_NORMALIZER="$CROSS_FLOWERS_NORMALIZER_RUN/pressure_normalizer_resolution_balanced_76.npz"
+test -f "$CROSS_FLOWERS_NORMALIZER"
+test -f data/resolution_transfer/manifest.json
+test -f data/resolution_transfer_train_add2x_20260724/manifest.json
+
+CUDA_VISIBLE_DEVICES=0 XLA_PYTHON_CLIENT_PREALLOCATE=false \
+.venv/bin/python scripts/run_experiment.py \
+  --name surface-moment-mixed-r096-r128-r256-r512-proportional-allshards-freq1to15-long240k \
+  --config notes/2026_07_19_discretization_invariant_cross_flowers.tex \
+  --require-clean \
+  --remote mutton2 \
+  --notes "Matched Stage 10 decoder control: identical fresh 71-bin all-shard 240k run using the fixed-core surface_moment decoder instead of cross_flowers." \
+  -- .venv/bin/python scripts/train_invariant_flowers.py \
+    --train-bucket r096 \
+      data/resolution_transfer/train/r096 \
+      data/resolution_transfer_train_add2x_20260724/train/r096_shard0000 \
+      data/resolution_transfer_train_add2x_20260724/train/r096_shard0001 \
+    --train-bucket r128 \
+      data/resolution_transfer/train/r128 \
+      data/resolution_transfer_train_add2x_20260724/train/r128_shard0000 \
+      data/resolution_transfer_train_add2x_20260724/train/r128_shard0001 \
+    --train-bucket r256 \
+      data/resolution_transfer/train/r256 \
+      data/resolution_transfer_train_add2x_20260724/train/r256_shard0000 \
+      data/resolution_transfer_train_add2x_20260724/train/r256_shard0001 \
+    --train-bucket r512 \
+      data/resolution_transfer/train/r512 \
+      data/resolution_transfer_train_add2x_20260724/train/r512_shard0000 \
+      data/resolution_transfer_train_add2x_20260724/train/r512_shard0001 \
+    --val-bucket r096 data/resolution_transfer/val/r096 \
+    --val-bucket r128 data/resolution_transfer/val/r128 \
+    --val-bucket r256 data/resolution_transfer/val/r256 \
+    --val-bucket r512 data/resolution_transfer/val/r512 \
+    --train-bucket-weight-by-size \
+    --normalizer "$CROSS_FLOWERS_NORMALIZER" \
+    --preset base \
+    --decoder surface_moment \
+    --core-grid-sizes 48 24 12 \
+    --core-widths 320 640 1280 \
+    --integration-shape 96 96 \
+    --basis-p 64 \
+    --coefficient-output-init-std 0.001 \
+    --cross-query-chunk-size 1024 \
+    --cross-frequency-chunk-size 4 \
+    --batch-size 1 \
+    --coefficient-only-training \
+    --steps 240000 \
+    --seed 0 \
+    --learning-rate 0.0001 \
+    --schedule cosine \
+    --warmup-steps 1000 \
+    --decay-steps 240000 \
+    --cosine-min-learning-rate 0.00001 \
+    --log-every 50 \
+    --eval-every 1000 \
+    --val-batches 8 \
+    --latest-every 1000 \
+    --save-every 80000 \
+    --wandb \
+    --wandb-project Cross-Flowers \
+    --wandb-name surface-moment-mixed-r096-r128-r256-r512-proportional-allshards-freq1to15-long240k \
+    --wandb-group cross-flowers-mixed-resolution \
+    --wandb-tags cross-flowers surface-moment decoder-control multires shared-state all-shards proportional-sampling freq1to15 resolution-specific-frequency-weights long240k
+```
+
+Before leaving the run unattended, verify the startup record reports:
+
+- `mode=fresh decoder=surface_moment`;
+- model frequencies `1.0..15.0 Hz` with count `71`;
+- selected stored indices `5..75`, with the same actual bucket row counts and
+  sampling probabilities as Stage 10;
+- high-band weights `0.1/0.1/1.0/1.0` for r096/r128/r256/r512;
+- `model.direct_memory_name=core_k0` in `training/config.json`;
+- a clean Git commit and W&B run name matching the runner name.
+
+Expected artifacts are under
+`outputs/experiments/<timestamp>_surface-moment-mixed-r096-r128-r256-r512-proportional-allshards-freq1to15-long240k_<sha>/training/`,
+including `config.json`, `checkpoints/latest.msgpack`,
+`checkpoints/best.msgpack`, and immutable 80k/160k/240k checkpoints. Use the
+runner-generated `pull outputs with:` command from the local workstation after
+completion.
 
 Historical learned-native-shell results remain available in
 `notes/2026_07_19_discretization_invariant_unet_flowers_plan.md`. Their
