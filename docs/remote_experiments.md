@@ -836,10 +836,12 @@ and verify it locally, then package any GPU/solver work through
 
 ### Stage 9: 1M-update constant-rate saturation continuation
 
-This user-authorized experiment is independent of deferred Stage 8. Its purpose
-is to measure the accuracy floor at constant learning rate `3e-5` and determine
-when validation error begins a sustained increase while training error
-continues to improve.
+This is an archived pre-scope-change recipe. **Do not launch it under the
+current project contract:** it preserves the historical 76-bin outputs and
+uses only the original training pool. It is retained solely to document the
+previously authorized saturation design and resume semantics. Any future
+saturation study must instead start from a 71-bin checkpoint and include every
+confirmed original and additive training shard.
 
 Use the selected step-239k checkpoint SHA
 `1b92c4d840b9bc0f8f124a5f669b0625744ab8ebee7a82e60ab7d8716365e49e`.
@@ -893,7 +895,7 @@ test -f "$CROSS_FLOWERS_MIXED_BEST" &&
 test -f "$CROSS_FLOWERS_MIXED_RUN/training/checkpoints/best.json"
 ```
 
-Launch manually on `mutton2`:
+Historical launch recipe (provenance only; do not run):
 
 ```sh
 cd ~/3D_Helmholtz
@@ -974,9 +976,9 @@ completed run directory. The expected directory name begins with
 
 ### Stage 10: Fresh 71-bin proportional all-shard 240k run
 
-This is the active fresh-model experiment. It repeats the architecture,
-optimizer, 240k cosine schedule, seed, fixed validation panels, and checkpoint
-cadence of Stage 6, with exactly three scientific changes:
+This is the reference run in the active fresh-model pair. It repeats the
+architecture, optimizer, 240k cosine schedule, seed, fixed validation panels,
+and checkpoint cadence of Stage 6, with exactly three scientific changes:
 
 1. the model sees and outputs only `1.0, 1.2, ..., 15.0 Hz` (`71` bins);
 2. `7.2-15.0 Hz` has weight `0.1` at r096/r128 and weight `1` at r256/r512;
@@ -987,6 +989,18 @@ The acoustic arrays remain immutable 76-bin files. The loader selects stored
 indices `5..75` before normalization or coefficient projection. The original
 train-only normalizer is selected identically in memory, with source/effective
 scale hashes and the exact indices written to `config.json`.
+
+The user confirmed on 2026-07-29 that the complete training layout is the
+original directory plus `rXXX_shard0000` and `rXXX_shard0001` under
+`resolution_transfer_train_add2x_20260724` for each resolution. Actual row
+counts are intentionally discovered from those directories at startup rather
+than copied from the generation plan.
+
+This all-shard rule applies to optimizer sampling. Reusing the earlier
+train-only normalizer is a deliberate matched-comparison choice: its scale is
+selected to the new 71-bin grid, but it is not refit on the additive pool. A
+later experiment that refits normalization on all shards must record that as a
+separate scientific change.
 
 Use `--train-bucket-weight-by-size` rather than copied numeric weights. The
 trainer counts all rows in the three paths per bucket and records the resulting
@@ -1084,6 +1098,105 @@ including `config.json`, `checkpoints/latest.msgpack`,
 `checkpoints/best.msgpack`, and immutable 80k/160k/240k checkpoints. Use the
 runner-generated `pull outputs with:` command from the local workstation after
 completion.
+
+### Stage 11: Matched r096/r128 high-band exclusion run
+
+This is a from-scratch matched companion to Stage 10. The dataset paths,
+71-bin output grid, normalizer, data-proportional sampling, model,
+initialization, optimizer, schedule, seed, validation panels, logging, and
+checkpoint cadence are identical. The only scientific change is that the
+`7.2-15.0 Hz` objective weight at r096/r128 is `0` instead of `0.1`;
+r256/r512 retain weight `1` throughout the full `1.0-15.0 Hz` output grid.
+
+The explicit `--low-resolution-high-band-weight 0` override is recorded in
+`config.json` as both a scalar and resolved per-resolution vectors. It does not
+change the project default used by Stage 10.
+
+Run manually on `mutton2` only after committing this implementation and
+checking out that clean commit:
+
+```sh
+cd ~/3D_Helmholtz
+export CROSS_FLOWERS_NORMALIZER_RUN=outputs/experiments/20260721_005852_cross-flowers-normalizer-76_e1977484
+export CROSS_FLOWERS_NORMALIZER="$CROSS_FLOWERS_NORMALIZER_RUN/pressure_normalizer_resolution_balanced_76.npz"
+test -f "$CROSS_FLOWERS_NORMALIZER"
+test -f data/resolution_transfer/manifest.json
+test -f data/resolution_transfer_train_add2x_20260724/manifest.json
+
+CUDA_VISIBLE_DEVICES=0 XLA_PYTHON_CLIENT_PREALLOCATE=false \
+.venv/bin/python scripts/run_experiment.py \
+  --name cross-flowers-mixed-r096-r128-r256-r512-proportional-allshards-freq1to15-lowres-highband0-long240k \
+  --config notes/2026_07_19_discretization_invariant_cross_flowers.tex \
+  --require-clean \
+  --remote mutton2 \
+  --notes "Matched Stage 10 ablation: identical fresh 71-bin all-shard 240k run, but exclude 7.2-15.0 Hz from the r096/r128 objective while retaining unit weight at r256/r512." \
+  -- .venv/bin/python scripts/train_invariant_flowers.py \
+    --train-bucket r096 \
+      data/resolution_transfer/train/r096 \
+      data/resolution_transfer_train_add2x_20260724/train/r096_shard0000 \
+      data/resolution_transfer_train_add2x_20260724/train/r096_shard0001 \
+    --train-bucket r128 \
+      data/resolution_transfer/train/r128 \
+      data/resolution_transfer_train_add2x_20260724/train/r128_shard0000 \
+      data/resolution_transfer_train_add2x_20260724/train/r128_shard0001 \
+    --train-bucket r256 \
+      data/resolution_transfer/train/r256 \
+      data/resolution_transfer_train_add2x_20260724/train/r256_shard0000 \
+      data/resolution_transfer_train_add2x_20260724/train/r256_shard0001 \
+    --train-bucket r512 \
+      data/resolution_transfer/train/r512 \
+      data/resolution_transfer_train_add2x_20260724/train/r512_shard0000 \
+      data/resolution_transfer_train_add2x_20260724/train/r512_shard0001 \
+    --val-bucket r096 data/resolution_transfer/val/r096 \
+    --val-bucket r128 data/resolution_transfer/val/r128 \
+    --val-bucket r256 data/resolution_transfer/val/r256 \
+    --val-bucket r512 data/resolution_transfer/val/r512 \
+    --train-bucket-weight-by-size \
+    --normalizer "$CROSS_FLOWERS_NORMALIZER" \
+    --low-resolution-high-band-weight 0 \
+    --preset base \
+    --decoder cross_flowers \
+    --core-grid-sizes 48 24 12 \
+    --core-widths 320 640 1280 \
+    --integration-shape 96 96 \
+    --basis-p 64 \
+    --coefficient-output-init-std 0.001 \
+    --cross-query-chunk-size 1024 \
+    --cross-frequency-chunk-size 4 \
+    --batch-size 1 \
+    --coefficient-only-training \
+    --steps 240000 \
+    --seed 0 \
+    --learning-rate 0.0001 \
+    --schedule cosine \
+    --warmup-steps 1000 \
+    --decay-steps 240000 \
+    --cosine-min-learning-rate 0.00001 \
+    --log-every 50 \
+    --eval-every 1000 \
+    --val-batches 8 \
+    --latest-every 1000 \
+    --save-every 80000 \
+    --wandb \
+    --wandb-project Cross-Flowers \
+    --wandb-name cross-flowers-mixed-r096-r128-r256-r512-proportional-allshards-freq1to15-lowres-highband0-long240k \
+    --wandb-group cross-flowers-mixed-resolution \
+    --wandb-tags cross-flowers multires shared-state all-shards proportional-sampling freq1to15 resolution-specific-frequency-weights lowres-highband-zero long240k
+```
+
+Before leaving the run unattended, verify the startup record reports:
+
+- model frequencies `1.0..15.0 Hz` with count `71`;
+- selected stored indices `5..75` and the same actual bucket row counts and
+  sampling probabilities as Stage 10;
+- high-band weights `0/0/1/1` for r096/r128/r256/r512;
+- `loss_source=fresh_low_resolution_high_band_override_cli`;
+- a clean Git commit and W&B run name matching the runner name.
+
+Expected artifacts are under
+`outputs/experiments/<timestamp>_cross-flowers-mixed-r096-r128-r256-r512-proportional-allshards-freq1to15-lowres-highband0-long240k_<sha>/training/`.
+Use the runner-generated `pull outputs with:` command from the local workstation
+after completion.
 
 Historical learned-native-shell results remain available in
 `notes/2026_07_19_discretization_invariant_unet_flowers_plan.md`. Their
