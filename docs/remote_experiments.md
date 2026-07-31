@@ -51,12 +51,17 @@ Every command must:
 - provide useful progress for long child workflows;
 - identify expected artifacts and the synchronization procedure.
 
+GPU selection is deliberately outside the command contract. David manages it
+before launch, so new commands and templates must not set
+`CUDA_VISIBLE_DEVICES` or use an equivalent device-selection option. The
+actual device remains a required receipt field.
+
 ## Command Pattern
 
 ```bash
 cd ~/3D_Helmholtz
 
-CUDA_VISIBLE_DEVICES=0 XLA_PYTHON_CLIENT_PREALLOCATE=false \
+XLA_PYTHON_CLIENT_PREALLOCATE=false \
 .venv/bin/python scripts/run_experiment.py \
   --name EXPERIMENT_NAME \
   --config PATH_TO_IMMUTABLE_CONFIG \
@@ -68,9 +73,9 @@ CUDA_VISIBLE_DEVICES=0 XLA_PYTHON_CLIENT_PREALLOCATE=false \
     --seed 0
 ```
 
-Omit GPU variables and a seed only when they do not apply, and say so in the
-run card. An intentionally dirty run must explicitly state why exact commit
-provenance is being waived.
+Include relevant non-selection environment variables and the seed when they
+apply. Never include a GPU device selector. An intentionally dirty run must
+explicitly state why exact commit provenance is being waived.
 
 ## Run Directory And Receipt
 
