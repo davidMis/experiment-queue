@@ -56,6 +56,11 @@ before launch, so new commands and templates must not set
 `CUDA_VISIBLE_DEVICES` or use an equivalent device-selection option. The
 actual device remains a required receipt field.
 
+Unless David explicitly specifies another target, GPU-accelerated runs use
+the NVIDIA RTX PRO 6000 Blackwell Server Edition accelerator class. This
+default hardware identity is an experiment assumption, not a device selector;
+the actual device is still recorded from the run receipt and artifact.
+
 ## Command Pattern
 
 ```bash
