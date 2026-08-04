@@ -556,8 +556,21 @@ class SchedulerWebApp:
             if item["state"] in RUNNING_STATES:
                 actions.append(f'<form method="post" action="/admin/item">{base}<input type="hidden" name="operation" value="terminate"><button class="secondary">Terminate</button></form>')
                 actions.append(f'<form method="post" action="/admin/item">{base}<input type="hidden" name="operation" value="kill"><input style="width:88px" name="confirm" placeholder="type KILL" aria-label="Type KILL to confirm force kill" required><button class="danger">Force kill</button></form>')
-            queue_rows.append(f"""<tr><td>#{item_id}</td><td><strong>{_escape(item['experiment_id'])}</strong><br><span class="tiny muted">attempt {item['attempt']} · segment {item['segment']}</span></td>
-<td><span class="pill">{_escape(item['state'])}</span></td><td>{item['priority']}{' · front' if item['resume_front'] else ''}</td><td>{_escape(item['assigned_gpu_index'] or '—')}</td><td>{_escape(item['state_detail'] or '')}</td><td><div class="actions">{''.join(actions)}</div></td></tr>""")
+            if item["worktree_cleanup_error"]:
+                isolation = f"cleanup pending: {item['worktree_cleanup_error']}"
+            elif item["worktree_removed_at"]:
+                isolation = "isolated worktree cleaned"
+            elif item["worktree_path"]:
+                isolation = "isolated worktree ready"
+            elif item["git_ref"]:
+                isolation = "commit pinned; worktree pending"
+            else:
+                isolation = "legacy shared checkout"
+            detail = str(item["state_detail"] or "")
+            if isolation:
+                detail = f"{detail} · {isolation}" if detail else isolation
+            queue_rows.append(f"""<tr><td>#{item_id}</td><td><strong>{_escape(item['experiment_id'])}</strong><br><span class="tiny muted">attempt {item['attempt']} · segment {item['segment']} · commit {_escape(str(item['git_commit'])[:12])}</span></td>
+<td><span class="pill">{_escape(item['state'])}</span></td><td>{item['priority']}{' · front' if item['resume_front'] else ''}</td><td>{_escape(item['assigned_gpu_index'] or '—')}</td><td>{_escape(detail)}</td><td><div class="actions">{''.join(actions)}</div></td></tr>""")
         event_rows = "".join(
             f'<div class="event"><span>{_escape(row["created_at"])}</span><strong>{_escape(row["event_type"])}</strong><span>{_escape(row["actor"])} · item {_escape(row["queue_item_id"] or "—")}<br>{_escape(row["payload_json"])}</span></div>'
             for row in data["events"]

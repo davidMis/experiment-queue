@@ -21,10 +21,11 @@ allowlist. The scheduler resolves his selected host indices to GPU UUIDs and
 sets `CUDA_VISIBLE_DEVICES` only in the launched child's environment.
 
 The ignored root directory `gpu_scheduler_state/` contains the SQLite state,
-per-segment launcher logs, yield requests and receipts, web password hashes and
-session-signing secret, scheduler identity, and exported queue receipt.
-Experiment artifacts remain in their usual `outputs/experiments/` directories
-and are not deleted or compacted by the queue.
+per-segment launcher logs, yield requests and receipts, detached code
+worktrees, web password hashes and session-signing secret, scheduler identity,
+and exported queue receipt. Experiment artifacts remain in their usual
+`outputs/experiments/` directories and are not deleted or compacted by the
+queue.
 
 ## Queue Membership Is Explicit
 
@@ -39,7 +40,10 @@ This command requires a clean checkout. It reads the explicitly named tracked
 card, verifies that its `Exact Manual Command On Mutton2` section invokes
 `scripts/run_experiment.py` with `--require-clean` and `--remote mutton2`, and
 stores the exact command, card SHA-256, and Git commit. It does not read
-`STATUS.md`.
+`STATUS.md`. Admission also creates a private
+`refs/experiment-queue/items/<queue-id>` Git ref immediately, so rebasing,
+deleting a branch, or advancing the primary checkout cannot make the admitted
+commit unreachable while it is waiting.
 
 Useful admission controls are:
 
@@ -107,10 +111,39 @@ its own process group and writes a durable exit receipt. Starting `serve` again
 reconciles those processes and receipts. Only one scheduler may use a state
 directory at a time.
 
-Do not update or dirty the shared checkout while queue jobs are running. The
-scheduler checks the worktree and commit at launch and during GPU polling. If
-it detects repository drift, it records the condition and pauses new dispatch;
-it does not terminate active work.
+At first dispatch, the scheduler materializes a detached worktree for the
+item's pinned commit under `gpu_scheduler_state/worktrees/`. It verifies that
+checkout's HEAD, cleanliness, and card bytes, and runs the frozen card command
+from it. The standard `cd ~/3D_Helmholtz` card line is redirected into the
+isolated worktree only for execution; the original command remains unchanged
+in the database for audit. Ignored environment, data, output, and run roots are
+linked back to the primary repository. A scheduler-only Git excludes file
+keeps those runtime links from invalidating `--require-clean`.
+
+This isolates tracked code, not the whole machine. The linked `.venv`, `data/`,
+and artifact roots remain shared operational inputs. Updating tracked files in
+the primary checkout is safe, but replacing the environment or mutating source
+data during an active job is not part of the guarantee; keep those stable and
+use the runner manifest's recorded environment/data provenance.
+
+The primary checkout may therefore be committed, pulled, switched, or left
+temporarily dirty while an already-running scheduler owns queued or active
+isolated items. Each item continues using only its admitted commit. A yielded
+item retains the same worktree and pinned ref across every segment so its
+runner manifest, checkpoint, optimizer state, and W&B identity can be resumed
+without changing code.
+
+To update the scheduler itself, stop `serve`, update the primary checkout to a
+clean commit, and start it again. Active experiment executors and their
+worktrees continue while the scheduler is stopped; the restarted service
+reconciles them from durable PIDs and exit receipts. The private web process is
+separate and can be restarted independently when its code changes.
+
+After an item becomes `succeeded`, `failed`, `interrupted`, `force_killed`, or
+`removed`, the scheduler removes only that exact detached worktree and its
+private pin. Shared data, checkpoints, launcher logs, queue history, runner
+artifacts, and W&B records remain. Cleanup failures do not change the terminal
+result: they are shown in CLI/web status and retried by later scheduler cycles.
 
 ## Run The Private HTTPS Web App
 
@@ -269,11 +302,14 @@ GPU until polling observes it idle.
 - User interruption and force-kill are recorded separately from child failure.
 - No queue action deletes an experiment artifact.
 - Removing membership never erases its event history.
+- A terminal item's exact detached code worktree and private Git ref are
+  reclaimed; failed cleanup is visible and retried without broad deletion.
 
 After review, `resume` reopens dispatch. A blocked item can be released only
-after its exact identity is again valid; when the required commit changed, the
-clear workflow is to remove the old pending membership and explicitly add the
-card again from the intended clean commit.
+after its pinned worktree identity is again valid; when the intended commit
+changed, the clear workflow is to remove the old pending membership and
+explicitly add the card again from the intended clean commit. Updating a branch
+does not migrate existing membership to that branch's new commit.
 
 Scheduler versions before the 2026-08-04 connection-lifecycle fix could
 eventually stop with `sqlite3.OperationalError: unable to open database file`

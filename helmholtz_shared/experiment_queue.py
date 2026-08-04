@@ -26,7 +26,6 @@ import subprocess
 import sys
 import tempfile
 import time
-import traceback
 import uuid as uuid_module
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -71,6 +70,63 @@ CARD_COMMAND_HEADING = "## Exact Manual Command On Mutton2"
 YIELD_EXIT_CODE = 75
 MIN_RESERVATION_HOURS = 1
 MAX_RESERVATION_HOURS = 24
+WORKTREE_CLEANUP_RETRY_SECONDS = 60
+
+_DURABLE_EXECUTOR_SOURCE = r'''# Minimal immutable queue executor; standard library only.
+import json
+import os
+import signal
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+signals_received = []
+child = None
+
+def now():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+def forward(signum, _frame):
+    signals_received.append(signal.Signals(signum).name)
+    if child is not None and child.poll() is None:
+        try:
+            child.send_signal(signum)
+        except ProcessLookupError:
+            pass
+
+previous = {}
+for signum in (signal.SIGINT, signal.SIGTERM):
+    previous[signum] = signal.signal(signum, forward)
+started_at = now()
+try:
+    child = subprocess.Popen(
+        ["/bin/bash", "-lc", payload["command"]],
+        cwd=payload["cwd"],
+    )
+    raw_return_code = child.wait()
+    return_code = 128 + abs(raw_return_code) if raw_return_code < 0 else raw_return_code
+except OSError as exc:
+    return_code = 127
+    signals_received.append(f"launch_error:{exc}")
+finally:
+    for signum, handler in previous.items():
+        signal.signal(signum, handler)
+receipt = dict(payload["receipt"])
+receipt.update({
+    "started_at": started_at,
+    "finished_at": now(),
+    "return_code": return_code,
+    "signals_received": signals_received,
+})
+receipt_path = Path(payload["receipt_path"])
+receipt_path.parent.mkdir(parents=True, exist_ok=True)
+temporary = receipt_path.with_name(f".{receipt_path.name}.{os.getpid()}.tmp")
+temporary.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+os.replace(temporary, receipt_path)
+raise SystemExit(return_code)
+'''
 
 
 class QueueError(RuntimeError):
@@ -119,42 +175,6 @@ class CardCommand:
     runner_name: str
 
 
-class _ForkedExecutor:
-    """Small ``Popen``-like handle for an inherited durable executor."""
-
-    def __init__(self, pid: int):
-        self.pid = pid
-        self.returncode: int | None = None
-
-    def poll(self) -> int | None:
-        """Reap the executor without blocking and return its exit code."""
-
-        if self.returncode is not None:
-            return self.returncode
-        try:
-            waited_pid, status = os.waitpid(self.pid, os.WNOHANG)
-        except ChildProcessError:
-            return self.returncode
-        if waited_pid == self.pid:
-            self.returncode = os.waitstatus_to_exitcode(status)
-        return self.returncode
-
-    def kill(self) -> None:
-        """Send SIGKILL to the executor process."""
-
-        os.kill(self.pid, signal.SIGKILL)
-
-    def wait(self, timeout: float | None = None) -> int:
-        """Wait for the executor, matching the subset of ``Popen`` we use."""
-
-        deadline = None if timeout is None else time.monotonic() + timeout
-        while self.poll() is None:
-            if deadline is not None and time.monotonic() >= deadline:
-                raise subprocess.TimeoutExpired(str(self.pid), timeout)
-            time.sleep(0.01)
-        return int(self.returncode)
-
-
 def utc_now_iso() -> str:
     """Return a compact UTC timestamp suitable for durable records."""
 
@@ -185,6 +205,15 @@ def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def _atomic_write_text(path: Path, value: str) -> None:
+    """Write text through an adjacent temporary file and atomic rename."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary.write_text(value, encoding="utf-8")
     os.replace(temporary, path)
 
 
@@ -472,9 +501,9 @@ class QueueStore:
                     "do not update the primary checkout until this process is terminal"
                 )
                 connection.execute(
-                    "UPDATE queue_items SET worktree_cleanup_error = ?, "
-                    "state_detail = COALESCE(state_detail, ?) WHERE id = ?",
-                    (detail, detail, item_id),
+                    "UPDATE queue_items SET state_detail = COALESCE(state_detail, ?) "
+                    "WHERE id = ?",
+                    (detail, item_id),
                 )
                 continue
             git_ref = _queue_git_ref(item_id)
@@ -495,9 +524,8 @@ class QueueStore:
                     f"{pinned.stderr.strip() or pinned.stdout.strip()}"
                 )
                 connection.execute(
-                    "UPDATE queue_items SET state = 'held', state_detail = ?, "
-                    "worktree_cleanup_error = ? WHERE id = ?",
-                    (detail, detail, item_id),
+                    "UPDATE queue_items SET state = 'held', state_detail = ? WHERE id = ?",
+                    (detail, item_id),
                 )
         self._set_meta(connection, "schema_version", str(SCHEMA_VERSION))
         self._event(
@@ -632,6 +660,63 @@ def _git_error(operation: str, result: subprocess.CompletedProcess[str]) -> Queu
     return QueueError(f"Git could not {operation}: {detail}")
 
 
+def _worktree_excludes_file(store: QueueStore) -> Path:
+    """Create the scheduler-only excludes needed for shared root symlinks."""
+
+    path = store.state_dir / "worktree_shared_paths.exclude"
+    content = "# Scheduler-managed shared paths in detached experiment worktrees.\n" + "".join(
+        f"/{name}\n" for name in SHARED_WORKTREE_PATHS
+    )
+    try:
+        current = path.read_text(encoding="utf-8") if path.is_file() else None
+        if current != content:
+            _atomic_write_text(path, content)
+    except OSError as exc:
+        raise QueueError(f"could not prepare worktree excludes file {path}: {exc}") from exc
+    return path
+
+
+def _environment_with_git_excludes(
+    environment: Mapping[str, str],
+    excludes_file: Path,
+) -> dict[str, str]:
+    """Append one command-scoped Git configuration entry to an environment."""
+
+    updated = dict(environment)
+    raw_count = updated.get("GIT_CONFIG_COUNT", "0")
+    try:
+        count = int(raw_count)
+    except ValueError as exc:
+        raise QueueError(f"GIT_CONFIG_COUNT must be an integer, got {raw_count!r}") from exc
+    updated[f"GIT_CONFIG_KEY_{count}"] = "core.excludesFile"
+    updated[f"GIT_CONFIG_VALUE_{count}"] = str(excludes_file)
+    updated["GIT_CONFIG_COUNT"] = str(count + 1)
+    return updated
+
+
+def _worktree_git_completed(
+    store: QueueStore,
+    worktree: Path,
+    *arguments: str,
+) -> subprocess.CompletedProcess[str]:
+    """Run Git with scheduler-owned shared symlinks excluded from status."""
+
+    environment = _environment_with_git_excludes(
+        os.environ,
+        _worktree_excludes_file(store),
+    )
+    return subprocess.run(
+        ["git", *arguments],
+        cwd=worktree,
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+
+
 def _pin_item_commit(repo_root: Path, item_id: int, commit: str) -> str:
     """Create the queue-owned ref that protects an admitted commit from pruning."""
 
@@ -663,7 +748,7 @@ def _worktree_identity(
 ) -> tuple[bool, str | None]:
     """Verify commit, cleanliness, and card bytes inside an item worktree."""
 
-    head = _git_completed(worktree, "rev-parse", "HEAD")
+    head = _worktree_git_completed(store, worktree, "rev-parse", "HEAD")
     if head.returncode != 0:
         return False, str(_git_error(f"read HEAD in {worktree}", head))
     if head.stdout.strip() != str(item["git_commit"]):
@@ -671,7 +756,13 @@ def _worktree_identity(
             f"worktree HEAD {head.stdout.strip()} differs from queued commit "
             f"{item['git_commit']}"
         )
-    status = _git_completed(worktree, "status", "--porcelain", "--untracked-files=normal")
+    status = _worktree_git_completed(
+        store,
+        worktree,
+        "status",
+        "--porcelain",
+        "--untracked-files=normal",
+    )
     if status.returncode != 0:
         return False, str(_git_error(f"inspect worktree {worktree}", status))
     if status.stdout.strip():
@@ -701,7 +792,16 @@ def _link_shared_worktree_paths(store: QueueStore, worktree: Path) -> list[str]:
             raise QueueError(
                 f"isolated worktree path {target} already exists and cannot link shared {source}"
             )
-        ignored = _git_completed(worktree, "check-ignore", "-q", "--", name)
+        ignore_candidate = f"{name}/" if source.is_dir() else name
+        ignored = _worktree_git_completed(
+            store,
+            worktree,
+            "check-ignore",
+            "-q",
+            "--no-index",
+            "--",
+            ignore_candidate,
+        )
         if ignored.returncode != 0:
             raise QueueError(
                 f"shared runtime path {name!r} is not ignored by queued commit "
@@ -859,6 +959,72 @@ def _command_for_worktree(command_text: str, worktree: Path) -> str:
             f"use one standalone 'cd ~/3D_Helmholtz' line: {worktree}"
         )
     return transformed
+
+
+def _item_execution_context(
+    store: QueueStore,
+    item: Mapping[str, Any],
+    environment: Mapping[str, str],
+) -> tuple[Path, str, dict[str, str]]:
+    """Validate an item's immutable checkout and construct its child environment."""
+
+    if _item_value(item, "git_ref"):
+        execution_root = _expected_worktree_path(store, item)
+        valid, detail = _worktree_identity(store, item, execution_root)
+        if not valid:
+            raise QueueError(
+                detail or f"queue item {item['id']} isolated worktree failed validation"
+            )
+        command_text = _command_for_worktree(str(item["command_text"]), execution_root)
+    else:
+        # Legacy attempts admitted before schema v3 retain shared-checkout behavior.
+        execution_root = store.repo_root
+        command_text = str(item["command_text"])
+    child_environment = dict(environment)
+    if _item_value(item, "git_ref"):
+        child_environment = _environment_with_git_excludes(
+            child_environment,
+            _worktree_excludes_file(store),
+        )
+    segment = int(item["segment"])
+    child_environment["EXPERIMENT_QUEUE_SEGMENT"] = str(segment)
+    child_environment["EXPERIMENT_QUEUE_WORKTREE"] = str(execution_root)
+    child_environment["EXPERIMENT_QUEUE_PRIMARY_REPO"] = str(store.repo_root)
+    if item["preemptible"]:
+        child_environment["EXPERIMENT_QUEUE_YIELD_REQUEST_PATH"] = str(
+            _yield_request_path(store, int(item["id"]), segment)
+        )
+        child_environment["EXPERIMENT_QUEUE_YIELD_RECEIPT_PATH"] = str(
+            _yield_receipt_path(store, int(item["id"]), segment)
+        )
+    if segment > 1:
+        required = {
+            "runner directory": item["runner_run_dir"],
+            "continuation checkpoint": item["continuation_checkpoint"],
+            "checkpoint SHA-256": item["continuation_checkpoint_sha256"],
+        }
+        missing = [label for label, value in required.items() if not value]
+        if missing:
+            raise QueueError(
+                f"queue item {item['id']} segment {segment} lacks " + ", ".join(missing)
+            )
+        checkpoint = Path(str(item["continuation_checkpoint"]))
+        if not checkpoint.is_file() or not hmac.compare_digest(
+            _sha256_file(checkpoint), str(item["continuation_checkpoint_sha256"])
+        ):
+            raise QueueError(
+                f"queue item {item['id']} continuation checkpoint is missing or changed: "
+                f"{checkpoint}"
+            )
+        child_environment["EXPERIMENT_QUEUE_CONTINUATION_RUN_DIR"] = str(
+            item["runner_run_dir"]
+        )
+        child_environment["EXPERIMENT_QUEUE_CONTINUATION_CHECKPOINT"] = str(checkpoint)
+        if item["continuation_wandb_id"]:
+            child_environment["EXPERIMENT_QUEUE_WANDB_ID"] = str(
+                item["continuation_wandb_id"]
+            )
+    return execution_root, command_text, child_environment
 
 
 def require_clean_git(repo_root: Path) -> str:
@@ -1895,7 +2061,7 @@ class Scheduler:
         self.termination_grace_seconds = termination_grace_seconds
         self.max_consecutive_failures = max_consecutive_failures
         self.gpu_provider = gpu_provider
-        self.processes: dict[int, _ForkedExecutor] = {}
+        self.processes: dict[int, subprocess.Popen[bytes]] = {}
         self.gpu_locks: dict[str, Any] = {}
         self._stop = False
         self._last_gpu_poll = 0.0
@@ -1946,43 +2112,6 @@ class Scheduler:
                 "control_seconds": self.control_seconds,
             },
         )
-
-    def _fork_executor(
-        self,
-        item_id: int,
-        launcher_log: Any,
-        environment: Mapping[str, str],
-    ) -> _ForkedExecutor:
-        """Fork loaded scheduler code so primary-checkout edits cannot change it."""
-
-        sys.stdout.flush()
-        sys.stderr.flush()
-        pid = os.fork()
-        if pid:
-            return _ForkedExecutor(pid)
-        exit_code = 2
-        try:
-            os.setsid()
-            inherited_locks = [self._scheduler_lock, *self.gpu_locks.values()]
-            for lock_file in inherited_locks:
-                if lock_file is not None:
-                    lock_file.close()
-            null_fd = os.open(os.devnull, os.O_RDONLY)
-            os.dup2(null_fd, 0)
-            if null_fd > 2:
-                os.close(null_fd)
-            log_fd = launcher_log.fileno()
-            os.dup2(log_fd, 1)
-            os.dup2(log_fd, 2)
-            if log_fd > 2:
-                launcher_log.close()
-            os.environ.clear()
-            os.environ.update(environment)
-            exit_code = execute_item(self.store, item_id)
-        except BaseException:
-            traceback.print_exc()
-        finally:
-            os._exit(int(exit_code))
 
     def _recover_gpu_locks(self) -> None:
         with self.store.connect() as connection:
@@ -2150,11 +2279,6 @@ class Scheduler:
                 },
             )
         self._release_gpu_lock(item["assigned_gpu_uuid"])
-        cleanup_item_worktree(
-            self.store,
-            self.store.item(int(item["id"])),
-            actor="scheduler",
-        )
         print(
             f"[{utc_now_iso()}] queue item {item['id']} yielded at step "
             f"{int(yield_receipt['step']):,} and returned to the queue front",
@@ -2298,6 +2422,11 @@ class Scheduler:
                 ):
                     connection.execute("DELETE FROM gpu_allowlist WHERE uuid = ?", (uuid,))
         self._release_gpu_lock(item["assigned_gpu_uuid"])
+        cleanup_item_worktree(
+            self.store,
+            self.store.item(int(item["id"])),
+            actor="scheduler",
+        )
         print(
             f"[{utc_now_iso()}] queue item {item['id']} {item['experiment_id']}/a{item['attempt']} "
             f"finished as {final_state} (return_code={return_code})",
@@ -2327,6 +2456,13 @@ class Scheduler:
                     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
                 except (OSError, json.JSONDecodeError):
                     continue
+                if process is not None:
+                    try:
+                        process.wait(timeout=1.0)
+                    except subprocess.TimeoutExpired:
+                        # The receipt is durable and authoritative. A later
+                        # parent-process exit will still reap this rare straggler.
+                        pass
                 self.processes.pop(item_id, None)
                 self._finalize_item(item, receipt)
             elif not _pid_matches(item):
@@ -2340,12 +2476,23 @@ class Scheduler:
         with self.store.connect() as connection:
             items = list(
                 connection.execute(
-                    f"SELECT * FROM queue_items WHERE state IN ({placeholders}) "
+                    "SELECT queue_items.*, (SELECT created_at FROM events "
+                    "WHERE events.queue_item_id = queue_items.id "
+                    "AND events.event_type = 'EXPERIMENT_WORKTREE_CLEANUP_FAILED' "
+                    "ORDER BY events.id DESC LIMIT 1) AS cleanup_last_attempt_at "
+                    f"FROM queue_items WHERE state IN ({placeholders}) "
                     "AND git_ref IS NOT NULL AND worktree_removed_at IS NULL",
                     tuple(sorted(TERMINAL_STATES)),
                 )
             )
         for item in items:
+            last_attempt = item["cleanup_last_attempt_at"]
+            if last_attempt:
+                elapsed = datetime.now(timezone.utc) - datetime.fromisoformat(
+                    str(last_attempt)
+                )
+                if elapsed.total_seconds() < WORKTREE_CLEANUP_RETRY_SECONDS:
+                    continue
             cleanup_item_worktree(self.store, item, actor="scheduler")
 
     def _reconcile_yield_failures(self) -> None:
@@ -2488,6 +2635,9 @@ class Scheduler:
         try:
             worktree = prepare_item_worktree(self.store, item)
             item = self.store.item(int(item["id"]))
+            execution_root, effective_command, execution_environment = (
+                _item_execution_context(self.store, item, os.environ)
+            )
         except QueueError as exc:
             detail = str(exc)
             with self.store.connect() as connection:
@@ -2549,10 +2699,31 @@ class Scheduler:
         attempt_dir = _segment_dir(self.store, item_id, segment)
         attempt_dir.mkdir(parents=True, exist_ok=True)
         launcher_log = (attempt_dir / "launcher.log").open("ab", buffering=0)
-        env = os.environ.copy()
+        env = execution_environment
         env["CUDA_VISIBLE_DEVICES"] = gpu.uuid
         env["EXPERIMENT_QUEUE_ITEM_ID"] = str(item_id)
         env["EXPERIMENT_QUEUE_GPU_UUID"] = gpu.uuid
+        executor_payload_path = attempt_dir / "executor.json"
+        _atomic_write_json(
+            executor_payload_path,
+            {
+                "command": effective_command,
+                "cwd": str(execution_root),
+                "receipt_path": str(self._receipt_path(item_id, segment)),
+                "receipt": {
+                    "schema_version": 2,
+                    "queue_item_id": item_id,
+                    "experiment_id": item["experiment_id"],
+                    "attempt": item["attempt"],
+                    "segment": segment,
+                    "git_commit": item["git_commit"],
+                    "git_ref": item["git_ref"],
+                    "worktree": str(execution_root),
+                    "command_sha256": _sha256_bytes(effective_command.encode("utf-8")),
+                    "gpu_uuid": gpu.uuid,
+                },
+            },
+        )
         with self.store.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             cursor = connection.execute(
@@ -2580,7 +2751,20 @@ class Scheduler:
                 },
             )
         try:
-            process = self._fork_executor(item_id, launcher_log, env)
+            process = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    _DURABLE_EXECUTOR_SOURCE,
+                    str(executor_payload_path),
+                ],
+                cwd=execution_root,
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=launcher_log,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
         except OSError as exc:
             self._release_gpu_lock(gpu.uuid)
             with self.store.connect() as connection:
@@ -2888,18 +3072,11 @@ def execute_item(store: QueueStore, item_id: int) -> int:
     item = store.item(item_id)
     if item["state"] not in RUNNING_STATES:
         raise QueueError(f"queue item {item_id} is {item['state']}; executor requires a running state")
-    if item["git_ref"]:
-        execution_root = _expected_worktree_path(store, item)
-        valid, detail = _worktree_identity(store, item, execution_root)
-        if not valid:
-            raise QueueError(
-                detail or f"queue item {item_id} isolated worktree failed validation"
-            )
-        command_text = _command_for_worktree(str(item["command_text"]), execution_root)
-    else:
-        # Legacy attempts admitted before schema v3 retain shared-checkout behavior.
-        execution_root = store.repo_root
-        command_text = str(item["command_text"])
+    execution_root, command_text, child_environment = _item_execution_context(
+        store,
+        item,
+        os.environ,
+    )
     segment = int(item["segment"])
     attempt_dir = _segment_dir(store, item_id, segment)
     attempt_dir.mkdir(parents=True, exist_ok=True)
@@ -2916,43 +3093,6 @@ def execute_item(store: QueueStore, item_id: int) -> int:
                 pass
 
     started_at = utc_now_iso()
-    child_environment = os.environ.copy()
-    child_environment["EXPERIMENT_QUEUE_SEGMENT"] = str(segment)
-    child_environment["EXPERIMENT_QUEUE_WORKTREE"] = str(execution_root)
-    child_environment["EXPERIMENT_QUEUE_PRIMARY_REPO"] = str(store.repo_root)
-    if item["preemptible"]:
-        child_environment["EXPERIMENT_QUEUE_YIELD_REQUEST_PATH"] = str(
-            _yield_request_path(store, item_id, segment)
-        )
-        child_environment["EXPERIMENT_QUEUE_YIELD_RECEIPT_PATH"] = str(
-            _yield_receipt_path(store, item_id, segment)
-        )
-    if segment > 1:
-        required = {
-            "runner directory": item["runner_run_dir"],
-            "continuation checkpoint": item["continuation_checkpoint"],
-            "checkpoint SHA-256": item["continuation_checkpoint_sha256"],
-        }
-        missing = [label for label, value in required.items() if not value]
-        if missing:
-            raise QueueError(
-                f"queue item {item_id} segment {segment} lacks " + ", ".join(missing)
-            )
-        checkpoint = Path(str(item["continuation_checkpoint"]))
-        if not checkpoint.is_file() or not hmac.compare_digest(
-            _sha256_file(checkpoint), str(item["continuation_checkpoint_sha256"])
-        ):
-            raise QueueError(
-                f"queue item {item_id} continuation checkpoint is missing or changed: {checkpoint}"
-            )
-        child_environment["EXPERIMENT_QUEUE_CONTINUATION_RUN_DIR"] = str(
-            item["runner_run_dir"]
-        )
-        child_environment["EXPERIMENT_QUEUE_CONTINUATION_CHECKPOINT"] = str(checkpoint)
-        if item["continuation_wandb_id"]:
-            child_environment["EXPERIMENT_QUEUE_WANDB_ID"] = str(
-                item["continuation_wandb_id"]
-            )
     previous_handlers: dict[int, Any] = {}
     for signum in (signal.SIGINT, signal.SIGTERM):
         previous_handlers[signum] = signal.signal(signum, forward)
@@ -3084,6 +3224,18 @@ def format_status(store: QueueStore, *, as_json: bool = False) -> str:
             if dependency["state"] != "succeeded"
         ]
         detail = str(item["state_detail"] or "")
+        if item["worktree_cleanup_error"]:
+            cleanup_detail = f"worktree cleanup pending: {item['worktree_cleanup_error']}"
+            detail = f"{detail}; {cleanup_detail}" if detail else cleanup_detail
+        elif item["worktree_removed_at"]:
+            isolation_detail = f"commit {str(item['git_commit'])[:12]} · worktree cleaned"
+            detail = f"{detail}; {isolation_detail}" if detail else isolation_detail
+        elif item["worktree_path"]:
+            isolation_detail = f"commit {str(item['git_commit'])[:12]} · isolated worktree ready"
+            detail = f"{detail}; {isolation_detail}" if detail else isolation_detail
+        elif item["git_ref"]:
+            isolation_detail = f"commit {str(item['git_commit'])[:12]} · pinned"
+            detail = f"{detail}; {isolation_detail}" if detail else isolation_detail
         if waiting:
             dependency_detail = "waiting on " + ",".join(waiting)
             detail = f"{detail}; {dependency_detail}" if detail else dependency_detail

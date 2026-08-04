@@ -132,9 +132,12 @@ and root `data/` is never part of experiment-output cleanup.
 shared unmanaged host and launch exact card commands through the normal
 runner. Queue admission is never inferred: David explicitly adds every
 experiment ID, and a ready card or `prepared_locally` ledger state does not
-create queue membership. The ignored `gpu_scheduler_state/` directory owns the
-live SQLite journal, web authentication hashes, reservations, continuation
-segments, and receipts. The separate private HTTPS interface in
+create queue membership. Each admitted commit is pinned and runs from a
+detached per-item worktree, so the primary checkout can advance without
+changing queued code; terminal worktrees are reclaimed without deleting
+shared artifacts. The ignored `gpu_scheduler_state/` directory owns the live
+SQLite journal, code worktrees, web authentication hashes, reservations,
+continuation segments, and receipts. The separate private HTTPS interface in
 `scripts/run_experiment_queue_web.py` exposes an administrator dashboard and a
 restricted coworker reservation page over that same state. `STATUS.md` remains
 the scientific ledger and is updated only from David's reports and synchronized

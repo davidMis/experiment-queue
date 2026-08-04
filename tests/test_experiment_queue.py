@@ -61,6 +61,7 @@ class TemporaryQueueRepository:
             "import argparse\n"
             "import json\n"
             "import os\n"
+            "import subprocess\n"
             "import time\n"
             "from pathlib import Path\n"
             "parser = argparse.ArgumentParser()\n"
@@ -72,7 +73,8 @@ class TemporaryQueueRepository:
             "parser.add_argument('--yield-aware', action='store_true')\n"
             "args = parser.parse_args()\n"
             "marker = Path(os.environ['QUEUE_TEST_MARKER'])\n"
-            "marker.write_text(json.dumps({'gpu': os.environ.get('CUDA_VISIBLE_DEVICES')}))\n"
+            "head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()\n"
+            "marker.write_text(json.dumps({'gpu': os.environ.get('CUDA_VISIBLE_DEVICES'), 'cwd': str(Path.cwd()), 'head': head, 'worktree': os.environ.get('EXPERIMENT_QUEUE_WORKTREE')}))\n"
             "if args.yield_aware and os.environ.get('EXPERIMENT_QUEUE_CONTINUATION_CHECKPOINT'):\n"
             "    print('run directory: ' + os.environ['EXPERIMENT_QUEUE_CONTINUATION_RUN_DIR'])\n"
             "    print('manifest: ' + os.environ['EXPERIMENT_QUEUE_CONTINUATION_RUN_DIR'] + '/manifest.json')\n"
@@ -83,7 +85,7 @@ class TemporaryQueueRepository:
             "    request_value = os.environ.get('EXPERIMENT_QUEUE_YIELD_REQUEST_PATH')\n"
             "    if args.yield_aware and request_value and Path(request_value).is_file():\n"
             "        request = json.loads(Path(request_value).read_text())\n"
-            "        run_dir = Path.cwd() / 'outputs' / 'experiments' / 'fake-run'\n"
+            "        run_dir = (Path.cwd() / 'outputs' / 'experiments' / 'fake-run').resolve()\n"
             "        checkpoint_dir = run_dir / 'training' / 'checkpoints'\n"
             "        checkpoint_dir.mkdir(parents=True, exist_ok=True)\n"
             "        checkpoint = checkpoint_dir / 'preempt_step_00000005.msgpack'\n"
@@ -134,9 +136,13 @@ class TemporaryQueueRepository:
             f"# {experiment_id}: Queue Test\n\n"
             "## Exact Manual Command On Mutton2\n\n"
             "```bash\n"
+            "(\n"
+            "set -euo pipefail\n"
+            "cd ~/3D_Helmholtz\n"
             f"python3 scripts/run_experiment.py --name {experiment_id.lower()} "
             f"--require-clean --remote mutton2 --sleep {sleep} --exit-code {exit_code} "
             f"{'--yield-aware' if yield_aware else ''}\n"
+            ")\n"
             "```\n\n"
             "## Expected Artifacts\n\nTest-only marker.\n",
             encoding="utf-8",
@@ -268,7 +274,7 @@ class ExperimentQueueTests(unittest.TestCase):
 
             migrated = QueueStore(state_dir, root)
 
-            self.assertEqual(migrated.get_meta("schema_version"), "2")
+            self.assertEqual(migrated.get_meta("schema_version"), "3")
             with migrated.connect() as connection:
                 columns = {
                     row["name"] for row in connection.execute("PRAGMA table_info(queue_items)")
@@ -281,6 +287,8 @@ class ExperimentQueueTests(unittest.TestCase):
                 }
             self.assertIn("preemptible", columns)
             self.assertIn("segment", columns)
+            self.assertIn("git_ref", columns)
+            self.assertIn("worktree_path", columns)
             self.assertIn("gpu_reservations", tables)
 
     def test_current_queue_candidate_cards_have_exact_runner_commands(self) -> None:
@@ -309,8 +317,36 @@ class ExperimentQueueTests(unittest.TestCase):
         self.assertNotIn("TST-002", format_status(self.repo.store))
         self.assertNotIn("TST-999", format_status(self.repo.store))
 
+    def test_v2_migration_pins_an_existing_pending_item(self) -> None:
+        item_id = add_experiment(self.repo.store, "TST-001")
+        item = self.repo.store.item(item_id)
+        subprocess.run(
+            ["git", "update-ref", "-d", str(item["git_ref"])],
+            cwd=self.repo.root,
+            check=True,
+        )
+        with self.repo.store.connect() as connection:
+            connection.execute("UPDATE metadata SET value = '2' WHERE key = 'schema_version'")
+            connection.execute(
+                "UPDATE queue_items SET git_ref = NULL WHERE id = ?",
+                (item_id,),
+            )
+
+        migrated = QueueStore(self.repo.state_dir, self.repo.root)
+
+        item = migrated.item(item_id)
+        self.assertEqual(migrated.get_meta("schema_version"), "3")
+        self.assertEqual(item["git_ref"], f"refs/experiment-queue/items/{item_id}")
+        pinned = subprocess.check_output(
+            ["git", "rev-parse", str(item["git_ref"])],
+            cwd=self.repo.root,
+            text=True,
+        ).strip()
+        self.assertEqual(pinned, item["git_commit"])
+
     def test_remove_preserves_history_and_explicit_readd_creates_new_membership(self) -> None:
         first = add_experiment(self.repo.store, "TST-001")
+        first_ref = str(self.repo.store.item(first)["git_ref"])
         remove_item(self.repo.store, first, "operator changed ordering")
         second = add_experiment(self.repo.store, "TST-001")
 
@@ -318,6 +354,15 @@ class ExperimentQueueTests(unittest.TestCase):
         items = self.repo.store.list_items()
         self.assertEqual([item["state"] for item in items], ["removed", "queued"])
         self.assertEqual([item["attempt"] for item in items], [1, 2])
+        self.assertIsNotNone(items[0]["worktree_removed_at"])
+        self.assertNotEqual(
+            subprocess.run(
+                ["git", "show-ref", "--verify", first_ref],
+                cwd=self.repo.root,
+                check=False,
+            ).returncode,
+            0,
+        )
 
     def test_removing_dependency_holds_its_pending_dependent(self) -> None:
         prerequisite = add_experiment(self.repo.store, "TST-001")
@@ -512,37 +557,85 @@ class ExperimentQueueTests(unittest.TestCase):
         self.assertEqual(item["terminate_reason"], "unit-test force stop")
 
     @unittest.skipIf(os.name != "posix", "process-group termination is POSIX-specific")
-    def test_repository_drift_pauses_future_dispatch_without_killing_job(self) -> None:
+    def test_pinned_worktrees_ignore_primary_updates_and_cleanup_when_terminal(self) -> None:
         gpu = self.gpu()
         update_gpu_allowlist(self.repo.store, "set", ["0"], snapshots=[gpu])
-        item_id = add_experiment(self.repo.store, "TST-003")
+        first_id = add_experiment(self.repo.store, "TST-003")
+        first = self.repo.store.item(first_id)
+        first_commit = str(first["git_commit"])
+        first_ref = str(first["git_ref"])
+        ref_head = subprocess.check_output(
+            ["git", "rev-parse", first_ref], cwd=self.repo.root, text=True
+        ).strip()
+        self.assertEqual(ref_head, first_commit)
+        self.assertIsNone(first["worktree_path"])
+
+        (self.repo.root / "STATUS.md").write_text("# committed after first admission\n", encoding="utf-8")
+        self.repo._git("add", "STATUS.md")
+        self.repo._git("commit", "-qm", "primary checkout update")
+        second_commit = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=self.repo.root, text=True
+        ).strip()
+        self.assertNotEqual(second_commit, first_commit)
+        second_id = add_experiment(self.repo.store, "TST-001")
+
         scheduler = Scheduler(
             self.repo.store,
-            poll_seconds=100,
+            poll_seconds=0.01,
             min_free_disk_gib=0,
             gpu_provider=lambda: [gpu],
         )
         scheduler.run_iteration(force_gpu_poll=True)
-        self.assertEqual(self.repo.store.item(item_id)["state"], "running")
+        first = self.repo.store.item(first_id)
+        self.assertEqual(first["state"], "running")
+        first_worktree = Path(str(first["worktree_path"]))
+        self.assertTrue(first_worktree.is_dir())
 
-        (self.repo.root / "STATUS.md").write_text("# changed during run\n", encoding="utf-8")
+        marker_deadline = time.monotonic() + 5
+        while time.monotonic() < marker_deadline and not self.marker.is_file():
+            time.sleep(0.02)
+        marker = json.loads(self.marker.read_text(encoding="utf-8"))
+        self.assertEqual(marker["head"], first_commit)
+        self.assertEqual(Path(marker["cwd"]), first_worktree)
+        self.assertEqual(marker["worktree"], str(first_worktree))
+
+        (self.repo.root / "STATUS.md").write_text("# uncommitted during run\n", encoding="utf-8")
         scheduler.run_iteration(force_gpu_poll=True)
 
-        item = self.repo.store.item(item_id)
-        self.assertEqual(item["state"], "running")
-        self.assertTrue(item["repo_drift_detected"])
-        self.assertEqual(self.repo.store.get_meta("dispatch_paused"), "1")
+        first = self.repo.store.item(first_id)
+        self.assertEqual(first["state"], "running")
+        self.assertFalse(first["repo_drift_detected"])
+        self.assertEqual(self.repo.store.get_meta("dispatch_paused"), "0")
 
         request_termination(
-            self.repo.store, item_id, reason="clean up repo-drift test", force=True
+            self.repo.store, first_id, reason="finish worktree-isolation test", force=True
         )
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
-            scheduler.run_iteration(force_gpu_poll=False)
-            if self.repo.store.item(item_id)["state"] == "force_killed":
+            scheduler.run_iteration(force_gpu_poll=True)
+            first_state = self.repo.store.item(first_id)["state"]
+            second_state = self.repo.store.item(second_id)["state"]
+            if first_state == "force_killed" and second_state == "succeeded":
                 break
             time.sleep(0.05)
-        self.assertEqual(self.repo.store.item(item_id)["state"], "force_killed")
+        first = self.repo.store.item(first_id)
+        second = self.repo.store.item(second_id)
+        self.assertEqual(first["state"], "force_killed")
+        self.assertEqual(second["state"], "succeeded")
+        self.assertIsNotNone(first["worktree_removed_at"])
+        self.assertIsNotNone(second["worktree_removed_at"])
+        self.assertFalse(first_worktree.exists())
+        self.assertFalse(Path(str(second["worktree_path"])).exists())
+        self.assertNotEqual(
+            subprocess.run(
+                ["git", "show-ref", "--verify", first_ref],
+                cwd=self.repo.root,
+                check=False,
+            ).returncode,
+            0,
+        )
+        marker = json.loads(self.marker.read_text(encoding="utf-8"))
+        self.assertEqual(marker["head"], second_commit)
 
     def test_two_consecutive_child_failures_pause_dispatch(self) -> None:
         gpu = self.gpu()
@@ -648,6 +741,16 @@ class ExperimentQueueTests(unittest.TestCase):
         self.assertEqual(item["continuation_step"], 5)
         self.assertEqual(item["continuation_wandb_id"], "fake-wandb-id")
         self.assertEqual(item["resume_front"], 1)
+        worktree = Path(str(item["worktree_path"]))
+        git_ref = str(item["git_ref"])
+        self.assertTrue(worktree.is_dir())
+        self.assertIsNone(item["worktree_removed_at"])
+        self.assertEqual(
+            subprocess.check_output(
+                ["git", "rev-parse", git_ref], cwd=self.repo.root, text=True
+            ).strip(),
+            item["git_commit"],
+        )
 
         deadline = time.monotonic() + 15
         while time.monotonic() < deadline:
@@ -659,6 +762,8 @@ class ExperimentQueueTests(unittest.TestCase):
         self.assertEqual(item["state"], "succeeded")
         self.assertEqual(item["segment"], 2)
         self.assertEqual(item["assigned_gpu_uuid"], gpu1.uuid)
+        self.assertIsNotNone(item["worktree_removed_at"])
+        self.assertFalse(worktree.exists())
 
     def test_query_gpus_parses_inventory_and_processes(self) -> None:
         executable = self.repo.root / "fake-nvidia-smi"
