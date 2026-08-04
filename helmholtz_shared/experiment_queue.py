@@ -26,17 +26,33 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 import uuid as uuid_module
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterable, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from helmholtz_shared.experiment_runner import collect_git_context
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 DEFAULT_STATE_DIR = Path("gpu_scheduler_state")
+WORKTREE_ROOT_NAME = "worktrees"
+SHARED_WORKTREE_PATHS = (
+    ".env",
+    ".venv",
+    "data",
+    "experiments",
+    "figures",
+    "logs",
+    "model",
+    "out",
+    "outputs",
+    "oxy_updates",
+    "papers",
+    "runs",
+)
 ACTIVE_STATES = {
     "queued",
     "held",
@@ -101,6 +117,42 @@ class CardCommand:
     card_sha256: str
     command_text: str
     runner_name: str
+
+
+class _ForkedExecutor:
+    """Small ``Popen``-like handle for an inherited durable executor."""
+
+    def __init__(self, pid: int):
+        self.pid = pid
+        self.returncode: int | None = None
+
+    def poll(self) -> int | None:
+        """Reap the executor without blocking and return its exit code."""
+
+        if self.returncode is not None:
+            return self.returncode
+        try:
+            waited_pid, status = os.waitpid(self.pid, os.WNOHANG)
+        except ChildProcessError:
+            return self.returncode
+        if waited_pid == self.pid:
+            self.returncode = os.waitstatus_to_exitcode(status)
+        return self.returncode
+
+    def kill(self) -> None:
+        """Send SIGKILL to the executor process."""
+
+        os.kill(self.pid, signal.SIGKILL)
+
+    def wait(self, timeout: float | None = None) -> int:
+        """Wait for the executor, matching the subset of ``Popen`` we use."""
+
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while self.poll() is None:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise subprocess.TimeoutExpired(str(self.pid), timeout)
+            time.sleep(0.01)
+        return int(self.returncode)
 
 
 def utc_now_iso() -> str:
@@ -256,6 +308,11 @@ class QueueStore:
                     continuation_checkpoint_sha256 TEXT,
                     continuation_step INTEGER,
                     continuation_wandb_id TEXT,
+                    git_ref TEXT,
+                    worktree_path TEXT,
+                    worktree_created_at TEXT,
+                    worktree_removed_at TEXT,
+                    worktree_cleanup_error TEXT,
                     UNIQUE(experiment_id, attempt)
                 );
 
@@ -327,18 +384,21 @@ class QueueStore:
                 self._event(connection, "QUEUE_INITIALIZED", payload={"repo_root": str(self.repo_root)})
             else:
                 version = int(existing_version["value"])
-                if version not in {1, SCHEMA_VERSION}:
+                if version not in {1, 2, SCHEMA_VERSION}:
                     raise QueueError(
                         f"queue schema {existing_version['value']} is not supported; "
-                        f"expected 1 or {SCHEMA_VERSION}"
+                        f"expected 1, 2, or {SCHEMA_VERSION}"
                     )
-                if version == 1:
-                    self._migrate_v1_to_v2(connection)
                 recorded_root = self.get_meta("repo_root", connection=connection)
                 if Path(recorded_root).resolve() != self.repo_root:
                     raise QueueError(
                         f"queue belongs to repository {recorded_root}, not {self.repo_root}"
                     )
+                if version == 1:
+                    self._migrate_v1_to_v2(connection)
+                    version = 2
+                if version == 2:
+                    self._migrate_v2_to_v3(connection)
             connection.execute("PRAGMA optimize")
 
     def _migrate_v1_to_v2(self, connection: sqlite3.Connection) -> None:
@@ -367,8 +427,84 @@ class QueueStore:
                 connection.execute(
                     f"ALTER TABLE queue_items ADD COLUMN {name} {declaration}"
                 )
-        self._set_meta(connection, "schema_version", str(SCHEMA_VERSION))
+        self._set_meta(connection, "schema_version", "2")
         self._event(connection, "QUEUE_SCHEMA_MIGRATED", payload={"from": 1, "to": 2})
+
+    def _migrate_v2_to_v3(self, connection: sqlite3.Connection) -> None:
+        """Pin pending commits and add isolated-worktree lifecycle fields."""
+
+        columns = {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(queue_items)")
+        }
+        additions = {
+            "git_ref": "TEXT",
+            "worktree_path": "TEXT",
+            "worktree_created_at": "TEXT",
+            "worktree_removed_at": "TEXT",
+            "worktree_cleanup_error": "TEXT",
+        }
+        for name, declaration in additions.items():
+            if name not in columns:
+                connection.execute(
+                    f"ALTER TABLE queue_items ADD COLUMN {name} {declaration}"
+                )
+        if "git_commit" not in columns:
+            item_count = int(connection.execute("SELECT COUNT(*) FROM queue_items").fetchone()[0])
+            if item_count:
+                raise QueueError(
+                    "queue schema v2 has items but no git_commit column; restore the original "
+                    "queue database before migrating"
+                )
+            active: list[sqlite3.Row] = []
+        else:
+            active = list(
+                connection.execute(
+                    "SELECT id, git_commit, state FROM queue_items WHERE state IN "
+                    "('queued','held','blocked','starting','running','yielding','terminating','force_killing')"
+                )
+            )
+        for item in active:
+            item_id = int(item["id"])
+            if item["state"] in RUNNING_STATES:
+                detail = (
+                    "legacy shared-checkout attempt created before isolated worktrees; "
+                    "do not update the primary checkout until this process is terminal"
+                )
+                connection.execute(
+                    "UPDATE queue_items SET worktree_cleanup_error = ?, "
+                    "state_detail = COALESCE(state_detail, ?) WHERE id = ?",
+                    (detail, detail, item_id),
+                )
+                continue
+            git_ref = _queue_git_ref(item_id)
+            pinned = _git_completed(
+                self.repo_root,
+                "update-ref",
+                git_ref,
+                str(item["git_commit"]),
+            )
+            if pinned.returncode == 0:
+                connection.execute(
+                    "UPDATE queue_items SET git_ref = ? WHERE id = ?",
+                    (git_ref, item_id),
+                )
+            else:
+                detail = (
+                    f"could not pin queued commit {item['git_commit']}: "
+                    f"{pinned.stderr.strip() or pinned.stdout.strip()}"
+                )
+                connection.execute(
+                    "UPDATE queue_items SET state = 'held', state_detail = ?, "
+                    "worktree_cleanup_error = ? WHERE id = ?",
+                    (detail, detail, item_id),
+                )
+        self._set_meta(connection, "schema_version", str(SCHEMA_VERSION))
+        self._event(
+            connection,
+            "QUEUE_SCHEMA_MIGRATED",
+            payload={"from": 2, "to": SCHEMA_VERSION},
+        )
 
     @staticmethod
     def _set_meta(connection: sqlite3.Connection, key: str, value: str) -> None:
@@ -449,6 +585,36 @@ class QueueStore:
             return list(connection.execute("SELECT * FROM queue_items ORDER BY id"))
 
 
+def _queue_git_ref(item_id: int) -> str:
+    """Return the private Git ref that keeps one queued commit reachable."""
+
+    if item_id < 1:
+        raise QueueError(f"queue item ID must be positive, got {item_id}")
+    return f"refs/experiment-queue/items/{item_id}"
+
+
+def _item_value(item: Mapping[str, Any], key: str) -> Any:
+    """Read a field from either a dictionary or ``sqlite3.Row``."""
+
+    try:
+        return item[key]
+    except (KeyError, IndexError):
+        return None
+
+
+def _expected_worktree_path(store: QueueStore, item: Mapping[str, Any]) -> Path:
+    """Return and validate the scheduler-owned worktree path for one item."""
+
+    commit = str(item["git_commit"])
+    if not re.fullmatch(r"[0-9a-fA-F]{7,64}", commit):
+        raise QueueError(f"queue item {item['id']} has invalid Git commit {commit!r}")
+    root = (store.state_dir / WORKTREE_ROOT_NAME).resolve()
+    path = (root / f"item-{int(item['id'])}-{commit[:12].lower()}").resolve()
+    if path.parent != root:
+        raise QueueError(f"unsafe queue worktree path resolved outside {root}: {path}")
+    return path
+
+
 def _git_completed(repo_root: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ["git", *arguments],
@@ -459,6 +625,240 @@ def _git_completed(repo_root: Path, *arguments: str) -> subprocess.CompletedProc
         timeout=15,
         check=False,
     )
+
+
+def _git_error(operation: str, result: subprocess.CompletedProcess[str]) -> QueueError:
+    detail = result.stderr.strip() or result.stdout.strip() or f"exit code {result.returncode}"
+    return QueueError(f"Git could not {operation}: {detail}")
+
+
+def _pin_item_commit(repo_root: Path, item_id: int, commit: str) -> str:
+    """Create the queue-owned ref that protects an admitted commit from pruning."""
+
+    git_ref = _queue_git_ref(item_id)
+    result = _git_completed(repo_root, "update-ref", git_ref, commit)
+    if result.returncode != 0:
+        raise _git_error(f"pin commit {commit} for queue item {item_id}", result)
+    return git_ref
+
+
+def _delete_item_ref(repo_root: Path, item_id: int, commit: str) -> None:
+    """Delete only the exact queue-owned ref for one terminal item."""
+
+    result = _git_completed(
+        repo_root,
+        "update-ref",
+        "-d",
+        _queue_git_ref(item_id),
+        commit,
+    )
+    if result.returncode != 0:
+        raise _git_error(f"delete pinned ref for queue item {item_id}", result)
+
+
+def _worktree_identity(
+    store: QueueStore,
+    item: Mapping[str, Any],
+    worktree: Path,
+) -> tuple[bool, str | None]:
+    """Verify commit, cleanliness, and card bytes inside an item worktree."""
+
+    head = _git_completed(worktree, "rev-parse", "HEAD")
+    if head.returncode != 0:
+        return False, str(_git_error(f"read HEAD in {worktree}", head))
+    if head.stdout.strip() != str(item["git_commit"]):
+        return False, (
+            f"worktree HEAD {head.stdout.strip()} differs from queued commit "
+            f"{item['git_commit']}"
+        )
+    status = _git_completed(worktree, "status", "--porcelain", "--untracked-files=normal")
+    if status.returncode != 0:
+        return False, str(_git_error(f"inspect worktree {worktree}", status))
+    if status.stdout.strip():
+        return False, f"isolated worktree is dirty: {status.stdout.strip()}"
+    card_path = worktree / str(item["card_path"])
+    if not card_path.is_file():
+        return False, f"queued card is missing from isolated worktree: {card_path}"
+    if _sha256_bytes(card_path.read_bytes()) != str(item["card_sha256"]):
+        return False, f"queued card hash changed inside isolated worktree: {card_path}"
+    return True, None
+
+
+def _link_shared_worktree_paths(store: QueueStore, worktree: Path) -> list[str]:
+    """Link ignored runtime/data/artifact roots into an isolated code worktree."""
+
+    (store.repo_root / "outputs").mkdir(parents=True, exist_ok=True)
+    linked: list[str] = []
+    for name in SHARED_WORKTREE_PATHS:
+        source = store.repo_root / name
+        if not source.exists() and not source.is_symlink():
+            continue
+        target = worktree / name
+        if os.path.lexists(target):
+            if target.is_symlink() and target.resolve() == source.resolve():
+                linked.append(name)
+                continue
+            raise QueueError(
+                f"isolated worktree path {target} already exists and cannot link shared {source}"
+            )
+        ignored = _git_completed(worktree, "check-ignore", "-q", "--", name)
+        if ignored.returncode != 0:
+            raise QueueError(
+                f"shared runtime path {name!r} is not ignored by queued commit "
+                f"{worktree.name}; add it to .gitignore before admitting the experiment"
+            )
+        target.symlink_to(source, target_is_directory=source.is_dir())
+        linked.append(name)
+    return linked
+
+
+def prepare_item_worktree(store: QueueStore, item: Mapping[str, Any]) -> Path:
+    """Materialize or verify one detached immutable code worktree."""
+
+    git_ref = str(_item_value(item, "git_ref") or "")
+    expected_ref = _queue_git_ref(int(item["id"]))
+    if git_ref != expected_ref:
+        raise QueueError(
+            f"queue item {item['id']} lacks its expected pinned ref {expected_ref}; "
+            "remove and explicitly re-add the item"
+        )
+    worktree = _expected_worktree_path(store, item)
+    recorded = _item_value(item, "worktree_path")
+    if recorded and Path(str(recorded)).resolve() != worktree:
+        raise QueueError(
+            f"queue item {item['id']} records unexpected worktree {recorded}; expected {worktree}"
+        )
+    if not worktree.exists():
+        worktree.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        added = _git_completed(
+            store.repo_root,
+            "worktree",
+            "add",
+            "--detach",
+            str(worktree),
+            git_ref,
+        )
+        if added.returncode != 0:
+            _git_completed(store.repo_root, "worktree", "prune")
+            added = _git_completed(
+                store.repo_root,
+                "worktree",
+                "add",
+                "--detach",
+                str(worktree),
+                git_ref,
+            )
+        if added.returncode != 0:
+            raise _git_error(f"create isolated worktree {worktree}", added)
+    linked = _link_shared_worktree_paths(store, worktree)
+    valid, detail = _worktree_identity(store, item, worktree)
+    if not valid:
+        raise QueueError(detail or f"isolated worktree validation failed: {worktree}")
+    if not recorded:
+        with store.connect() as connection:
+            connection.execute(
+                "UPDATE queue_items SET worktree_path = ?, worktree_created_at = ?, "
+                "worktree_removed_at = NULL, worktree_cleanup_error = NULL WHERE id = ?",
+                (str(worktree), utc_now_iso(), item["id"]),
+            )
+            store._event(
+                connection,
+                "EXPERIMENT_WORKTREE_CREATED",
+                queue_item_id=int(item["id"]),
+                payload={
+                    "path": str(worktree),
+                    "git_commit": item["git_commit"],
+                    "git_ref": git_ref,
+                    "shared_paths": linked,
+                },
+            )
+    return worktree
+
+
+def cleanup_item_worktree(
+    store: QueueStore,
+    item: Mapping[str, Any],
+    *,
+    actor: str | None = None,
+) -> bool:
+    """Remove one exact terminal worktree and its pinned ref, retaining artifacts."""
+
+    git_ref = _item_value(item, "git_ref")
+    if not git_ref:
+        return True
+    item_id = int(item["id"])
+    worktree = _expected_worktree_path(store, item)
+    recorded = _item_value(item, "worktree_path")
+    if recorded and Path(str(recorded)).resolve() != worktree:
+        detail = f"refused unexpected worktree cleanup target {recorded}; expected {worktree}"
+    else:
+        detail = None
+        if worktree.exists() or os.path.lexists(worktree):
+            removed = _git_completed(
+                store.repo_root,
+                "worktree",
+                "remove",
+                "--force",
+                str(worktree),
+            )
+            if removed.returncode != 0:
+                detail = str(_git_error(f"remove isolated worktree {worktree}", removed))
+        if detail is None:
+            try:
+                _delete_item_ref(store.repo_root, item_id, str(item["git_commit"]))
+            except QueueError as exc:
+                detail = str(exc)
+    with store.connect() as connection:
+        if detail is None:
+            connection.execute(
+                "UPDATE queue_items SET worktree_removed_at = ?, "
+                "worktree_cleanup_error = NULL WHERE id = ?",
+                (utc_now_iso(), item_id),
+            )
+            store._event(
+                connection,
+                "EXPERIMENT_WORKTREE_REMOVED",
+                queue_item_id=item_id,
+                payload={"path": str(worktree), "git_ref": git_ref},
+                actor=actor,
+            )
+        else:
+            connection.execute(
+                "UPDATE queue_items SET worktree_cleanup_error = ? WHERE id = ?",
+                (detail, item_id),
+            )
+            store._event(
+                connection,
+                "EXPERIMENT_WORKTREE_CLEANUP_FAILED",
+                queue_item_id=item_id,
+                payload={"path": str(worktree), "git_ref": git_ref, "error": detail},
+                actor=actor,
+            )
+    if detail is None:
+        _git_completed(store.repo_root, "worktree", "prune")
+        return True
+    return False
+
+
+def _command_for_worktree(command_text: str, worktree: Path) -> str:
+    """Redirect the card's canonical checkout line into its isolated worktree."""
+
+    replacement = 'cd -- "$EXPERIMENT_QUEUE_WORKTREE"'
+    lines = command_text.splitlines()
+    replaced = 0
+    for index, line in enumerate(lines):
+        if re.fullmatch(r"\s*cd\s+~/3D_Helmholtz\s*", line):
+            lines[index] = replacement
+            replaced += 1
+    transformed = "\n".join(lines)
+    if replaced > 1:
+        raise QueueError("card command changes to ~/3D_Helmholtz more than once")
+    if "~/3D_Helmholtz" in transformed:
+        raise QueueError(
+            "card command contains an unsupported primary-checkout reference; "
+            f"use one standalone 'cd ~/3D_Helmholtz' line: {worktree}"
+        )
+    return transformed
 
 
 def require_clean_git(repo_root: Path) -> str:
@@ -626,28 +1026,41 @@ def add_experiment(
             ),
         )
         item_id = int(cursor.lastrowid)
-        for dependency_id in dependency_ids:
+        git_ref = _pin_item_commit(store.repo_root, item_id, commit)
+        try:
             connection.execute(
-                "INSERT INTO dependencies(queue_item_id, dependency_item_id) VALUES (?, ?)",
-                (item_id, dependency_id),
+                "UPDATE queue_items SET git_ref = ? WHERE id = ?",
+                (git_ref, item_id),
             )
-        store._event(
-            connection,
-            "EXPERIMENT_ADDED",
-            queue_item_id=item_id,
-            payload={
-                "experiment_id": card.experiment_id,
-                "attempt": attempt,
-                "priority": priority,
-                "held": held,
-                "dependencies": list(dependency_ids),
-                "card_path": str(relative_card),
-                "card_sha256": card.card_sha256,
-                "git_commit": commit,
-                "preemptible": bool(preemptible),
-            },
-            actor=actor,
-        )
+            for dependency_id in dependency_ids:
+                connection.execute(
+                    "INSERT INTO dependencies(queue_item_id, dependency_item_id) VALUES (?, ?)",
+                    (item_id, dependency_id),
+                )
+            store._event(
+                connection,
+                "EXPERIMENT_ADDED",
+                queue_item_id=item_id,
+                payload={
+                    "experiment_id": card.experiment_id,
+                    "attempt": attempt,
+                    "priority": priority,
+                    "held": held,
+                    "dependencies": list(dependency_ids),
+                    "card_path": str(relative_card),
+                    "card_sha256": card.card_sha256,
+                    "git_commit": commit,
+                    "git_ref": git_ref,
+                    "preemptible": bool(preemptible),
+                },
+                actor=actor,
+            )
+        except BaseException:
+            try:
+                _delete_item_ref(store.repo_root, item_id, commit)
+            except QueueError:
+                pass
+            raise
     return item_id
 
 
@@ -733,6 +1146,7 @@ def remove_item(
                 payload={"dependency_item_id": item_id, "reason": detail},
                 actor=actor,
             )
+    cleanup_item_worktree(store, store.item(item_id), actor=actor)
 
 
 def hold_item(
@@ -1481,7 +1895,7 @@ class Scheduler:
         self.termination_grace_seconds = termination_grace_seconds
         self.max_consecutive_failures = max_consecutive_failures
         self.gpu_provider = gpu_provider
-        self.processes: dict[int, subprocess.Popen[bytes]] = {}
+        self.processes: dict[int, _ForkedExecutor] = {}
         self.gpu_locks: dict[str, Any] = {}
         self._stop = False
         self._last_gpu_poll = 0.0
@@ -1532,6 +1946,43 @@ class Scheduler:
                 "control_seconds": self.control_seconds,
             },
         )
+
+    def _fork_executor(
+        self,
+        item_id: int,
+        launcher_log: Any,
+        environment: Mapping[str, str],
+    ) -> _ForkedExecutor:
+        """Fork loaded scheduler code so primary-checkout edits cannot change it."""
+
+        sys.stdout.flush()
+        sys.stderr.flush()
+        pid = os.fork()
+        if pid:
+            return _ForkedExecutor(pid)
+        exit_code = 2
+        try:
+            os.setsid()
+            inherited_locks = [self._scheduler_lock, *self.gpu_locks.values()]
+            for lock_file in inherited_locks:
+                if lock_file is not None:
+                    lock_file.close()
+            null_fd = os.open(os.devnull, os.O_RDONLY)
+            os.dup2(null_fd, 0)
+            if null_fd > 2:
+                os.close(null_fd)
+            log_fd = launcher_log.fileno()
+            os.dup2(log_fd, 1)
+            os.dup2(log_fd, 2)
+            if log_fd > 2:
+                launcher_log.close()
+            os.environ.clear()
+            os.environ.update(environment)
+            exit_code = execute_item(self.store, item_id)
+        except BaseException:
+            traceback.print_exc()
+        finally:
+            os._exit(int(exit_code))
 
     def _recover_gpu_locks(self) -> None:
         with self.store.connect() as connection:
@@ -1699,6 +2150,11 @@ class Scheduler:
                 },
             )
         self._release_gpu_lock(item["assigned_gpu_uuid"])
+        cleanup_item_worktree(
+            self.store,
+            self.store.item(int(item["id"])),
+            actor="scheduler",
+        )
         print(
             f"[{utc_now_iso()}] queue item {item['id']} yielded at step "
             f"{int(yield_receipt['step']):,} and returned to the queue front",
@@ -1877,6 +2333,21 @@ class Scheduler:
                 self.processes.pop(item_id, None)
                 self._finalize_item(item, None)
 
+    def _reconcile_worktree_cleanup(self) -> None:
+        """Retry exact cleanup left incomplete by a prior stop or Git error."""
+
+        placeholders = ",".join("?" for _ in TERMINAL_STATES)
+        with self.store.connect() as connection:
+            items = list(
+                connection.execute(
+                    f"SELECT * FROM queue_items WHERE state IN ({placeholders}) "
+                    "AND git_ref IS NOT NULL AND worktree_removed_at IS NULL",
+                    tuple(sorted(TERMINAL_STATES)),
+                )
+            )
+        for item in items:
+            cleanup_item_worktree(self.store, item, actor="scheduler")
+
     def _reconcile_yield_failures(self) -> None:
         """Return a still-running job to normal state when checkpointing failed."""
 
@@ -1959,6 +2430,13 @@ class Scheduler:
                 )
 
     def _repo_identity_matches(self, item: sqlite3.Row) -> tuple[bool, str | None]:
+        if item["git_ref"]:
+            worktree = _expected_worktree_path(self.store, item)
+            if not worktree.is_dir():
+                return False, f"isolated worktree is missing: {worktree}"
+            return _worktree_identity(self.store, item, worktree)
+        # A process admitted before schema v3 still belongs to the shared
+        # checkout and retains the old safety rule until it is terminal.
         try:
             head = require_clean_git(self.store.repo_root)
         except QueueError as exc:
@@ -2007,6 +2485,28 @@ class Scheduler:
         )
 
     def _launch(self, item: sqlite3.Row, gpu: GpuSnapshot) -> bool:
+        try:
+            worktree = prepare_item_worktree(self.store, item)
+            item = self.store.item(int(item["id"]))
+        except QueueError as exc:
+            detail = str(exc)
+            with self.store.connect() as connection:
+                connection.execute(
+                    "UPDATE queue_items SET state_detail = ? WHERE id = ? AND state = 'queued'",
+                    (detail, item["id"]),
+                )
+                self.store._event(
+                    connection,
+                    "EXPERIMENT_WORKTREE_PREPARATION_FAILED",
+                    queue_item_id=int(item["id"]),
+                    payload={"reason": detail},
+                )
+            print(
+                f"[{utc_now_iso()}] worktree preparation deferred: {detail}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return False
         matches, detail = self._repo_identity_matches(item)
         if not matches:
             with self.store.connect() as connection:
@@ -2049,17 +2549,6 @@ class Scheduler:
         attempt_dir = _segment_dir(self.store, item_id, segment)
         attempt_dir.mkdir(parents=True, exist_ok=True)
         launcher_log = (attempt_dir / "launcher.log").open("ab", buffering=0)
-        executor_script = Path(__file__).resolve().parents[1] / "scripts" / "run_experiment_queue.py"
-        command = [
-            sys.executable,
-            str(executor_script),
-            "--repo-root",
-            str(self.store.repo_root),
-            "--state-dir",
-            str(self.store.state_dir),
-            "_execute",
-            str(item_id),
-        ]
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = gpu.uuid
         env["EXPERIMENT_QUEUE_ITEM_ID"] = str(item_id)
@@ -2091,17 +2580,8 @@ class Scheduler:
                 },
             )
         try:
-            process = subprocess.Popen(
-                command,
-                cwd=self.store.repo_root,
-                env=env,
-                stdin=subprocess.DEVNULL,
-                stdout=launcher_log,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
-            )
+            process = self._fork_executor(item_id, launcher_log, env)
         except OSError as exc:
-            launcher_log.close()
             self._release_gpu_lock(gpu.uuid)
             with self.store.connect() as connection:
                 connection.execute(
@@ -2116,6 +2596,7 @@ class Scheduler:
                     queue_item_id=item_id,
                     payload={"error": str(exc)},
                 )
+            cleanup_item_worktree(self.store, self.store.item(item_id), actor="scheduler")
             return False
         finally:
             launcher_log.close()
@@ -2151,7 +2632,13 @@ class Scheduler:
                 connection,
                 "EXPERIMENT_LAUNCHED",
                 queue_item_id=item_id,
-                payload={"pid": process.pid, "pgid": process.pid, "gpu_uuid": gpu.uuid},
+                payload={
+                    "pid": process.pid,
+                    "pgid": process.pid,
+                    "gpu_uuid": gpu.uuid,
+                    "git_commit": item["git_commit"],
+                    "worktree": str(worktree),
+                },
             )
         self.processes[item_id] = process
         if signal_after_launch is not None:
@@ -2250,7 +2737,7 @@ class Scheduler:
                     break
 
     def _check_running_repo_identity(self) -> None:
-        """Pause new dispatch if the shared checkout changes beneath running work."""
+        """Pause only when an active item's own execution checkout changes."""
 
         with self.store.connect() as connection:
             running = list(
@@ -2261,37 +2748,33 @@ class Scheduler:
             )
         if not running:
             return
-        try:
-            head = require_clean_git(self.store.repo_root)
-            base_reason = None
-        except QueueError as exc:
-            head = None
-            base_reason = str(exc)
         mismatched = [
-            item
+            (item, detail)
             for item in running
-            if base_reason is not None or head != str(item["git_commit"])
+            for matches, detail in (self._repo_identity_matches(item),)
+            if not matches
         ]
         if not mismatched:
             return
-        reason = base_reason or (
-            f"repository HEAD changed to {head} while queue jobs from another commit are running"
+        reason = "; ".join(
+            f"item {item['id']}: {detail or 'execution checkout identity mismatch'}"
+            for item, detail in mismatched
         )
         with self.store.connect() as connection:
             self.store._set_meta(connection, "dispatch_paused", "1")
             self.store._set_meta(connection, "pause_reason", reason)
-            for item in mismatched:
+            for item, item_reason in mismatched:
                 if not item["repo_drift_detected"]:
                     connection.execute(
                         "UPDATE queue_items SET repo_drift_detected = 1, "
                         "state_detail = COALESCE(state_detail, ?) WHERE id = ?",
-                        (reason, item["id"]),
+                        (item_reason or reason, item["id"]),
                     )
                     self.store._event(
                         connection,
                         "REPOSITORY_DRIFT_DETECTED",
                         queue_item_id=int(item["id"]),
-                        payload={"reason": reason},
+                        payload={"reason": item_reason or reason},
                     )
 
     def _refresh_allowlist_identities(self, snapshots: Sequence[GpuSnapshot]) -> None:
@@ -2321,6 +2804,7 @@ class Scheduler:
 
         expire_reservations(self.store)
         self._reconcile_processes()
+        self._reconcile_worktree_cleanup()
         self._reconcile_yield_failures()
         self._escalate_terminations()
         now = time.monotonic()
@@ -2404,6 +2888,18 @@ def execute_item(store: QueueStore, item_id: int) -> int:
     item = store.item(item_id)
     if item["state"] not in RUNNING_STATES:
         raise QueueError(f"queue item {item_id} is {item['state']}; executor requires a running state")
+    if item["git_ref"]:
+        execution_root = _expected_worktree_path(store, item)
+        valid, detail = _worktree_identity(store, item, execution_root)
+        if not valid:
+            raise QueueError(
+                detail or f"queue item {item_id} isolated worktree failed validation"
+            )
+        command_text = _command_for_worktree(str(item["command_text"]), execution_root)
+    else:
+        # Legacy attempts admitted before schema v3 retain shared-checkout behavior.
+        execution_root = store.repo_root
+        command_text = str(item["command_text"])
     segment = int(item["segment"])
     attempt_dir = _segment_dir(store, item_id, segment)
     attempt_dir.mkdir(parents=True, exist_ok=True)
@@ -2422,6 +2918,8 @@ def execute_item(store: QueueStore, item_id: int) -> int:
     started_at = utc_now_iso()
     child_environment = os.environ.copy()
     child_environment["EXPERIMENT_QUEUE_SEGMENT"] = str(segment)
+    child_environment["EXPERIMENT_QUEUE_WORKTREE"] = str(execution_root)
+    child_environment["EXPERIMENT_QUEUE_PRIMARY_REPO"] = str(store.repo_root)
     if item["preemptible"]:
         child_environment["EXPERIMENT_QUEUE_YIELD_REQUEST_PATH"] = str(
             _yield_request_path(store, item_id, segment)
@@ -2460,8 +2958,8 @@ def execute_item(store: QueueStore, item_id: int) -> int:
         previous_handlers[signum] = signal.signal(signum, forward)
     try:
         child = subprocess.Popen(
-            ["/bin/bash", "-lc", str(item["command_text"])],
-            cwd=store.repo_root,
+            ["/bin/bash", "-lc", command_text],
+            cwd=execution_root,
             env=child_environment,
         )
         raw_return_code = child.wait()
@@ -2473,11 +2971,15 @@ def execute_item(store: QueueStore, item_id: int) -> int:
         for signum, handler in previous_handlers.items():
             signal.signal(signum, handler)
     receipt = {
-        "schema_version": 1,
+        "schema_version": 2,
         "queue_item_id": item_id,
         "experiment_id": item["experiment_id"],
         "attempt": item["attempt"],
         "segment": segment,
+        "git_commit": item["git_commit"],
+        "git_ref": item["git_ref"],
+        "worktree": str(execution_root),
+        "command_sha256": _sha256_bytes(command_text.encode("utf-8")),
         "started_at": started_at,
         "finished_at": utc_now_iso(),
         "return_code": return_code,
