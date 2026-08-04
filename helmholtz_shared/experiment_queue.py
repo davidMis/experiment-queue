@@ -61,6 +61,16 @@ class QueueError(RuntimeError):
     """Raised when a queue operation cannot be completed safely."""
 
 
+class _ClosingConnection(sqlite3.Connection):
+    """Commit or roll back a context-managed connection, then always close it."""
+
+    def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> bool:
+        try:
+            return bool(super().__exit__(exc_type, exc, traceback))
+        finally:
+            self.close()
+
+
 @dataclass(frozen=True)
 class GpuSnapshot:
     """One physical GPU observation from ``nvidia-smi``."""
@@ -143,13 +153,51 @@ class QueueStore:
         self.state_dir = state_dir.resolve()
         self.repo_root = repo_root.resolve()
         self.database_path = self.state_dir / "queue.sqlite3"
-        self.state_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            self.state_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise QueueError(
+                f"could not create scheduler state directory {self.state_dir}: {exc}. "
+                "Create it as the scheduler user and verify that its parent is writable."
+            ) from exc
         self._initialize()
 
     def connect(self) -> sqlite3.Connection:
-        """Open one configured SQLite connection."""
+        """Open a connection that closes after a ``with`` block.
 
-        connection = sqlite3.connect(self.database_path, timeout=30.0)
+        ``sqlite3.Connection`` normally commits or rolls back on context exit
+        without closing the database handle. The scheduler opens several
+        short transactions per control pass, so its connection subclass must
+        close deterministically to avoid exhausting the process file limit.
+        """
+
+        try:
+            connection = sqlite3.connect(
+                self.database_path,
+                timeout=30.0,
+                factory=_ClosingConnection,
+            )
+        except sqlite3.Error as exc:
+            if not self.state_dir.exists():
+                state_detail = "the state directory no longer exists"
+            elif not self.state_dir.is_dir():
+                state_detail = "the configured state path is not a directory"
+            else:
+                access = "/".join(
+                    label
+                    for label, allowed in (
+                        ("readable", os.access(self.state_dir, os.R_OK)),
+                        ("writable", os.access(self.state_dir, os.W_OK)),
+                        ("searchable", os.access(self.state_dir, os.X_OK)),
+                    )
+                    if allowed
+                ) or "no effective access"
+                state_detail = f"effective directory access: {access}"
+            raise QueueError(
+                f"could not open scheduler database {self.database_path}: {exc}; "
+                f"{state_detail}. Verify that gpu_scheduler_state remains present and "
+                "writable by the scheduler user."
+            ) from exc
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA busy_timeout = 30000")
@@ -2312,23 +2360,42 @@ class Scheduler:
                     break
                 time.sleep(self.control_seconds)
         finally:
+            had_active_error = sys.exc_info()[0] is not None
+            cleanup_error: BaseException | None = None
             for signum, handler in previous_handlers.items():
                 signal.signal(signum, handler)
             if scheduler_started and stop_signal is not None:
-                self.store.event(
-                    "SCHEDULER_STOP_REQUESTED", payload={"signal": stop_signal}
-                )
+                try:
+                    self.store.event(
+                        "SCHEDULER_STOP_REQUESTED", payload={"signal": stop_signal}
+                    )
+                except (OSError, QueueError, sqlite3.Error) as exc:
+                    cleanup_error = exc
             if scheduler_started:
-                self.store.event("SCHEDULER_STOPPED", payload={"pid": os.getpid()})
+                try:
+                    self.store.event("SCHEDULER_STOPPED", payload={"pid": os.getpid()})
+                except (OSError, QueueError, sqlite3.Error) as exc:
+                    cleanup_error = cleanup_error or exc
             identity_path = self.store.state_dir / "scheduler.json"
-            if identity_path.exists():
-                identity_path.unlink()
+            try:
+                if identity_path.exists():
+                    identity_path.unlink()
+            except OSError as exc:
+                cleanup_error = cleanup_error or exc
             for lock_file in self.gpu_locks.values():
                 lock_file.close()
             self.gpu_locks.clear()
             if self._scheduler_lock is not None:
                 self._scheduler_lock.close()
                 self._scheduler_lock = None
+            if cleanup_error is not None:
+                if had_active_error:
+                    print(
+                        f"warning: scheduler cleanup could not update state: {cleanup_error}",
+                        file=sys.stderr,
+                    )
+                else:
+                    raise cleanup_error
 
 
 def execute_item(store: QueueStore, item_id: int) -> int:

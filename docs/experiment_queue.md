@@ -261,6 +261,14 @@ after its exact identity is again valid; when the required commit changed, the
 clear workflow is to remove the old pending membership and explicitly add the
 card again from the intended clean commit.
 
+Scheduler versions before the 2026-08-04 connection-lifecycle fix could
+eventually stop with `sqlite3.OperationalError: unable to open database file`
+after leaking short-lived SQLite handles. Exiting that process releases the
+handles; the durable database does not need to be removed or recreated. Update
+the checkout and restart `serve` as the same user. If the corrected scheduler
+reports a database-path error, preserve `gpu_scheduler_state/` and verify that
+the directory still exists and is writable rather than deleting queue state.
+
 ## Receipts And Synchronization
 
 The queue captures the existing runner's final run directory, manifest path,

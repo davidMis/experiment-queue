@@ -209,6 +209,13 @@ class ExperimentQueueTests(unittest.TestCase):
             os.environ["QUEUE_TEST_MARKER"] = self.previous_marker
         self.repo.close()
 
+    def test_context_managed_connections_close_database_handles(self) -> None:
+        connection = self.repo.store.connect()
+        with connection as active:
+            self.assertEqual(active.execute("SELECT 1").fetchone()[0], 1)
+        with self.assertRaisesRegex(sqlite3.ProgrammingError, "closed database"):
+            connection.execute("SELECT 1")
+
     @staticmethod
     def gpu(index: str = "0", uuid: str = "GPU-test-0000") -> GpuSnapshot:
         return GpuSnapshot(
