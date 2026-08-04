@@ -53,6 +53,9 @@ SESSION_SECONDS = 12 * 60 * 60
 MAX_FORM_BYTES = 32 * 1024
 LOGIN_WINDOW_SECONDS = 5 * 60
 LOGIN_MAX_FAILURES = 8
+LIVE_POLL_SECONDS = 0.5
+LIVE_TELEMETRY_SECONDS = 10.0
+LIVE_KEEPALIVE_SECONDS = 15.0
 
 
 def _b64encode(value: bytes) -> str:
@@ -265,9 +268,82 @@ def _parse_web_timestamp(value: str) -> datetime:
 
 
 STYLE = """
-:root{color-scheme:dark;--bg:#101311;--panel:#171c19;--panel2:#1d2420;--line:#334039;--text:#f2f5f0;--muted:#aab5ae;--green:#9ee37d;--amber:#f0c36a;--red:#ff8c82;--blue:#8dc7ff}
-*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at top left,#1d2a22 0,#101311 42%);color:var(--text);font:15px/1.45 ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;min-height:100vh}
-a{color:var(--blue)}.shell{max-width:1180px;margin:0 auto;padding:28px 20px 64px}.top{display:flex;align-items:flex-start;justify-content:space-between;gap:24px;margin-bottom:24px}.eyebrow{text-transform:uppercase;letter-spacing:.14em;color:var(--green);font-size:12px;font-weight:700}.title{font-size:clamp(28px,5vw,48px);line-height:1.02;margin:8px 0}.subtitle{color:var(--muted);max-width:680px}.nav{display:flex;gap:10px;flex-wrap:wrap}.panel,.gpu,.login{background:linear-gradient(145deg,var(--panel),var(--panel2));border:1px solid var(--line);border-radius:16px;box-shadow:0 18px 50px #0004}.panel{padding:20px;margin:18px 0}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(270px,1fr));gap:14px}.gpu{padding:18px;position:relative;overflow:hidden}.gpu:before{content:"";position:absolute;left:0;top:0;bottom:0;width:4px;background:var(--line)}.gpu.available:before{background:var(--green)}.gpu.busy:before{background:var(--amber)}.gpu.reserved:before{background:var(--blue)}.gpu.danger:before{background:var(--red)}.gpu h3{margin:0 0 4px;font-size:20px}.meta{color:var(--muted);font-size:13px}.status{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--line);border-radius:999px;padding:4px 9px;margin:10px 0;font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.06em}.dot{width:7px;height:7px;border-radius:50%;background:currentColor}.available .status{color:var(--green)}.busy .status{color:var(--amber)}.reserved .status{color:var(--blue)}.danger .status{color:var(--red)}form{margin:12px 0 0}.row{display:flex;gap:10px;flex-wrap:wrap;align-items:end}.field{display:flex;flex-direction:column;gap:5px;min-width:120px;flex:1}.field label{font-size:12px;color:var(--muted);font-weight:700}input,select,button,textarea{font:inherit}input,select,textarea{width:100%;color:var(--text);background:#0e120f;border:1px solid var(--line);border-radius:9px;padding:9px 10px}textarea{min-height:72px;resize:vertical}button,.button{border:1px solid #55705e;background:#263d2d;color:var(--text);border-radius:9px;padding:9px 13px;font-weight:750;cursor:pointer;text-decoration:none;display:inline-block}button:hover,.button:hover{background:#31503a}button.secondary,.button.secondary{background:#202824;border-color:var(--line)}button.danger{background:#4b2525;border-color:#83403b}button:disabled{opacity:.5;cursor:not-allowed}.flash{padding:12px 14px;border-radius:10px;margin:14px 0;border:1px solid}.flash.ok{color:var(--green);background:#17301d;border-color:#315c3b}.flash.error{color:#ffd1cd;background:#3a2020;border-color:#78403d}table{width:100%;border-collapse:collapse;font-size:13px}th,td{text-align:left;padding:10px 8px;border-bottom:1px solid var(--line);vertical-align:top}th{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.08em}.actions{display:flex;gap:6px;flex-wrap:wrap}.actions form{margin:0}.actions button{padding:6px 9px;font-size:12px}.pill{display:inline-block;padding:3px 7px;border-radius:999px;background:#253029;color:var(--muted);font-size:11px}.login{max-width:440px;margin:12vh auto 0;padding:28px}.login h1{margin-top:0}.split{display:grid;grid-template-columns:1fr 1fr;gap:18px}.muted{color:var(--muted)}.tiny{font-size:12px}.event{display:grid;grid-template-columns:150px 210px 1fr;gap:10px;padding:8px 0;border-bottom:1px solid var(--line);font-size:12px}@media(max-width:760px){.top{display:block}.nav{margin-top:18px}.split{grid-template-columns:1fr}table{display:block;overflow-x:auto}.event{grid-template-columns:1fr}.shell{padding:20px 14px 50px}}
+:root{color-scheme:dark;--bg:#101311;--glow:#1d2a22;--panel:#171c19;--panel2:#1d2420;--field:#0e120f;--line:#334039;--text:#f2f5f0;--muted:#aab5ae;--green:#9ee37d;--amber:#f0c36a;--red:#ff8c82;--blue:#8dc7ff;--button:#263d2d;--button-hover:#31503a;--secondary:#202824;--danger:#4b2525;--danger-line:#83403b;--pill:#253029;--ok-bg:#17301d;--ok-line:#315c3b;--error-text:#ffd1cd;--error-bg:#3a2020;--error-line:#78403d;--shadow:#0004}
+:root[data-theme=light]{color-scheme:light;--bg:#f4f7f2;--glow:#dfeee2;--panel:#fff;--panel2:#f7faf6;--field:#fff;--line:#c8d4ca;--text:#172019;--muted:#5d6b61;--green:#347a2e;--amber:#9a6414;--red:#b23932;--blue:#1769aa;--button:#dcecdf;--button-hover:#cce3d1;--secondary:#edf2ed;--danger:#f7dddd;--danger-line:#d8a09c;--pill:#e7eee8;--ok-bg:#e3f3e4;--ok-line:#a8cea9;--error-text:#7d211d;--error-bg:#f9e1df;--error-line:#d9a4a0;--shadow:#253a2b1c}
+*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at top left,var(--glow) 0,var(--bg) 42%);color:var(--text);font:15px/1.45 ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;min-height:100vh;transition:background-color .18s,color .18s}
+a{color:var(--blue)}.shell{max-width:1180px;margin:0 auto;padding:28px 20px 64px}.top{display:flex;align-items:flex-start;justify-content:space-between;gap:24px;margin-bottom:24px}.eyebrow{text-transform:uppercase;letter-spacing:.14em;color:var(--green);font-size:12px;font-weight:700}.title{font-size:clamp(28px,5vw,48px);line-height:1.02;margin:8px 0}.subtitle{color:var(--muted);max-width:680px}.nav{display:flex;align-items:flex-start;gap:10px;flex-wrap:wrap}.nav form{margin:0}.panel,.gpu,.login{background:linear-gradient(145deg,var(--panel),var(--panel2));border:1px solid var(--line);border-radius:16px;box-shadow:0 18px 50px var(--shadow)}.panel{padding:20px;margin:18px 0}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(270px,1fr));gap:14px}.gpu{padding:18px;position:relative;overflow:hidden}.gpu:before{content:"";position:absolute;left:0;top:0;bottom:0;width:4px;background:var(--line)}.gpu.available:before{background:var(--green)}.gpu.busy:before{background:var(--amber)}.gpu.reserved:before{background:var(--blue)}.gpu.danger:before{background:var(--red)}.gpu h3{margin:0 0 4px;font-size:20px}.meta{color:var(--muted);font-size:13px}.status{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--line);border-radius:999px;padding:4px 9px;margin:10px 0;font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.06em}.dot{width:7px;height:7px;border-radius:50%;background:currentColor}.available .status{color:var(--green)}.busy .status{color:var(--amber)}.reserved .status{color:var(--blue)}.danger .status{color:var(--red)}form{margin:12px 0 0}.row{display:flex;gap:10px;flex-wrap:wrap;align-items:end}.field{display:flex;flex-direction:column;gap:5px;min-width:120px;flex:1}.field label{font-size:12px;color:var(--muted);font-weight:700}input,select,button,textarea{font:inherit}input,select,textarea{width:100%;color:var(--text);background:var(--field);border:1px solid var(--line);border-radius:9px;padding:9px 10px}textarea{min-height:72px;resize:vertical}button,.button{border:1px solid var(--line);background:var(--button);color:var(--text);border-radius:9px;padding:9px 13px;font-weight:750;cursor:pointer;text-decoration:none;display:inline-block}button:hover,.button:hover{background:var(--button-hover)}button.secondary,.button.secondary{background:var(--secondary);border-color:var(--line)}button.danger{background:var(--danger);border-color:var(--danger-line)}button:disabled{opacity:.5;cursor:not-allowed}.flash{padding:12px 14px;border-radius:10px;margin:14px 0;border:1px solid}.flash.ok{color:var(--green);background:var(--ok-bg);border-color:var(--ok-line)}.flash.error{color:var(--error-text);background:var(--error-bg);border-color:var(--error-line)}table{width:100%;border-collapse:collapse;font-size:13px}th,td{text-align:left;padding:10px 8px;border-bottom:1px solid var(--line);vertical-align:top}th{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.08em}.actions{display:flex;gap:6px;flex-wrap:wrap}.actions form{margin:0}.actions button{padding:6px 9px;font-size:12px}.pill{display:inline-block;padding:3px 7px;border-radius:999px;background:var(--pill);color:var(--muted);font-size:11px}.login{max-width:440px;margin:12vh auto 0;padding:28px}.login h1{margin-top:0}.split{display:grid;grid-template-columns:1fr 1fr;gap:18px}.muted{color:var(--muted)}.tiny{font-size:12px}.event{display:grid;grid-template-columns:150px 210px 1fr;gap:10px;padding:8px 0;border-bottom:1px solid var(--line);font-size:12px}.theme-corner{position:fixed;right:18px;top:18px;z-index:2}.live-indicator{display:inline-flex;align-items:center;gap:7px;color:var(--amber);border:1px solid var(--line);border-radius:999px;padding:8px 11px;font-size:12px;font-weight:700;background:var(--panel)}.live-indicator.connected{color:var(--green)}.live-indicator.disconnected{color:var(--red)}.live-indicator .dot{box-shadow:0 0 0 3px color-mix(in srgb,currentColor 18%,transparent)}[data-live-section]{scroll-margin-top:16px}@media(max-width:760px){.top{display:block}.nav{margin-top:18px}.split{grid-template-columns:1fr}table{display:block;overflow-x:auto}.event{grid-template-columns:1fr}.shell{padding:20px 14px 50px}.theme-corner{position:static;margin:14px}}
+"""
+
+
+CLIENT_SCRIPT = r"""
+(() => {
+  const root = document.documentElement;
+  const storageKey = "mutton-scheduler-theme";
+  const preferredTheme = () => {
+    let saved = null;
+    try { saved = localStorage.getItem(storageKey); } catch (_error) { /* preference is optional */ }
+    if (saved === "light" || saved === "dark") return saved;
+    return matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
+  };
+  const setTheme = (theme) => {
+    root.dataset.theme = theme;
+    const toggle = document.getElementById("theme-toggle");
+    if (toggle) {
+      const target = theme === "dark" ? "Light" : "Dark";
+      toggle.textContent = `${target} mode`;
+      toggle.setAttribute("aria-label", `Switch to ${target.toLowerCase()} mode`);
+    }
+  };
+  setTheme(preferredTheme());
+  document.getElementById("theme-toggle")?.addEventListener("click", () => {
+    const next = root.dataset.theme === "dark" ? "light" : "dark";
+    try { localStorage.setItem(storageKey, next); } catch (_error) { /* keep this page themed */ }
+    setTheme(next);
+  });
+
+  const view = document.body.dataset.liveView;
+  if (!view || !window.EventSource) return;
+  const indicator = document.getElementById("live-connection");
+  const pending = new Map();
+  const setConnection = (state, label) => {
+    if (!indicator) return;
+    indicator.className = `live-indicator ${state}`;
+    const labelNode = indicator.querySelector("span:last-child");
+    if (labelNode) labelNode.textContent = label;
+  };
+  const applySection = (name, markup) => {
+    const section = document.querySelector(`[data-live-section="${CSS.escape(name)}"]`);
+    if (!section) return;
+    if (section.contains(document.activeElement)) {
+      pending.set(name, markup);
+      return;
+    }
+    section.innerHTML = markup;
+    pending.delete(name);
+  };
+  document.addEventListener("focusout", () => setTimeout(() => {
+    for (const [name, markup] of pending) applySection(name, markup);
+  }, 0));
+
+  const stream = new EventSource(`/events/${encodeURIComponent(view)}`);
+  stream.onopen = () => setConnection("connected", "Live");
+  stream.onerror = () => setConnection("disconnected", "Reconnecting…");
+  stream.addEventListener("status", (event) => {
+    try {
+      const payload = JSON.parse(event.data);
+      for (const [name, markup] of Object.entries(payload.sections || {})) {
+        applySection(name, String(markup));
+      }
+      setConnection("connected", "Live");
+    } catch (_error) {
+      setConnection("disconnected", "Update error");
+    }
+  });
+  stream.addEventListener("session-expired", () => {
+    location.assign(view === "admin" ? "/login/admin" : "/login/reservation");
+  });
+  addEventListener("beforeunload", () => stream.close(), { once: true });
+})();
 """
 
 
@@ -327,12 +403,28 @@ class SchedulerWebApp:
         }
 
     @staticmethod
-    def _page(title: str, body: str, *, refresh: bool = False) -> bytes:
-        refresh_tag = '<meta http-equiv="refresh" content="15">' if refresh else ""
+    def _page(title: str, body: str, *, live_view: str | None = None) -> bytes:
+        live_attribute = f' data-live-view="{_escape(live_view)}"' if live_view else ""
         document = f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">{refresh_tag}
-<title>{_escape(title)}</title><style>{STYLE}</style></head><body>{body}</body></html>"""
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{_escape(title)}</title><style>{STYLE}</style><script src="/static/scheduler.js" defer></script></head>
+<body{live_attribute}>{body}</body></html>"""
         return document.encode("utf-8")
+
+    @staticmethod
+    def _theme_toggle(*, corner: bool = False) -> str:
+        wrapper = ' class="theme-corner"' if corner else ""
+        return (
+            f"<div{wrapper}><button id=\"theme-toggle\" class=\"secondary\" "
+            'type="button" aria-label="Switch color theme">Theme</button></div>'
+        )
+
+    @staticmethod
+    def _live_indicator() -> str:
+        return (
+            '<div id="live-connection" class="live-indicator" role="status" '
+            'aria-live="polite"><span class="dot"></span><span>Connecting…</span></div>'
+        )
 
     @staticmethod
     def _flash(query: Mapping[str, list[str]]) -> str:
@@ -345,7 +437,7 @@ class SchedulerWebApp:
     def render_login(self, role: str, *, error: str | None = None) -> bytes:
         label = "Scheduler administrator" if role == "admin" else "GPU reservation desk"
         error_html = f'<div class="flash error">{_escape(error)}</div>' if error else ""
-        body = f"""<main class="shell"><section class="login"><div class="eyebrow">Mutton2</div>
+        body = f"""{self._theme_toggle(corner=True)}<main class="shell"><section class="login"><div class="eyebrow">Mutton2</div>
 <h1>{label}</h1><p class="muted">Enter the shared password David provided.</p>{error_html}
 <form method="post" action="/login/{role}"><div class="field"><label for="password">Password</label>
 <input id="password" name="password" type="password" autocomplete="current-password" required autofocus></div>
@@ -363,11 +455,9 @@ class SchedulerWebApp:
 <div class="field"><label>Reserved for / note</label><input name="note" maxlength="200" placeholder="Name — short reason" required></div>
 <button type="submit">{_escape(label)}</button></div></form>"""
 
-    def render_reserve(
-        self,
-        session: WebSession,
-        query: Mapping[str, list[str]],
-    ) -> bytes:
+    def _reserve_sections(self, session: WebSession) -> dict[str, str]:
+        """Render the coworker status fragment pushed over the live stream."""
+
         data = self._data()
         cards: list[str] = []
         for row in data["allow"]:
@@ -412,19 +502,31 @@ class SchedulerWebApp:
             f'<div class="flash error">GPU telemetry is unavailable: {_escape(data["telemetry_error"])}</div>'
             if data["telemetry_error"] else ""
         )
-        admin_link = '<a class="button secondary" href="/admin">Administrator</a>' if session.role == "admin" else ""
-        body = f"""<main class="shell"><header class="top"><div><div class="eyebrow">Shared GPU courtesy desk</div>
-<h1 class="title">Need a GPU? Take a window.</h1><p class="subtitle">A running preemptible job will save a continuation checkpoint, leave the device, and return to the front of David’s queue on another available GPU.</p></div>
-<nav class="nav">{admin_link}<form method="post" action="/logout"><input type="hidden" name="csrf" value="{_escape(session.csrf)}"><button class="secondary">Sign out</button></form></nav></header>
-{self._flash(query)}{telemetry_warning}<section class="grid">{''.join(cards) or '<p>No GPUs are currently in David’s scheduler pool.</p>'}</section>
-<section class="panel"><strong>Reservation rules</strong><p class="muted">Choose 1–24 whole hours. The timer for a yielded job starts only after its checkpoint is verified and its GPU process exits. Expiry removes the temporary reservation; normal GPU polling still prevents launch while another process is present.</p></section></main>"""
-        return self._page("Mutton2 GPU reservation desk", body, refresh=True)
+        return {
+            "reserve": (
+                f'{telemetry_warning}<section class="grid">'
+                f"{''.join(cards) or '<p>No GPUs are currently in David’s scheduler pool.</p>'}"
+                "</section>"
+            )
+        }
 
-    def render_admin(
+    def render_reserve(
         self,
         session: WebSession,
         query: Mapping[str, list[str]],
     ) -> bytes:
+        sections = self._reserve_sections(session)
+        admin_link = '<a class="button secondary" href="/admin">Administrator</a>' if session.role == "admin" else ""
+        body = f"""<main class="shell"><header class="top"><div><div class="eyebrow">Shared GPU courtesy desk</div>
+<h1 class="title">Need a GPU? Take a window.</h1><p class="subtitle">A running preemptible job will save a continuation checkpoint, leave the device, and return to the front of David’s queue on another available GPU.</p></div>
+<nav class="nav">{self._live_indicator()}{self._theme_toggle()}{admin_link}<form method="post" action="/logout"><input type="hidden" name="csrf" value="{_escape(session.csrf)}"><button class="secondary">Sign out</button></form></nav></header>
+{self._flash(query)}<div data-live-section="reserve">{sections['reserve']}</div>
+<section class="panel"><strong>Reservation rules</strong><p class="muted">Choose 1–24 whole hours. The timer for a yielded job starts only after its checkpoint is verified and its GPU process exits. Expiry removes the temporary reservation; normal GPU polling still prevents launch while another process is present.</p></section></main>"""
+        return self._page("Mutton2 GPU reservation desk", body, live_view="reserve")
+
+    def _admin_sections(self, session: WebSession) -> dict[str, str]:
+        """Render administrator status fragments without replacing data-entry forms."""
+
         data = self._data()
         pause_action = "resume" if data["dispatch_paused"] else "pause"
         dispatch_text = "Dispatch paused" if data["dispatch_paused"] else "Dispatch active"
@@ -464,19 +566,53 @@ class SchedulerWebApp:
             f"<tr><td>#{row['id']}</td><td>{_escape(row['note'])}</td><td><span class=\"pill\">{_escape(row['status'])}</span></td><td>{row['duration_hours']}h</td><td>{_escape(row['starts_at'] or 'waiting for clear')}</td><td>{_escape(row['expires_at'] or '—')}</td></tr>"
             for row in data["reservations"][:30]
         )
+        telemetry_warning = (
+            f'<div class="flash error">GPU telemetry is unavailable: {_escape(data["telemetry_error"])}</div>'
+            if data["telemetry_error"] else ""
+        )
+        return {
+            "dispatch": f"""<section class="panel"><div class="row"><div><strong>{dispatch_text}</strong><div class="muted">{_escape(data['pause_reason'])}</div></div>
+<form method="post" action="/admin/dispatch"><input type="hidden" name="csrf" value="{_escape(session.csrf)}"><input type="hidden" name="operation" value="{pause_action}"><input name="reason" placeholder="Reason (optional)"><button>{pause_action.title()} dispatch</button></form></div></section>""",
+            "gpus": f"{telemetry_warning}<div class=\"grid\">{''.join(gpu_cards) or '<p>No GPUs are enabled.</p>'}</div>",
+            "queue": f"""<section class="panel"><h2>Queue</h2><table><thead><tr><th>ID</th><th>Experiment</th><th>State</th><th>Priority</th><th>GPU</th><th>Detail</th><th>Controls</th></tr></thead><tbody>{''.join(queue_rows)}</tbody></table></section>""",
+            "reservations": f"""<section class="panel"><h2>Reservation history</h2><table><thead><tr><th>ID</th><th>Reserved for / note</th><th>Status</th><th>Duration</th><th>Started</th><th>Expires</th></tr></thead><tbody>{reservation_rows}</tbody></table></section>""",
+            "events": f"""<section class="panel"><h2>Recent audit history</h2>{event_rows or '<p>No events recorded.</p>'}</section>""",
+        }
+
+    def live_sections(self, view: str, session: WebSession) -> dict[str, str]:
+        """Return role-checked live sections for one authenticated dashboard."""
+
+        if view == "reserve":
+            return self._reserve_sections(session)
+        if view == "admin" and session.role == "admin":
+            return self._admin_sections(session)
+        raise QueueError(f"role {session.role!r} cannot subscribe to {view!r} status")
+
+    def live_revision(self) -> int:
+        """Return the latest durable event ID used for prompt change detection."""
+
+        with self.store.connect() as connection:
+            row = connection.execute("SELECT COALESCE(MAX(id), 0) AS id FROM events").fetchone()
+        return int(row["id"])
+
+    def render_admin(
+        self,
+        session: WebSession,
+        query: Mapping[str, list[str]],
+    ) -> bytes:
+        sections = self._admin_sections(session)
         body = f"""<main class="shell"><header class="top"><div><div class="eyebrow">Mutton2 scheduler</div><h1 class="title">Queue control</h1>
-<p class="subtitle">Explicit experiment admission, mutable GPU pool, safe yield reservations, and complete operational history.</p></div><nav class="nav"><a class="button secondary" href="/reserve">Reservation page</a><form method="post" action="/logout"><input type="hidden" name="csrf" value="{_escape(session.csrf)}"><button class="secondary">Sign out</button></form></nav></header>
-{self._flash(query)}<section class="panel"><div class="row"><div><strong>{dispatch_text}</strong><div class="muted">{_escape(data['pause_reason'])}</div></div>
-<form method="post" action="/admin/dispatch"><input type="hidden" name="csrf" value="{_escape(session.csrf)}"><input type="hidden" name="operation" value="{pause_action}"><input name="reason" placeholder="Reason (optional)"><button>{pause_action.title()} dispatch</button></form></div></section>
-<section><h2>GPU pool</h2><div class="grid">{''.join(gpu_cards) or '<p>No GPUs are enabled.</p>'}</div>
+<p class="subtitle">Explicit experiment admission, mutable GPU pool, safe yield reservations, and complete operational history.</p></div><nav class="nav">{self._live_indicator()}{self._theme_toggle()}<a class="button secondary" href="/reserve">Reservation page</a><form method="post" action="/logout"><input type="hidden" name="csrf" value="{_escape(session.csrf)}"><button class="secondary">Sign out</button></form></nav></header>
+{self._flash(query)}<div data-live-section="dispatch">{sections['dispatch']}</div>
+<section><h2>GPU pool</h2><div data-live-section="gpus">{sections['gpus']}</div>
 <div class="panel"><form method="post" action="/admin/gpu"><input type="hidden" name="csrf" value="{_escape(session.csrf)}"><div class="row"><div class="field"><label>Indices, UUIDs, or UUID prefixes</label><input name="identifiers" placeholder="0 2 GPU-…"></div><button name="operation" value="add">Add GPUs</button><button class="secondary" name="operation" value="set">Replace pool</button><button class="danger" name="operation" value="clear">Clear pool</button></div></form></div></section>
 <section class="panel"><h2>Add experiment explicitly</h2><form method="post" action="/admin/add"><input type="hidden" name="csrf" value="{_escape(session.csrf)}"><div class="row">
 <div class="field"><label>Experiment ID</label><input name="experiment_id" placeholder="WCG-023" required></div><div class="field"><label>Card path (optional)</label><input name="card_path" placeholder="docs/experiments/WCG-023.md"></div><div class="field"><label>Priority</label><input name="priority" type="number" value="0"></div><div class="field"><label>After item IDs</label><input name="dependencies" placeholder="1, 2"></div></div>
 <div class="row"><label><input style="width:auto" type="checkbox" name="preemptible" value="1"> Checkpoint and requeue capable</label><label><input style="width:auto" type="checkbox" name="held" value="1"> Add held</label><label><input style="width:auto" type="checkbox" name="new_attempt" value="1"> Authorize new attempt</label><button type="submit">Add to queue</button></div></form></section>
-<section class="panel"><h2>Queue</h2><table><thead><tr><th>ID</th><th>Experiment</th><th>State</th><th>Priority</th><th>GPU</th><th>Detail</th><th>Controls</th></tr></thead><tbody>{''.join(queue_rows)}</tbody></table></section>
-<section class="panel"><h2>Reservation history</h2><table><thead><tr><th>ID</th><th>Reserved for / note</th><th>Status</th><th>Duration</th><th>Started</th><th>Expires</th></tr></thead><tbody>{reservation_rows}</tbody></table></section>
-<section class="panel"><h2>Recent audit history</h2>{event_rows or '<p>No events recorded.</p>'}</section></main>"""
-        return self._page("Mutton2 scheduler", body, refresh=True)
+<div data-live-section="queue">{sections['queue']}</div>
+<div data-live-section="reservations">{sections['reservations']}</div>
+<div data-live-section="events">{sections['events']}</div></main>"""
+        return self._page("Mutton2 scheduler", body, live_view="admin")
 
     def admin_action(self, route: str, form: Mapping[str, list[str]]) -> str:
         actor = "web:admin"
@@ -621,6 +757,7 @@ class QueueWebHandler(BaseHTTPRequestHandler):
     """Route authenticated HTML requests without exposing shell execution."""
 
     server: QueueWebServer
+    protocol_version = "HTTP/1.1"
 
     def log_message(self, format: str, *args: Any) -> None:
         print(
@@ -630,7 +767,11 @@ class QueueWebHandler(BaseHTTPRequestHandler):
 
     def _security_headers(self) -> None:
         self.send_header("Cache-Control", "no-store")
-        self.send_header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'")
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; "
+            "connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+        )
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
@@ -666,14 +807,71 @@ class QueueWebHandler(BaseHTTPRequestHandler):
         )
 
     def _require(self, role: str) -> WebSession | None:
+        session = self._authorized_session(role)
+        if session is None:
+            self._redirect(f"/login/{role}")
+        return session
+
+    def _authorized_session(self, role: str) -> WebSession | None:
+        """Return a session authorized for a page or read-only event stream."""
+
         session = self._session()
         allowed = session is not None and (
             session.role == "admin" or (role == "reservation" and session.role == "reservation")
         )
-        if not allowed:
-            self._redirect(f"/login/{role}")
-            return None
-        return session
+        return session if allowed else None
+
+    def _send_live_events(self, view: str, session: WebSession) -> None:
+        """Push changed dashboard sections over an authenticated SSE connection."""
+
+        self.send_response(HTTPStatus.OK)
+        self._security_headers()
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+        last_revision: int | None = None
+        last_digest: str | None = None
+        last_render = 0.0
+        last_keepalive = time.monotonic()
+        try:
+            self.wfile.write(b"retry: 2000\n\n")
+            self.wfile.flush()
+            while time.time() < session.expires_epoch:
+                now = time.monotonic()
+                revision = self.server.app.live_revision()
+                if (
+                    last_revision is None
+                    or revision != last_revision
+                    or now - last_render >= LIVE_TELEMETRY_SECONDS
+                ):
+                    sections = self.server.app.live_sections(view, session)
+                    encoded = json.dumps(
+                        {"sections": sections},
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                    digest = hashlib.sha256(encoded).hexdigest()
+                    if digest != last_digest:
+                        self.wfile.write(f"event: status\nid: {revision}\ndata: ".encode("utf-8"))
+                        self.wfile.write(encoded)
+                        self.wfile.write(b"\n\n")
+                        self.wfile.flush()
+                        last_digest = digest
+                    last_revision = revision
+                    last_render = now
+                    last_keepalive = now
+                elif now - last_keepalive >= LIVE_KEEPALIVE_SECONDS:
+                    self.wfile.write(b": keepalive\n\n")
+                    self.wfile.flush()
+                    last_keepalive = now
+                time.sleep(LIVE_POLL_SECONDS)
+            self.wfile.write(b"event: session-expired\ndata: {}\n\n")
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError, QueueError):
+            pass
+        finally:
+            self.close_connection = True
 
     def _form(self) -> dict[str, list[str]]:
         content_type = self.headers.get("Content-Type", "")
@@ -692,6 +890,26 @@ class QueueWebHandler(BaseHTTPRequestHandler):
         query = parse_qs(parsed.query, keep_blank_values=True)
         if parsed.path == "/healthz":
             self._send(HTTPStatus.OK, b"ok\n", content_type="text/plain; charset=utf-8")
+            return
+        if parsed.path == "/static/scheduler.js":
+            self._send(
+                HTTPStatus.OK,
+                CLIENT_SCRIPT.encode("utf-8"),
+                content_type="text/javascript; charset=utf-8",
+            )
+            return
+        if parsed.path in {"/events/admin", "/events/reserve"}:
+            view = parsed.path.rsplit("/", 1)[-1]
+            role = "admin" if view == "admin" else "reservation"
+            session = self._authorized_session(role)
+            if session is None:
+                self._send(
+                    HTTPStatus.UNAUTHORIZED,
+                    b"authentication required\n",
+                    content_type="text/plain; charset=utf-8",
+                )
+                return
+            self._send_live_events(view, session)
             return
         if parsed.path == "/":
             session = self._session()

@@ -156,6 +156,20 @@ are signed, secure, HTTP-only, same-site cookies; every mutation also requires
 a session-specific CSRF token. Login failures are rate limited. HTTPS is
 required except for an explicit loopback-only local-test flag.
 
+Both dashboards stay current without periodically reloading the page. Each
+authenticated browser opens a server-sent event stream for its authorized
+view. The web service checks the durable queue event sequence twice per second
+and pushes changed sections immediately; it also refreshes GPU telemetry every
+10 seconds and sends only when the rendered status changed. The browser
+reconnects automatically after a brief network interruption, reports its live
+connection state, and defers replacement of a section while someone is typing
+in one of its controls. The stream is read-only, role-checked on the server,
+uses the signed session cookie, and expires with that session.
+
+Every page also offers light and dark appearance modes. The choice is a local
+browser preference rather than scheduler state, so coworkers can choose
+independently without creating accounts or changing the shared database.
+
 ## Operator Controls
 
 These controls may be used while `serve` is running:
