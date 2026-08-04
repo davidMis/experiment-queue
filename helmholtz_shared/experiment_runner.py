@@ -30,6 +30,9 @@ from typing import IO, Any, Iterable, Sequence
 DEFAULT_OUTPUT_ROOT = Path("outputs/experiments")
 MANIFEST_NAME = "manifest.json"
 DEFAULT_USE_PTY = True
+YIELD_EXIT_CODE = 75
+CONTINUATION_RUN_DIR_ENV = "EXPERIMENT_QUEUE_CONTINUATION_RUN_DIR"
+YIELD_RECEIPT_ENV = "EXPERIMENT_QUEUE_YIELD_RECEIPT_PATH"
 
 
 class ExperimentError(RuntimeError):
@@ -220,6 +223,57 @@ def main(argv: Sequence[str] | None = None) -> int:
     return result.return_code
 
 
+def _load_continuation_manifest(
+    request: ExperimentRequest,
+    *,
+    cwd: Path,
+    git_context: dict[str, Any],
+) -> tuple[str, Path, Path, dict[str, Any]] | None:
+    """Load and strictly validate a scheduler-authorized yielded runner."""
+
+    value = os.environ.get(CONTINUATION_RUN_DIR_ENV)
+    if not value:
+        return None
+    run_dir = Path(value).resolve()
+    if not run_dir.is_dir() or run_dir.is_symlink():
+        raise ExperimentError(
+            f"continuation runner directory is missing or not a regular directory: {run_dir}"
+        )
+    manifest_path = run_dir / MANIFEST_NAME
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ExperimentError(
+            f"could not read continuation manifest {manifest_path}: {exc}"
+        ) from exc
+    run = manifest.get("run", {})
+    command = manifest.get("command", {})
+    paths = manifest.get("paths", {})
+    recorded_git = manifest.get("git", {})
+    mismatches: list[str] = []
+    if run.get("status") != "yielded":
+        mismatches.append(f"run status is {run.get('status')!r}, expected 'yielded'")
+    if run.get("name") != request.name:
+        mismatches.append("run name changed")
+    if command.get("argv") != list(request.command):
+        mismatches.append("child command changed")
+    if bool(command.get("pty")) != bool(request.use_pty):
+        mismatches.append("PTY mode changed")
+    if Path(str(paths.get("cwd", ""))).resolve() != cwd:
+        mismatches.append("working directory changed")
+    if Path(str(paths.get("output_dir", ""))).resolve() != run_dir:
+        mismatches.append("recorded output directory changed")
+    if recorded_git.get("commit") != git_context.get("commit"):
+        mismatches.append("Git commit changed")
+    if mismatches:
+        raise ExperimentError(
+            "refusing continuation because runner identity differs: "
+            + "; ".join(mismatches)
+        )
+    run_id = str(run.get("id") or run_dir.name)
+    return run_id, run_dir, manifest_path, manifest
+
+
 def run_experiment(request: ExperimentRequest) -> ExperimentResult:
     """Prepare a run directory, execute the command, and update the manifest."""
 
@@ -250,34 +304,60 @@ def run_experiment(request: ExperimentRequest) -> ExperimentResult:
                 f"--require-clean after accepting that the run is not exact.{detail}"
             )
 
-    _ensure_output_root(output_root)
-    run_id, run_dir = _choose_run_dir(
-        output_root=output_root,
-        timestamp=_timestamp_for_id(),
-        name=request.name,
-        short_commit=str(git_context.get("short_commit") or ""),
-    )
-    run_dir.mkdir(parents=True)
-
-    copied_configs = copy_config_paths(resolved_config_paths, run_dir)
-    write_git_snapshots(git_context, cwd, run_dir)
-
-    rsync_pull_command = build_rsync_pull_command(
-        remote=request.remote,
-        remote_run_dir=run_dir,
-        local_output_root=request.local_output_root or request.output_root,
-        run_id=run_id,
-    )
-    manifest = build_manifest(
-        request=request,
+    continuation = _load_continuation_manifest(
+        request,
         cwd=cwd,
-        run_id=run_id,
-        run_dir=run_dir,
         git_context=git_context,
-        copied_configs=copied_configs,
-        rsync_pull_command=rsync_pull_command,
     )
-    manifest_path = run_dir / MANIFEST_NAME
+    append_logs = continuation is not None
+    if continuation is None:
+        _ensure_output_root(output_root)
+        run_id, run_dir = _choose_run_dir(
+            output_root=output_root,
+            timestamp=_timestamp_for_id(),
+            name=request.name,
+            short_commit=str(git_context.get("short_commit") or ""),
+        )
+        run_dir.mkdir(parents=True)
+        copied_configs = copy_config_paths(resolved_config_paths, run_dir)
+        write_git_snapshots(git_context, cwd, run_dir)
+        rsync_pull_command = build_rsync_pull_command(
+            remote=request.remote,
+            remote_run_dir=run_dir,
+            local_output_root=request.local_output_root or request.output_root,
+            run_id=run_id,
+        )
+        manifest = build_manifest(
+            request=request,
+            cwd=cwd,
+            run_id=run_id,
+            run_dir=run_dir,
+            git_context=git_context,
+            copied_configs=copied_configs,
+            rsync_pull_command=rsync_pull_command,
+        )
+        manifest_path = run_dir / MANIFEST_NAME
+    else:
+        run_id, run_dir, manifest_path, manifest = continuation
+        rsync_pull_command = manifest.get("sync", {}).get("rsync_pull_command")
+
+    segment_number = len(manifest.setdefault("segments", [])) + 1
+    segment = {
+        "segment": segment_number,
+        "status": "running",
+        "started_at": utc_now_iso(),
+        "finished_at": None,
+        "duration_seconds": None,
+        "return_code": None,
+        "continuation_checkpoint": os.environ.get(
+            "EXPERIMENT_QUEUE_CONTINUATION_CHECKPOINT"
+        ),
+        "gpu_uuid": os.environ.get("EXPERIMENT_QUEUE_GPU_UUID"),
+    }
+    manifest["segments"].append(segment)
+    manifest["run"]["status"] = "running"
+    manifest["run"]["finished_at"] = None
+    manifest["run"]["return_code"] = None
     write_manifest(manifest_path, manifest)
 
     started = time.monotonic()
@@ -289,9 +369,15 @@ def run_experiment(request: ExperimentRequest) -> ExperimentResult:
                 run_dir,
                 run_id,
                 use_pty=request.use_pty,
+                append=append_logs,
             )
         if return_code == 0:
             status = "succeeded"
+        elif (
+            return_code == YIELD_EXIT_CODE
+            and os.environ.get(YIELD_RECEIPT_ENV)
+        ):
+            status = "yielded"
         elif return_code == 130:
             status = "interrupted"
         else:
@@ -302,19 +388,43 @@ def run_experiment(request: ExperimentRequest) -> ExperimentResult:
     except OSError as exc:
         return_code = 127
         status = "launch_failed"
-        manifest["run"]["status"] = status
-        manifest["run"]["return_code"] = return_code
-        manifest["run"]["finished_at"] = utc_now_iso()
-        manifest["run"]["duration_seconds"] = round(time.monotonic() - started, 3)
+        duration = round(time.monotonic() - started, 3)
+        segment.update(
+            status=status,
+            return_code=return_code,
+            finished_at=utc_now_iso(),
+            duration_seconds=duration,
+        )
+        manifest["run"].update(
+            status=status,
+            return_code=return_code,
+            finished_at=segment["finished_at"],
+            duration_seconds=round(
+                sum(float(row.get("duration_seconds") or 0.0) for row in manifest["segments"]),
+                3,
+            ),
+        )
         write_manifest(manifest_path, manifest)
         raise ExperimentError(
             f"could not start command {request.command[0]!r}: {exc.strerror or exc}"
         ) from exc
 
-    manifest["run"]["status"] = status
-    manifest["run"]["return_code"] = return_code
-    manifest["run"]["finished_at"] = utc_now_iso()
-    manifest["run"]["duration_seconds"] = round(time.monotonic() - started, 3)
+    duration = round(time.monotonic() - started, 3)
+    segment.update(
+        status=status,
+        return_code=return_code,
+        finished_at=utc_now_iso(),
+        duration_seconds=duration,
+    )
+    manifest["run"].update(
+        status=status,
+        return_code=return_code,
+        finished_at=segment["finished_at"],
+        duration_seconds=round(
+            sum(float(row.get("duration_seconds") or 0.0) for row in manifest["segments"]),
+            3,
+        ),
+    )
     write_manifest(manifest_path, manifest)
 
     return ExperimentResult(
@@ -423,11 +533,12 @@ def launch_and_stream(
     run_id: str,
     *,
     use_pty: bool = False,
+    append: bool = False,
 ) -> int:
     """Launch a child command and tee stdout/stderr into run log files."""
 
     if use_pty:
-        return _launch_and_stream_pty(command, cwd, run_dir, run_id)
+        return _launch_and_stream_pty(command, cwd, run_dir, run_id, append=append)
 
     env = os.environ.copy()
     env["EXPERIMENT_RUN_ID"] = run_id
@@ -448,12 +559,12 @@ def launch_and_stream(
         assert process.stderr is not None
         stdout_thread = threading.Thread(
             target=_tee_stream,
-            args=(process.stdout, stdout_log, sys.stdout),
+            args=(process.stdout, stdout_log, sys.stdout, append),
             daemon=True,
         )
         stderr_thread = threading.Thread(
             target=_tee_stream,
-            args=(process.stderr, stderr_log, sys.stderr),
+            args=(process.stderr, stderr_log, sys.stderr, append),
             daemon=True,
         )
         stdout_thread.start()
@@ -473,7 +584,14 @@ def launch_and_stream(
         return return_code
 
 
-def _launch_and_stream_pty(command: Sequence[str], cwd: Path, run_dir: Path, run_id: str) -> int:
+def _launch_and_stream_pty(
+    command: Sequence[str],
+    cwd: Path,
+    run_dir: Path,
+    run_id: str,
+    *,
+    append: bool = False,
+) -> int:
     """Launch a child command under a PTY and tee combined output."""
 
     if os.name == "nt":
@@ -487,10 +605,8 @@ def _launch_and_stream_pty(command: Sequence[str], cwd: Path, run_dir: Path, run
 
     stdout_log = run_dir / "stdout.log"
     stderr_log = run_dir / "stderr.log"
-    stderr_log.write_text(
-        "PTY mode merges child stdout and stderr into stdout.log.\n",
-        encoding="utf-8",
-    )
+    with stderr_log.open("a" if append else "w", encoding="utf-8") as handle:
+        handle.write("PTY mode merges child stdout and stderr into stdout.log.\n")
 
     master_fd, slave_fd = pty.openpty()
     _configure_pty_window_size(slave_fd)
@@ -508,7 +624,10 @@ def _launch_and_stream_pty(command: Sequence[str], cwd: Path, run_dir: Path, run
         os.close(slave_fd)
         slave_fd = -1
         decoder = codecs.getincrementaldecoder("utf-8")("replace")
-        with stdout_log.open("w", encoding="utf-8") as log_file:
+        with stdout_log.open("a" if append else "w", encoding="utf-8") as log_file:
+            if append:
+                log_file.write(f"\n=== continuation started {utc_now_iso()} ===\n")
+                log_file.flush()
             while True:
                 if process.poll() is not None:
                     ready, _, _ = select.select([master_fd], [], [], 0)
@@ -757,8 +876,16 @@ def _unique_path(path: Path) -> Path:
     raise ExperimentError(f"could not choose an unused destination for {path}")
 
 
-def _tee_stream(pipe: IO[str], log_path: Path, destination: IO[str]) -> None:
-    with log_path.open("w", encoding="utf-8") as log_file:
+def _tee_stream(
+    pipe: IO[str],
+    log_path: Path,
+    destination: IO[str],
+    append: bool = False,
+) -> None:
+    with log_path.open("a" if append else "w", encoding="utf-8") as log_file:
+        if append:
+            log_file.write(f"\n=== continuation started {utc_now_iso()} ===\n")
+            log_file.flush()
         for line in iter(pipe.readline, ""):
             log_file.write(line)
             log_file.flush()

@@ -21,9 +21,10 @@ allowlist. The scheduler resolves his selected host indices to GPU UUIDs and
 sets `CUDA_VISIBLE_DEVICES` only in the launched child's environment.
 
 The ignored root directory `gpu_scheduler_state/` contains the SQLite state,
-attempt launcher logs, exit receipts, scheduler identity, and exported queue
-receipt. Experiment artifacts remain in their usual `outputs/experiments/`
-directories and are not deleted or compacted by the queue.
+per-segment launcher logs, yield requests and receipts, web password hashes and
+session-signing secret, scheduler identity, and exported queue receipt.
+Experiment artifacts remain in their usual `outputs/experiments/` directories
+and are not deleted or compacted by the queue.
 
 ## Queue Membership Is Explicit
 
@@ -51,7 +52,14 @@ Useful admission controls are:
 
 # A prior launched attempt requires explicit authorization.
 .venv/bin/python scripts/run_experiment_queue.py add WCG-017 --new-attempt
+
+# Allow this admitted workflow to checkpoint, yield, and resume.
+.venv/bin/python scripts/run_experiment_queue.py add WCG-023 --preemptible
 ```
+
+`--preemptible` is an explicit operational promise, not a property inferred
+from card or ledger status. Use it only for workflows whose trainer implements
+the queue yield contract. The frozen WCG wrapper and Flowers trainer do so.
 
 An experiment can have only one active queue item. Removing a never-launched
 item and adding it again creates a new recorded membership. After any launched
@@ -104,6 +112,50 @@ scheduler checks the worktree and commit at launch and during GPU polling. If
 it detects repository drift, it records the condition and pauses new dispatch;
 it does not terminate active work.
 
+## Run The Private HTTPS Web App
+
+The scheduler and web app are separate processes over the same SQLite state.
+The web process records authenticated requests; only the scheduler launches or
+reconciles jobs. Configure two passwords interactively: one administrator
+password for David and one shared reservation password for coworkers.
+
+```bash
+cd ~/3D_Helmholtz
+.venv/bin/python scripts/run_experiment_queue_web.py auth-setup
+```
+
+Only scrypt password hashes, random salts, an authentication version, and a
+session-signing secret are written to
+`gpu_scheduler_state/web_auth.json`. The file is owner-only and ignored by
+Git. Re-running setup replaces both passwords, rotates the signing secret, and
+invalidates existing browser sessions.
+
+Serve on the private network with the certificate and key for its HTTPS
+hostname. The key should remain outside Git with owner-only permissions.
+
+```bash
+cd ~/3D_Helmholtz
+.venv/bin/python scripts/run_experiment_queue_web.py serve \
+  --host 0.0.0.0 \
+  --port 8443 \
+  --tls-cert /absolute/private/path/mutton2.crt \
+  --tls-key /absolute/private/path/mutton2.key
+```
+
+The two entry points are:
+
+- `https://<private-mutton2-host>:8443/reserve`: restricted coworker GPU
+  reservation and early-release page; and
+- `https://<private-mutton2-host>:8443/admin`: David's complete queue, GPU
+  pool, dispatch, termination, force-kill, reservation, and audit dashboard.
+
+The coworker password cannot authorize queue admission, priority, allowlist,
+dispatch, termination, or force-kill operations. The required reservation note
+is the self-reported identity because coworkers share one credential. Sessions
+are signed, secure, HTTP-only, same-site cookies; every mutation also requires
+a session-specific CSRF token. Login failures are rate limited. HTTPS is
+required except for an explicit loopback-only local-test flag.
+
 ## Operator Controls
 
 These controls may be used while `serve` is running:
@@ -125,6 +177,48 @@ These controls may be used while `serve` is running:
 
 `remove` applies only to pending or held work. A running item must be
 terminated explicitly.
+
+## Yield And Resume A Running Job
+
+The coworker page can reserve an idle eligible GPU or yield a running queue job
+that was explicitly admitted with `--preemptible`. Reservations accept only
+whole-hour durations from 1 through 24 and require a note identifying who the
+window is for.
+
+For a running job, the queue first creates a pending reservation so dispatch
+cannot refill the device. The Flowers loop observes the durable request only
+after completing an optimizer update, atomically serializes the complete Flax
+`TrainState` (step, parameters, and optimizer state), records metadata and a
+SHA-256 receipt, and exits with the dedicated cooperative-yield status. Its
+training batch and dropout randomness are step-derived, so the recorded global
+step restores their exact progression without an extra sampler cursor.
+
+The scheduler verifies the checkpoint path, size, digest, queue/request
+identity, metadata, and optimizer step before it does either of the following:
+
+1. starts the reservation clock after the GPU-owning process has exited; and
+2. returns the same queue item to the front with a new execution segment.
+
+The yielded GPU is excluded while the reservation is pending or active. The
+front item may therefore resume on another eligible idle GPU. The experiment
+runner reopens the original run directory, appends a segment to its manifest
+and logs, and preserves the original pull command. The WCG wrapper reuses the
+same training directory, restores the preemption checkpoint, retains earlier
+best/milestone checkpoints, and resumes an enabled W&B run using its exact ID
+with `resume=must`. A missing W&B identity blocks a W&B-enabled continuation
+rather than silently creating another run.
+
+If checkpoint creation fails, the trainer publishes a failure receipt and
+continues running. The reservation fails and its timer never starts. The
+coworker action never force-kills. David may still use the distinct terminate
+or force-kill controls.
+
+An active reservation expires at its exact 1--24 hour deadline or can be
+released early. Expiry removes only the temporary exclusion: it does not
+reinsert a GPU that David removed from the permanent pool. An expired device
+becomes scheduling-eligible at the next polling pass only if it remains in the
+allowlist and ordinary telemetry still reports it idle. This preserves the
+accepted unmanaged-host race boundary.
 
 ## Terminate A Running Attempt
 

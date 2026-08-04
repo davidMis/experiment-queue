@@ -14,6 +14,7 @@ import csv
 import fcntl
 import getpass
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -25,22 +26,35 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid as uuid_module
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
 
 from helmholtz_shared.experiment_runner import collect_git_context
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 DEFAULT_STATE_DIR = Path("gpu_scheduler_state")
-ACTIVE_STATES = {"queued", "held", "blocked", "starting", "running", "terminating", "force_killing"}
+ACTIVE_STATES = {
+    "queued",
+    "held",
+    "blocked",
+    "starting",
+    "running",
+    "yielding",
+    "terminating",
+    "force_killing",
+}
 PENDING_STATES = {"queued", "held", "blocked"}
-RUNNING_STATES = {"starting", "running", "terminating", "force_killing"}
+RUNNING_STATES = {"starting", "running", "yielding", "terminating", "force_killing"}
 TERMINAL_STATES = {"succeeded", "failed", "interrupted", "force_killed", "removed"}
 SUCCESS_STATE = "succeeded"
 CARD_COMMAND_HEADING = "## Exact Manual Command On Mutton2"
+YIELD_EXIT_CODE = 75
+MIN_RESERVATION_HOURS = 1
+MAX_RESERVATION_HOURS = 24
 
 
 class QueueError(RuntimeError):
@@ -93,6 +107,14 @@ def _actor() -> str:
 
 def _sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -174,6 +196,18 @@ class QueueStore:
                     runner_run_dir TEXT,
                     runner_manifest_path TEXT,
                     rsync_pull_command TEXT,
+                    preemptible INTEGER NOT NULL DEFAULT 0,
+                    segment INTEGER NOT NULL DEFAULT 1,
+                    resume_front INTEGER NOT NULL DEFAULT 0,
+                    yield_requested_at TEXT,
+                    yield_requested_by TEXT,
+                    yield_request_id TEXT,
+                    yield_note TEXT,
+                    yield_duration_hours INTEGER,
+                    continuation_checkpoint TEXT,
+                    continuation_checkpoint_sha256 TEXT,
+                    continuation_step INTEGER,
+                    continuation_wandb_id TEXT,
                     UNIQUE(experiment_id, attempt)
                 );
 
@@ -207,6 +241,30 @@ class QueueStore:
                     payload_json TEXT NOT NULL,
                     FOREIGN KEY(queue_item_id) REFERENCES queue_items(id)
                 );
+
+                CREATE TABLE IF NOT EXISTS gpu_reservations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    gpu_uuid TEXT NOT NULL,
+                    queue_item_id INTEGER,
+                    status TEXT NOT NULL,
+                    requested_at TEXT NOT NULL,
+                    requested_by TEXT NOT NULL,
+                    note TEXT NOT NULL,
+                    duration_hours INTEGER NOT NULL,
+                    starts_at TEXT,
+                    expires_at TEXT,
+                    released_at TEXT,
+                    released_by TEXT,
+                    state_detail TEXT,
+                    FOREIGN KEY(queue_item_id) REFERENCES queue_items(id)
+                );
+
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_gpu_reservations_open_gpu
+                    ON gpu_reservations(gpu_uuid)
+                    WHERE status IN ('pending', 'active');
+
+                CREATE INDEX IF NOT EXISTS idx_gpu_reservations_status_expiry
+                    ON gpu_reservations(status, expires_at);
                 """
             )
             existing_version = connection.execute(
@@ -220,16 +278,49 @@ class QueueStore:
                 self._set_meta(connection, "consecutive_failures", "0")
                 self._event(connection, "QUEUE_INITIALIZED", payload={"repo_root": str(self.repo_root)})
             else:
-                if int(existing_version["value"]) != SCHEMA_VERSION:
+                version = int(existing_version["value"])
+                if version not in {1, SCHEMA_VERSION}:
                     raise QueueError(
                         f"queue schema {existing_version['value']} is not supported; "
-                        f"expected {SCHEMA_VERSION}"
+                        f"expected 1 or {SCHEMA_VERSION}"
                     )
+                if version == 1:
+                    self._migrate_v1_to_v2(connection)
                 recorded_root = self.get_meta("repo_root", connection=connection)
                 if Path(recorded_root).resolve() != self.repo_root:
                     raise QueueError(
                         f"queue belongs to repository {recorded_root}, not {self.repo_root}"
                     )
+            connection.execute("PRAGMA optimize")
+
+    def _migrate_v1_to_v2(self, connection: sqlite3.Connection) -> None:
+        """Add cooperative-yield state without discarding a live v1 queue."""
+
+        columns = {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(queue_items)")
+        }
+        additions = {
+            "preemptible": "INTEGER NOT NULL DEFAULT 0",
+            "segment": "INTEGER NOT NULL DEFAULT 1",
+            "resume_front": "INTEGER NOT NULL DEFAULT 0",
+            "yield_requested_at": "TEXT",
+            "yield_requested_by": "TEXT",
+            "yield_request_id": "TEXT",
+            "yield_note": "TEXT",
+            "yield_duration_hours": "INTEGER",
+            "continuation_checkpoint": "TEXT",
+            "continuation_checkpoint_sha256": "TEXT",
+            "continuation_step": "INTEGER",
+            "continuation_wandb_id": "TEXT",
+        }
+        for name, declaration in additions.items():
+            if name not in columns:
+                connection.execute(
+                    f"ALTER TABLE queue_items ADD COLUMN {name} {declaration}"
+                )
+        self._set_meta(connection, "schema_version", str(SCHEMA_VERSION))
+        self._event(connection, "QUEUE_SCHEMA_MIGRATED", payload={"from": 1, "to": 2})
 
     @staticmethod
     def _set_meta(connection: sqlite3.Connection, key: str, value: str) -> None:
@@ -282,9 +373,16 @@ class QueueStore:
         *,
         queue_item_id: int | None = None,
         payload: dict[str, Any] | None = None,
+        actor: str | None = None,
     ) -> None:
         with self.connect() as connection:
-            self._event(connection, event_type, queue_item_id=queue_item_id, payload=payload)
+            self._event(
+                connection,
+                event_type,
+                queue_item_id=queue_item_id,
+                payload=payload,
+                actor=actor,
+            )
 
     def item(self, item_id: int, *, connection: sqlite3.Connection | None = None) -> sqlite3.Row:
         owns_connection = connection is None
@@ -413,6 +511,8 @@ def add_experiment(
     dependency_ids: Sequence[int] = (),
     held: bool = False,
     new_attempt: bool = False,
+    preemptible: bool = False,
+    actor: str | None = None,
 ) -> int:
     """Explicitly snapshot one committed card command into queue membership."""
 
@@ -422,7 +522,7 @@ def add_experiment(
         connection.execute("BEGIN IMMEDIATE")
         active = connection.execute(
             "SELECT id, state FROM queue_items WHERE experiment_id = ? "
-            "AND state IN ('queued','held','blocked','starting','running','terminating','force_killing')",
+            "AND state IN ('queued','held','blocked','starting','running','yielding','terminating','force_killing')",
             (card.experiment_id,),
         ).fetchone()
         if active is not None:
@@ -458,7 +558,8 @@ def add_experiment(
             INSERT INTO queue_items(
                 experiment_id, attempt, state, priority, card_path, card_sha256,
                 command_text, runner_name, git_commit, added_at, added_by, state_detail
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                , preemptible
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 card.experiment_id,
@@ -471,8 +572,9 @@ def add_experiment(
                 card.runner_name,
                 commit,
                 utc_now_iso(),
-                _actor(),
+                actor or _actor(),
                 "explicitly held at admission" if held else None,
+                int(preemptible),
             ),
         )
         item_id = int(cursor.lastrowid)
@@ -494,7 +596,9 @@ def add_experiment(
                 "card_path": str(relative_card),
                 "card_sha256": card.card_sha256,
                 "git_commit": commit,
+                "preemptible": bool(preemptible),
             },
+            actor=actor,
         )
     return item_id
 
@@ -507,6 +611,7 @@ def _transition_pending_item(
     event_type: str,
     detail: str | None = None,
     allowed_states: Iterable[str] = PENDING_STATES,
+    actor: str | None = None,
 ) -> None:
     with store.connect() as connection:
         connection.execute("BEGIN IMMEDIATE")
@@ -520,10 +625,22 @@ def _transition_pending_item(
             "UPDATE queue_items SET state = ?, state_detail = ? WHERE id = ?",
             (target_state, detail, item_id),
         )
-        store._event(connection, event_type, queue_item_id=item_id, payload={"detail": detail})
+        store._event(
+            connection,
+            event_type,
+            queue_item_id=item_id,
+            payload={"detail": detail},
+            actor=actor,
+        )
 
 
-def remove_item(store: QueueStore, item_id: int, reason: str | None = None) -> None:
+def remove_item(
+    store: QueueStore,
+    item_id: int,
+    reason: str | None = None,
+    *,
+    actor: str | None = None,
+) -> None:
     """Remove a pending item without deleting its operational history."""
 
     with store.connect() as connection:
@@ -542,6 +659,7 @@ def remove_item(store: QueueStore, item_id: int, reason: str | None = None) -> N
             "EXPERIMENT_REMOVED",
             queue_item_id=item_id,
             payload={"detail": reason},
+            actor=actor,
         )
         dependents = list(
             connection.execute(
@@ -565,10 +683,17 @@ def remove_item(store: QueueStore, item_id: int, reason: str | None = None) -> N
                 "DEPENDENT_HELD",
                 queue_item_id=int(dependent["id"]),
                 payload={"dependency_item_id": item_id, "reason": detail},
+                actor=actor,
             )
 
 
-def hold_item(store: QueueStore, item_id: int, reason: str | None = None) -> None:
+def hold_item(
+    store: QueueStore,
+    item_id: int,
+    reason: str | None = None,
+    *,
+    actor: str | None = None,
+) -> None:
     """Prevent a pending item from dispatching until explicitly released."""
 
     _transition_pending_item(
@@ -578,10 +703,16 @@ def hold_item(store: QueueStore, item_id: int, reason: str | None = None) -> Non
         event_type="EXPERIMENT_HELD",
         detail=reason,
         allowed_states={"queued", "blocked"},
+        actor=actor,
     )
 
 
-def release_item(store: QueueStore, item_id: int) -> None:
+def release_item(
+    store: QueueStore,
+    item_id: int,
+    *,
+    actor: str | None = None,
+) -> None:
     """Return a held or blocked item to explicit queue membership."""
 
     _transition_pending_item(
@@ -590,10 +721,17 @@ def release_item(store: QueueStore, item_id: int) -> None:
         target_state="queued",
         event_type="EXPERIMENT_RELEASED",
         allowed_states={"held", "blocked"},
+        actor=actor,
     )
 
 
-def set_priority(store: QueueStore, item_id: int, priority: int) -> None:
+def set_priority(
+    store: QueueStore,
+    item_id: int,
+    priority: int,
+    *,
+    actor: str | None = None,
+) -> None:
     """Change the dispatch priority of a pending item."""
 
     with store.connect() as connection:
@@ -607,10 +745,17 @@ def set_priority(store: QueueStore, item_id: int, priority: int) -> None:
             "PRIORITY_CHANGED",
             queue_item_id=item_id,
             payload={"old": item["priority"], "new": priority},
+            actor=actor,
         )
 
 
-def set_dispatch_paused(store: QueueStore, paused: bool, reason: str | None = None) -> None:
+def set_dispatch_paused(
+    store: QueueStore,
+    paused: bool,
+    reason: str | None = None,
+    *,
+    actor: str | None = None,
+) -> None:
     """Pause or resume new dispatch without changing running jobs."""
 
     with store.connect() as connection:
@@ -620,6 +765,7 @@ def set_dispatch_paused(store: QueueStore, paused: bool, reason: str | None = No
             connection,
             "DISPATCH_PAUSED" if paused else "DISPATCH_RESUMED",
             payload={"reason": reason},
+            actor=actor,
         )
 
 
@@ -745,7 +891,7 @@ def _running_gpu_uuids(connection: sqlite3.Connection) -> set[str]:
         str(row["assigned_gpu_uuid"])
         for row in connection.execute(
             "SELECT assigned_gpu_uuid FROM queue_items WHERE state IN "
-            "('starting','running','terminating','force_killing') AND assigned_gpu_uuid IS NOT NULL"
+            "('starting','running','yielding','terminating','force_killing') AND assigned_gpu_uuid IS NOT NULL"
         )
     }
 
@@ -756,6 +902,7 @@ def update_gpu_allowlist(
     identifiers: Sequence[str],
     *,
     snapshots: Sequence[GpuSnapshot],
+    actor: str | None = None,
 ) -> None:
     """Atomically set, add, or remove operator-owned GPU eligibility."""
 
@@ -843,6 +990,300 @@ def update_gpu_allowlist(
                 "resolved_uuids": sorted(requested_uuids),
                 "draining_uuids": sorted(removals & running),
             },
+            actor=actor,
+        )
+
+
+def _segment_dir(store: QueueStore, item_id: int, segment: int) -> Path:
+    return store.state_dir / "attempts" / str(item_id) / "segments" / str(segment)
+
+
+def _yield_request_path(store: QueueStore, item_id: int, segment: int) -> Path:
+    return _segment_dir(store, item_id, segment) / "yield" / "request.json"
+
+
+def _yield_receipt_path(store: QueueStore, item_id: int, segment: int) -> Path:
+    return _segment_dir(store, item_id, segment) / "yield" / "receipt.json"
+
+
+def _parse_timestamp(value: str) -> datetime:
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def expire_reservations(
+    store: QueueStore,
+    *,
+    now: datetime | None = None,
+) -> list[int]:
+    """Expire active reservations without mutating the permanent GPU allowlist."""
+
+    current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    expired: list[int] = []
+    with store.connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        rows = list(
+            connection.execute(
+                "SELECT * FROM gpu_reservations WHERE status = 'active' "
+                "AND expires_at IS NOT NULL"
+            )
+        )
+        for row in rows:
+            if _parse_timestamp(str(row["expires_at"])) > current:
+                continue
+            reservation_id = int(row["id"])
+            connection.execute(
+                "UPDATE gpu_reservations SET status = 'expired', state_detail = ? WHERE id = ?",
+                ("reservation duration elapsed", reservation_id),
+            )
+            store._event(
+                connection,
+                "GPU_RESERVATION_EXPIRED",
+                queue_item_id=row["queue_item_id"],
+                payload={
+                    "reservation_id": reservation_id,
+                    "gpu_uuid": row["gpu_uuid"],
+                    "note": row["note"],
+                    "expires_at": row["expires_at"],
+                },
+                actor="scheduler",
+            )
+            expired.append(reservation_id)
+    return expired
+
+
+def _open_reserved_gpu_uuids(connection: sqlite3.Connection) -> set[str]:
+    return {
+        str(row["gpu_uuid"])
+        for row in connection.execute(
+            "SELECT gpu_uuid FROM gpu_reservations "
+            "WHERE status IN ('pending', 'active')"
+        )
+    }
+
+
+def list_reservations(store: QueueStore) -> list[sqlite3.Row]:
+    """Return reservations newest first for operator and coworker interfaces."""
+
+    with store.connect() as connection:
+        return list(
+            connection.execute("SELECT * FROM gpu_reservations ORDER BY id DESC")
+        )
+
+
+def request_gpu_reservation(
+    store: QueueStore,
+    gpu_uuid: str,
+    *,
+    duration_hours: int,
+    note: str,
+    actor: str,
+    snapshots: Sequence[GpuSnapshot] | None = None,
+) -> int:
+    """Reserve an idle GPU or cooperatively yield one preemptible queue job."""
+
+    if not isinstance(duration_hours, int) or not (
+        MIN_RESERVATION_HOURS <= duration_hours <= MAX_RESERVATION_HOURS
+    ):
+        raise QueueError(
+            f"reservation duration must be a whole number from {MIN_RESERVATION_HOURS} "
+            f"through {MAX_RESERVATION_HOURS} hours"
+        )
+    cleaned_note = " ".join(note.split()).strip()
+    if not cleaned_note:
+        raise QueueError("reservation note is required; include who the GPU is for")
+    if len(cleaned_note) > 200:
+        raise QueueError("reservation note must be 200 characters or fewer")
+    now = datetime.now(timezone.utc)
+    requested_at = now.isoformat(timespec="seconds")
+    request_id = uuid_module.uuid4().hex
+    item_id: int | None = None
+    segment: int | None = None
+    reservation_id: int
+    with store.connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        allow = connection.execute(
+            "SELECT * FROM gpu_allowlist WHERE uuid = ? AND enabled = 1",
+            (gpu_uuid,),
+        ).fetchone()
+        if allow is None:
+            raise QueueError(
+                f"GPU {gpu_uuid} is not currently enabled in the scheduler pool"
+            )
+        existing = connection.execute(
+            "SELECT * FROM gpu_reservations WHERE gpu_uuid = ? "
+            "AND status IN ('pending', 'active')",
+            (gpu_uuid,),
+        ).fetchone()
+        if existing is not None:
+            raise QueueError(
+                f"GPU {gpu_uuid} already has open reservation {existing['id']} "
+                f"for {existing['note']}"
+            )
+        running = connection.execute(
+            "SELECT * FROM queue_items WHERE assigned_gpu_uuid = ? AND state IN "
+            "('starting','running','yielding','terminating','force_killing')",
+            (gpu_uuid,),
+        ).fetchone()
+        if running is not None:
+            if running["state"] != "running":
+                raise QueueError(
+                    f"queue item {running['id']} is {running['state']}; wait until it is "
+                    "stably running before requesting a cooperative yield"
+                )
+            if not running["preemptible"]:
+                raise QueueError(
+                    f"queue item {running['id']} is not marked checkpoint-and-requeue capable"
+                )
+            item_id = int(running["id"])
+            segment = int(running["segment"])
+            status = "pending"
+            starts_at = None
+            expires_at = None
+        else:
+            if snapshots is not None:
+                observed = {gpu.uuid: gpu for gpu in snapshots}.get(gpu_uuid)
+                if observed is None:
+                    raise QueueError(
+                        f"GPU {gpu_uuid} is not currently visible in GPU telemetry"
+                    )
+                if observed.compute_pids:
+                    raise QueueError(
+                        f"GPU {gpu_uuid} is used by external process IDs "
+                        f"{list(observed.compute_pids)}; the scheduler cannot yield those processes"
+                    )
+            status = "active"
+            starts_at = requested_at
+            expires_at = (now + timedelta(hours=duration_hours)).isoformat(
+                timespec="seconds"
+            )
+        cursor = connection.execute(
+            """
+            INSERT INTO gpu_reservations(
+                gpu_uuid, queue_item_id, status, requested_at, requested_by,
+                note, duration_hours, starts_at, expires_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                gpu_uuid,
+                item_id,
+                status,
+                requested_at,
+                actor,
+                cleaned_note,
+                duration_hours,
+                starts_at,
+                expires_at,
+            ),
+        )
+        reservation_id = int(cursor.lastrowid)
+        if item_id is not None:
+            connection.execute(
+                """
+                UPDATE queue_items SET state = 'yielding', yield_requested_at = ?,
+                    yield_requested_by = ?, yield_request_id = ?, yield_note = ?,
+                    yield_duration_hours = ?, state_detail = ?
+                WHERE id = ? AND state = 'running'
+                """,
+                (
+                    requested_at,
+                    actor,
+                    request_id,
+                    cleaned_note,
+                    duration_hours,
+                    f"checkpointing to yield GPU for {cleaned_note}",
+                    item_id,
+                ),
+            )
+        store._event(
+            connection,
+            "GPU_RESERVATION_REQUESTED",
+            queue_item_id=item_id,
+            payload={
+                "reservation_id": reservation_id,
+                "gpu_uuid": gpu_uuid,
+                "duration_hours": duration_hours,
+                "note": cleaned_note,
+                "status": status,
+                "request_id": request_id if item_id is not None else None,
+            },
+            actor=actor,
+        )
+    if item_id is not None and segment is not None:
+        request_path = _yield_request_path(store, item_id, segment)
+        try:
+            _atomic_write_json(
+                request_path,
+                {
+                    "schema_version": 1,
+                    "request_id": request_id,
+                    "queue_item_id": item_id,
+                    "segment": segment,
+                    "gpu_uuid": gpu_uuid,
+                    "requested_at": requested_at,
+                    "requested_by": actor,
+                    "note": cleaned_note,
+                    "duration_hours": duration_hours,
+                },
+            )
+        except OSError as exc:
+            with store.connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                connection.execute(
+                    "UPDATE queue_items SET state = 'running', state_detail = ? WHERE id = ?",
+                    (f"yield request could not be written: {exc}", item_id),
+                )
+                connection.execute(
+                    "UPDATE gpu_reservations SET status = 'failed', state_detail = ? WHERE id = ?",
+                    (str(exc), reservation_id),
+                )
+                store._event(
+                    connection,
+                    "GPU_RESERVATION_FAILED",
+                    queue_item_id=item_id,
+                    payload={"reservation_id": reservation_id, "error": str(exc)},
+                    actor=actor,
+                )
+            raise QueueError(f"could not deliver yield request: {exc}") from exc
+    return reservation_id
+
+
+def release_gpu_reservation(
+    store: QueueStore,
+    reservation_id: int,
+    *,
+    actor: str,
+) -> None:
+    """Release a pending or active reservation without changing the allowlist."""
+
+    with store.connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        row = connection.execute(
+            "SELECT * FROM gpu_reservations WHERE id = ?", (reservation_id,)
+        ).fetchone()
+        if row is None:
+            raise QueueError(f"GPU reservation {reservation_id} does not exist")
+        if row["status"] not in {"pending", "active"}:
+            raise QueueError(
+                f"GPU reservation {reservation_id} is already {row['status']}"
+            )
+        connection.execute(
+            "UPDATE gpu_reservations SET status = 'released', released_at = ?, "
+            "released_by = ?, state_detail = ? WHERE id = ?",
+            (utc_now_iso(), actor, "released early", reservation_id),
+        )
+        store._event(
+            connection,
+            "GPU_RESERVATION_RELEASED",
+            queue_item_id=row["queue_item_id"],
+            payload={
+                "reservation_id": reservation_id,
+                "gpu_uuid": row["gpu_uuid"],
+                "note": row["note"],
+            },
+            actor=actor,
         )
 
 
@@ -890,13 +1331,14 @@ def request_termination(
     *,
     reason: str | None,
     force: bool,
+    actor: str | None = None,
 ) -> bool:
     """Record and signal a graceful termination or explicit force kill."""
 
     with store.connect() as connection:
         connection.execute("BEGIN IMMEDIATE")
         item = store.item(item_id, connection=connection)
-        if item["state"] not in {"starting", "running", "terminating", "force_killing"}:
+        if item["state"] not in RUNNING_STATES:
             raise QueueError(
                 f"queue item {item_id} is {item['state']}; remove pending work or target a running item"
             )
@@ -922,11 +1364,18 @@ def request_termination(
             """,
             (target_state, now, reason, stage, epoch, item_id),
         )
+        if item["state"] == "yielding":
+            connection.execute(
+                "UPDATE gpu_reservations SET status = 'failed', state_detail = ? "
+                "WHERE queue_item_id = ? AND status = 'pending'",
+                ("yield superseded by explicit termination", item_id),
+            )
         store._event(
             connection,
             event_type,
             queue_item_id=item_id,
             payload={"reason": reason, "signal": signal.Signals(signum).name},
+            actor=actor,
         )
         refreshed = store.item(item_id, connection=connection)
     signaled = _signal_item(refreshed, signum)
@@ -934,6 +1383,7 @@ def request_termination(
         "TERMINATION_SIGNAL_SENT" if signaled else "TERMINATION_SIGNAL_PENDING",
         queue_item_id=item_id,
         payload={"signal": signal.Signals(signum).name},
+        actor=actor,
     )
     return signaled
 
@@ -1040,7 +1490,7 @@ class Scheduler:
             rows = list(
                 connection.execute(
                     "SELECT * FROM queue_items WHERE state IN "
-                    "('starting','running','terminating','force_killing')"
+                    "('starting','running','yielding','terminating','force_killing')"
                 )
             )
         for item in rows:
@@ -1052,12 +1502,181 @@ class Scheduler:
                     payload={"gpu_uuid": uuid},
                 )
 
-    def _receipt_path(self, item_id: int) -> Path:
-        return self.store.state_dir / "attempts" / str(item_id) / "exit.json"
+    def _receipt_path(self, item_id: int, segment: int) -> Path:
+        return _segment_dir(self.store, item_id, segment) / "exit.json"
+
+    def _validated_yield_receipt(
+        self,
+        item: sqlite3.Row,
+        *,
+        runner_run_dir: str | None,
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        """Verify the trainer's checkpoint receipt before allowing requeue."""
+
+        receipt_path = _yield_receipt_path(
+            self.store,
+            int(item["id"]),
+            int(item["segment"]),
+        )
+        if not receipt_path.is_file():
+            return None, f"yield receipt is missing: {receipt_path}"
+        try:
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            return None, f"yield receipt is invalid: {exc}"
+        if receipt.get("status") != "ready":
+            return None, f"yield checkpoint reported {receipt.get('status')!r}"
+        if receipt.get("request_id") != item["yield_request_id"]:
+            return None, "yield receipt request identity does not match the queue item"
+        try:
+            receipt_item_id = int(receipt.get("queue_item_id", -1))
+        except (TypeError, ValueError):
+            return None, "yield receipt has no valid queue-item identity"
+        if receipt_item_id != int(item["id"]):
+            return None, "yield receipt queue-item identity does not match"
+        checkpoint_value = receipt.get("checkpoint")
+        metadata_value = receipt.get("checkpoint_metadata")
+        if not checkpoint_value or not metadata_value:
+            return None, "yield receipt omits checkpoint paths"
+        checkpoint = Path(str(checkpoint_value)).resolve()
+        metadata = Path(str(metadata_value)).resolve()
+        if not checkpoint.is_file() or checkpoint.is_symlink():
+            return None, f"yield checkpoint is missing or unsafe: {checkpoint}"
+        if not metadata.is_file() or metadata.is_symlink():
+            return None, f"yield checkpoint metadata is missing or unsafe: {metadata}"
+        if runner_run_dir:
+            run_dir = Path(runner_run_dir)
+            if not run_dir.is_absolute():
+                run_dir = self.store.repo_root / run_dir
+            try:
+                checkpoint.relative_to(run_dir.resolve())
+            except ValueError:
+                return None, f"yield checkpoint is outside runner directory {run_dir}"
+        expected_bytes = receipt.get("checkpoint_bytes")
+        try:
+            expected_size = int(expected_bytes)
+        except (TypeError, ValueError):
+            return None, "yield receipt has no valid checkpoint size"
+        if checkpoint.stat().st_size != expected_size:
+            return None, "yield checkpoint size differs from its receipt"
+        expected_hash = str(receipt.get("checkpoint_sha256") or "")
+        actual_hash = _sha256_file(checkpoint)
+        if not expected_hash or not hmac.compare_digest(actual_hash, expected_hash):
+            return None, "yield checkpoint SHA-256 differs from its receipt"
+        try:
+            step = int(receipt["step"])
+        except (KeyError, TypeError, ValueError):
+            return None, "yield receipt has no valid optimizer step"
+        if step < 1:
+            return None, f"yield receipt has invalid optimizer step {step}"
+        return receipt, None
+
+    def _activate_pending_reservation(
+        self,
+        connection: sqlite3.Connection,
+        item: sqlite3.Row,
+    ) -> sqlite3.Row | None:
+        reservation = connection.execute(
+            "SELECT * FROM gpu_reservations WHERE queue_item_id = ? AND status = 'pending'",
+            (item["id"],),
+        ).fetchone()
+        if reservation is None:
+            return None
+        starts = datetime.now(timezone.utc)
+        expires = starts + timedelta(hours=int(reservation["duration_hours"]))
+        connection.execute(
+            "UPDATE gpu_reservations SET status = 'active', starts_at = ?, expires_at = ?, "
+            "state_detail = ? WHERE id = ?",
+            (
+                starts.isoformat(timespec="seconds"),
+                expires.isoformat(timespec="seconds"),
+                "scheduler job checkpointed and GPU process exited",
+                reservation["id"],
+            ),
+        )
+        return connection.execute(
+            "SELECT * FROM gpu_reservations WHERE id = ?", (reservation["id"],)
+        ).fetchone()
+
+    def _finalize_yield(
+        self,
+        item: sqlite3.Row,
+        executor_receipt: dict[str, Any],
+        runner_receipt: dict[str, str],
+        yield_receipt: dict[str, Any],
+    ) -> None:
+        """Activate the reservation and return the same experiment to queue front."""
+
+        wandb = yield_receipt.get("wandb") or {}
+        with self.store.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            reservation = self._activate_pending_reservation(connection, item)
+            connection.execute(
+                """
+                UPDATE queue_items SET state = 'queued', state_detail = ?, segment = segment + 1,
+                    resume_front = 1, assigned_gpu_uuid = NULL, assigned_gpu_index = NULL,
+                    pid = NULL, pgid = NULL, proc_start_ticks = NULL, return_code = NULL,
+                    continuation_checkpoint = ?, continuation_checkpoint_sha256 = ?,
+                    continuation_step = ?, continuation_wandb_id = ?, runner_run_dir = ?,
+                    runner_manifest_path = ?, rsync_pull_command = ?
+                WHERE id = ?
+                """,
+                (
+                    f"resume from verified step {int(yield_receipt['step']):,}",
+                    str(yield_receipt["checkpoint"]),
+                    str(yield_receipt["checkpoint_sha256"]),
+                    int(yield_receipt["step"]),
+                    wandb.get("id"),
+                    runner_receipt.get("run_directory") or item["runner_run_dir"],
+                    runner_receipt.get("manifest") or item["runner_manifest_path"],
+                    runner_receipt.get("rsync_pull_command") or item["rsync_pull_command"],
+                    item["id"],
+                ),
+            )
+            self.store._set_meta(connection, "consecutive_failures", "0")
+            self.store._event(
+                connection,
+                "EXPERIMENT_YIELDED_AND_REQUEUED",
+                queue_item_id=int(item["id"]),
+                payload={
+                    "segment_finished": int(item["segment"]),
+                    "next_segment": int(item["segment"]) + 1,
+                    "checkpoint": yield_receipt["checkpoint"],
+                    "checkpoint_sha256": yield_receipt["checkpoint_sha256"],
+                    "step": int(yield_receipt["step"]),
+                    "wandb_id": wandb.get("id"),
+                    "reservation_id": int(reservation["id"]) if reservation else None,
+                    "reservation_expires_at": reservation["expires_at"] if reservation else None,
+                    "executor_receipt": executor_receipt,
+                },
+            )
+        self._release_gpu_lock(item["assigned_gpu_uuid"])
+        print(
+            f"[{utc_now_iso()}] queue item {item['id']} yielded at step "
+            f"{int(yield_receipt['step']):,} and returned to the queue front",
+            flush=True,
+        )
 
     def _finalize_item(self, item: sqlite3.Row, receipt: dict[str, Any] | None) -> None:
         prior_state = str(item["state"])
         return_code = receipt.get("return_code") if receipt is not None else None
+        segment_dir = _segment_dir(
+            self.store,
+            int(item["id"]),
+            int(item["segment"]),
+        )
+        runner_receipt = _read_runner_receipt(segment_dir / "launcher.log")
+        if prior_state == "yielding" and receipt is not None:
+            run_dir = runner_receipt.get("run_directory") or item["runner_run_dir"]
+            yield_receipt, yield_error = self._validated_yield_receipt(
+                item,
+                runner_run_dir=run_dir,
+            )
+            if return_code == YIELD_EXIT_CODE and yield_receipt is not None:
+                self._finalize_yield(item, receipt, runner_receipt, yield_receipt)
+                return
+        else:
+            yield_error = None
         if prior_state == "force_killing":
             final_state = "force_killed"
         elif prior_state == "terminating" or return_code == 130:
@@ -1066,9 +1685,10 @@ class Scheduler:
             final_state = "succeeded"
         else:
             final_state = "failed"
-        detail = None if receipt is not None else "process disappeared without an exit receipt"
-        runner_receipt = _read_runner_receipt(
-            self.store.state_dir / "attempts" / str(item["id"]) / "launcher.log"
+        detail = (
+            yield_error
+            if yield_error
+            else None if receipt is not None else "process disappeared without an exit receipt"
         )
         with self.store.connect() as connection:
             connection.execute(
@@ -1101,6 +1721,27 @@ class Scheduler:
                 queue_item_id=int(item["id"]),
                 payload={"state": final_state, "return_code": return_code, "receipt": receipt},
             )
+            pending_reservation = connection.execute(
+                "SELECT * FROM gpu_reservations WHERE queue_item_id = ? AND status = 'pending'",
+                (item["id"],),
+            ).fetchone()
+            if pending_reservation is not None:
+                connection.execute(
+                    "UPDATE gpu_reservations SET status = 'failed', state_detail = ? WHERE id = ?",
+                    (
+                        detail or f"queue item finished as {final_state} before safe yield",
+                        pending_reservation["id"],
+                    ),
+                )
+                self.store._event(
+                    connection,
+                    "GPU_RESERVATION_FAILED",
+                    queue_item_id=int(item["id"]),
+                    payload={
+                        "reservation_id": int(pending_reservation["id"]),
+                        "reason": detail or final_state,
+                    },
+                )
             if final_state != "succeeded":
                 dependents = list(
                     connection.execute(
@@ -1139,7 +1780,7 @@ class Scheduler:
             if uuid:
                 running_on_gpu = connection.execute(
                     "SELECT 1 FROM queue_items WHERE assigned_gpu_uuid = ? AND state IN "
-                    "('starting','running','terminating','force_killing') LIMIT 1",
+                    "('starting','running','yielding','terminating','force_killing') LIMIT 1",
                     (uuid,),
                 ).fetchone()
                 allow = connection.execute(
@@ -1164,7 +1805,7 @@ class Scheduler:
             items = list(
                 connection.execute(
                     "SELECT * FROM queue_items WHERE state IN "
-                    "('starting','running','terminating','force_killing')"
+                    "('starting','running','yielding','terminating','force_killing')"
                 )
             )
         for item in items:
@@ -1172,14 +1813,75 @@ class Scheduler:
             process = self.processes.get(item_id)
             if process is not None:
                 process.poll()
-            receipt_path = self._receipt_path(item_id)
+            receipt_path = self._receipt_path(item_id, int(item["segment"]))
+            if int(item["segment"]) == 1 and not receipt_path.exists():
+                legacy = self.store.state_dir / "attempts" / str(item_id) / "exit.json"
+                if legacy.exists():
+                    receipt_path = legacy
             if receipt_path.is_file():
-                receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+                try:
+                    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    continue
                 self.processes.pop(item_id, None)
                 self._finalize_item(item, receipt)
             elif not _pid_matches(item):
                 self.processes.pop(item_id, None)
                 self._finalize_item(item, None)
+
+    def _reconcile_yield_failures(self) -> None:
+        """Return a still-running job to normal state when checkpointing failed."""
+
+        with self.store.connect() as connection:
+            items = list(
+                connection.execute("SELECT * FROM queue_items WHERE state = 'yielding'")
+            )
+        for item in items:
+            receipt_path = _yield_receipt_path(
+                self.store,
+                int(item["id"]),
+                int(item["segment"]),
+            )
+            if not receipt_path.is_file() or not _pid_matches(item):
+                continue
+            try:
+                receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if receipt.get("status") != "failed":
+                continue
+            detail = (
+                f"cooperative yield failed at step {receipt.get('step')}: "
+                f"{receipt.get('error', 'unknown checkpoint error')}"
+            )
+            with self.store.connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                current = self.store.item(int(item["id"]), connection=connection)
+                if current["state"] != "yielding":
+                    continue
+                connection.execute(
+                    "UPDATE queue_items SET state = 'running', state_detail = ? WHERE id = ?",
+                    (detail, item["id"]),
+                )
+                reservation = connection.execute(
+                    "SELECT * FROM gpu_reservations WHERE queue_item_id = ? "
+                    "AND status = 'pending'",
+                    (item["id"],),
+                ).fetchone()
+                if reservation is not None:
+                    connection.execute(
+                        "UPDATE gpu_reservations SET status = 'failed', state_detail = ? WHERE id = ?",
+                        (detail, reservation["id"]),
+                    )
+                self.store._event(
+                    connection,
+                    "COOPERATIVE_YIELD_FAILED",
+                    queue_item_id=int(item["id"]),
+                    payload={
+                        "reservation_id": int(reservation["id"]) if reservation else None,
+                        "receipt": receipt,
+                    },
+                )
 
     def _escalate_terminations(self) -> None:
         now = time.time()
@@ -1241,7 +1943,7 @@ class Scheduler:
             candidates = list(
                 connection.execute(
                     "SELECT * FROM queue_items WHERE state = 'queued' "
-                    "ORDER BY priority DESC, id ASC"
+                    "ORDER BY resume_front DESC, priority DESC, id ASC"
                 )
             )
             for item in candidates:
@@ -1295,7 +1997,8 @@ class Scheduler:
             return False
 
         item_id = int(item["id"])
-        attempt_dir = self.store.state_dir / "attempts" / str(item_id)
+        segment = int(item["segment"])
+        attempt_dir = _segment_dir(self.store, item_id, segment)
         attempt_dir.mkdir(parents=True, exist_ok=True)
         launcher_log = (attempt_dir / "launcher.log").open("ab", buffering=0)
         executor_script = Path(__file__).resolve().parents[1] / "scripts" / "run_experiment_queue.py"
@@ -1318,7 +2021,7 @@ class Scheduler:
             cursor = connection.execute(
                 """
                 UPDATE queue_items SET state = 'starting', assigned_gpu_uuid = ?,
-                    assigned_gpu_index = ?, state_detail = NULL WHERE id = ?
+                    assigned_gpu_index = ?, state_detail = NULL, resume_front = 0 WHERE id = ?
                     AND state = 'queued'
                 """,
                 (gpu.uuid, gpu.index, item_id),
@@ -1336,6 +2039,7 @@ class Scheduler:
                     "gpu_name": gpu.name,
                     "free_memory_fraction": gpu.free_memory_fraction,
                     "utilization_percent": gpu.utilization_percent,
+                    "segment": segment,
                 },
             )
         try:
@@ -1426,7 +2130,7 @@ class Scheduler:
             running = list(
                 connection.execute(
                     "SELECT * FROM queue_items WHERE state IN "
-                    "('starting','running','terminating','force_killing') "
+                    "('starting','running','yielding','terminating','force_killing') "
                     "AND assigned_gpu_uuid IS NOT NULL"
                 )
             )
@@ -1480,11 +2184,13 @@ class Scheduler:
                 )
             )
             assigned = _running_gpu_uuids(connection)
+            reserved = _open_reserved_gpu_uuids(connection)
         available = [
             by_uuid[row["uuid"]]
             for row in allow
             if row["uuid"] in by_uuid
             and row["uuid"] not in assigned
+            and row["uuid"] not in reserved
             and self._idle(by_uuid[row["uuid"]])
         ]
         for gpu in available:
@@ -1502,7 +2208,7 @@ class Scheduler:
             running = list(
                 connection.execute(
                     "SELECT * FROM queue_items WHERE state IN "
-                    "('starting','running','terminating','force_killing')"
+                    "('starting','running','yielding','terminating','force_killing')"
                 )
             )
         if not running:
@@ -1565,7 +2271,9 @@ class Scheduler:
     def run_iteration(self, *, force_gpu_poll: bool = False) -> None:
         """Run one recovery/control cycle and optionally one GPU scheduling pass."""
 
+        expire_reservations(self.store)
         self._reconcile_processes()
+        self._reconcile_yield_failures()
         self._escalate_terminations()
         now = time.monotonic()
         if force_gpu_poll or now - self._last_gpu_poll >= self.poll_seconds:
@@ -1627,9 +2335,11 @@ def execute_item(store: QueueStore, item_id: int) -> int:
     """Internal durable executor that writes an exit receipt even if the scheduler stops."""
 
     item = store.item(item_id)
-    if item["state"] not in {"starting", "running", "terminating", "force_killing"}:
+    if item["state"] not in RUNNING_STATES:
         raise QueueError(f"queue item {item_id} is {item['state']}; executor requires a running state")
-    attempt_dir = store.state_dir / "attempts" / str(item_id)
+    segment = int(item["segment"])
+    attempt_dir = _segment_dir(store, item_id, segment)
+    attempt_dir.mkdir(parents=True, exist_ok=True)
     receipt_path = attempt_dir / "exit.json"
     signals_received: list[str] = []
     child: subprocess.Popen[bytes] | None = None
@@ -1642,15 +2352,50 @@ def execute_item(store: QueueStore, item_id: int) -> int:
             except ProcessLookupError:
                 pass
 
+    started_at = utc_now_iso()
+    child_environment = os.environ.copy()
+    child_environment["EXPERIMENT_QUEUE_SEGMENT"] = str(segment)
+    if item["preemptible"]:
+        child_environment["EXPERIMENT_QUEUE_YIELD_REQUEST_PATH"] = str(
+            _yield_request_path(store, item_id, segment)
+        )
+        child_environment["EXPERIMENT_QUEUE_YIELD_RECEIPT_PATH"] = str(
+            _yield_receipt_path(store, item_id, segment)
+        )
+    if segment > 1:
+        required = {
+            "runner directory": item["runner_run_dir"],
+            "continuation checkpoint": item["continuation_checkpoint"],
+            "checkpoint SHA-256": item["continuation_checkpoint_sha256"],
+        }
+        missing = [label for label, value in required.items() if not value]
+        if missing:
+            raise QueueError(
+                f"queue item {item_id} segment {segment} lacks " + ", ".join(missing)
+            )
+        checkpoint = Path(str(item["continuation_checkpoint"]))
+        if not checkpoint.is_file() or not hmac.compare_digest(
+            _sha256_file(checkpoint), str(item["continuation_checkpoint_sha256"])
+        ):
+            raise QueueError(
+                f"queue item {item_id} continuation checkpoint is missing or changed: {checkpoint}"
+            )
+        child_environment["EXPERIMENT_QUEUE_CONTINUATION_RUN_DIR"] = str(
+            item["runner_run_dir"]
+        )
+        child_environment["EXPERIMENT_QUEUE_CONTINUATION_CHECKPOINT"] = str(checkpoint)
+        if item["continuation_wandb_id"]:
+            child_environment["EXPERIMENT_QUEUE_WANDB_ID"] = str(
+                item["continuation_wandb_id"]
+            )
     previous_handlers: dict[int, Any] = {}
     for signum in (signal.SIGINT, signal.SIGTERM):
         previous_handlers[signum] = signal.signal(signum, forward)
-    started_at = utc_now_iso()
     try:
         child = subprocess.Popen(
             ["/bin/bash", "-lc", str(item["command_text"])],
             cwd=store.repo_root,
-            env=os.environ.copy(),
+            env=child_environment,
         )
         raw_return_code = child.wait()
         return_code = 128 + abs(raw_return_code) if raw_return_code < 0 else raw_return_code
@@ -1665,6 +2410,7 @@ def execute_item(store: QueueStore, item_id: int) -> int:
         "queue_item_id": item_id,
         "experiment_id": item["experiment_id"],
         "attempt": item["attempt"],
+        "segment": segment,
         "started_at": started_at,
         "finished_at": utc_now_iso(),
         "return_code": return_code,
@@ -1683,16 +2429,27 @@ def _format_gpu_status(store: QueueStore, snapshots: Sequence[GpuSnapshot] | Non
             str(row["assigned_gpu_uuid"]): row
             for row in connection.execute(
                 "SELECT id, experiment_id, assigned_gpu_uuid FROM queue_items WHERE state IN "
-                "('starting','running','terminating','force_killing')"
+                "('starting','running','yielding','terminating','force_killing')"
             )
             if row["assigned_gpu_uuid"]
+        }
+        reservations = {
+            str(row["gpu_uuid"]): row
+            for row in connection.execute(
+                "SELECT * FROM gpu_reservations WHERE status IN ('pending', 'active')"
+            )
         }
     lines = ["INDEX  UUID                  STATE           JOB       MEMORY-FREE  UTIL  COMPUTE-PIDS"]
     for row in rows:
         gpu = by_uuid.get(str(row["uuid"]))
         job = assigned.get(str(row["uuid"]))
+        reservation = reservations.get(str(row["uuid"]))
         if row["draining"]:
             state = "draining"
+        elif reservation and reservation["status"] == "active":
+            state = "reserved"
+        elif reservation:
+            state = "yield-pending"
         elif job:
             state = "scheduler-busy"
         elif gpu is None:
@@ -1741,6 +2498,7 @@ def format_status(store: QueueStore, *, as_json: bool = False) -> str:
         "pause_reason": store.get_meta("pause_reason"),
         "consecutive_failures": int(store.get_meta("consecutive_failures")),
         "items": item_payloads,
+        "reservations": [dict(row) for row in list_reservations(store)],
     }
     if as_json:
         return json.dumps(payload, indent=2, sort_keys=True)
@@ -1774,7 +2532,7 @@ def export_receipt(store: QueueStore, destination: Path | None = None) -> Path:
     target = destination or store.state_dir / "queue_receipt.json"
     with store.connect() as connection:
         payload = {
-            "schema_version": 1,
+            "schema_version": SCHEMA_VERSION,
             "generated_at": utc_now_iso(),
             "repo_root": str(store.repo_root),
             "metadata": {
@@ -1782,6 +2540,10 @@ def export_receipt(store: QueueStore, destination: Path | None = None) -> Path:
             },
             "gpu_allowlist": [
                 dict(row) for row in connection.execute("SELECT * FROM gpu_allowlist ORDER BY uuid")
+            ],
+            "gpu_reservations": [
+                dict(row)
+                for row in connection.execute("SELECT * FROM gpu_reservations ORDER BY id")
             ],
             "queue_items": [
                 dict(row) for row in connection.execute("SELECT * FROM queue_items ORDER BY id")
@@ -1856,6 +2618,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--new-attempt",
         action="store_true",
         help="Explicitly authorize another attempt after this experiment was previously launched.",
+    )
+    add.add_argument(
+        "--preemptible",
+        action="store_true",
+        help=(
+            "Allow the cooperative checkpoint-and-requeue yield workflow. Use only "
+            "for commands whose trainer supports experiment-queue yield receipts."
+        ),
     )
 
     for name, help_text in (
@@ -2003,6 +2773,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 dependency_ids=args.after,
                 held=args.hold,
                 new_attempt=args.new_attempt,
+                preemptible=args.preemptible,
             )
             item = store.item(item_id)
             print(f"added queue item {item_id}: {item['experiment_id']}/a{item['attempt']} ({item['state']})")

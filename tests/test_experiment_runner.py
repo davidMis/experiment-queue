@@ -189,6 +189,59 @@ class ExperimentRunnerTests(unittest.TestCase):
             manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
             self.assertFalse(manifest["command"]["pty"])
 
+    def test_yielded_runner_continues_in_same_directory_and_appends_segment(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            command = [
+                sys.executable,
+                "-c",
+                (
+                    "import os; "
+                    "print('segment=' + os.environ.get('EXPERIMENT_QUEUE_SEGMENT', '1')); "
+                    "raise SystemExit(0 if os.environ.get("
+                    "'EXPERIMENT_QUEUE_CONTINUATION_RUN_DIR') else 75)"
+                ),
+            ]
+            request = ExperimentRequest(
+                name="Yield Resume",
+                command=command,
+                output_root=root / "outputs",
+                cwd=root,
+                use_pty=False,
+            )
+            previous_receipt = os.environ.get("EXPERIMENT_QUEUE_YIELD_RECEIPT_PATH")
+            previous_run = os.environ.get("EXPERIMENT_QUEUE_CONTINUATION_RUN_DIR")
+            try:
+                os.environ["EXPERIMENT_QUEUE_YIELD_RECEIPT_PATH"] = str(
+                    root / "yield-receipt.json"
+                )
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(
+                    io.StringIO()
+                ):
+                    first = run_experiment(request)
+                self.assertEqual(first.return_code, 75)
+                os.environ["EXPERIMENT_QUEUE_CONTINUATION_RUN_DIR"] = str(first.run_dir)
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(
+                    io.StringIO()
+                ):
+                    second = run_experiment(request)
+            finally:
+                if previous_receipt is None:
+                    os.environ.pop("EXPERIMENT_QUEUE_YIELD_RECEIPT_PATH", None)
+                else:
+                    os.environ["EXPERIMENT_QUEUE_YIELD_RECEIPT_PATH"] = previous_receipt
+                if previous_run is None:
+                    os.environ.pop("EXPERIMENT_QUEUE_CONTINUATION_RUN_DIR", None)
+                else:
+                    os.environ["EXPERIMENT_QUEUE_CONTINUATION_RUN_DIR"] = previous_run
+
+            self.assertEqual(second.return_code, 0)
+            self.assertEqual(second.run_dir.resolve(), first.run_dir.resolve())
+            manifest = json.loads(second.manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(manifest["run"]["status"], "succeeded")
+            self.assertEqual([row["status"] for row in manifest["segments"]], ["yielded", "succeeded"])
+            self.assertIn("continuation started", (first.run_dir / "stdout.log").read_text())
+
     def test_cli_pty_defaults_can_be_disabled(self) -> None:
         parser = build_arg_parser()
 

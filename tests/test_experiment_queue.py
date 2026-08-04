@@ -5,17 +5,23 @@ from __future__ import annotations
 import json
 import os
 import shlex
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
+from datetime import datetime, timedelta
 from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+
+
+def time_to_datetime(value: str, *, seconds: int = 0):
+    return datetime.fromisoformat(value) + timedelta(seconds=seconds)
 
 from helmholtz_shared.experiment_queue import (  # noqa: E402
     GpuSnapshot,
@@ -25,10 +31,13 @@ from helmholtz_shared.experiment_queue import (  # noqa: E402
     add_experiment,
     format_pull_commands,
     format_status,
+    expire_reservations,
+    list_reservations,
     query_gpus,
     read_card_command,
     remove_item,
     request_termination,
+    request_gpu_reservation,
     set_priority,
     update_gpu_allowlist,
 )
@@ -60,10 +69,37 @@ class TemporaryQueueRepository:
             "parser.add_argument('--remote')\n"
             "parser.add_argument('--sleep', type=float, default=0.0)\n"
             "parser.add_argument('--exit-code', type=int, default=0)\n"
+            "parser.add_argument('--yield-aware', action='store_true')\n"
             "args = parser.parse_args()\n"
             "marker = Path(os.environ['QUEUE_TEST_MARKER'])\n"
             "marker.write_text(json.dumps({'gpu': os.environ.get('CUDA_VISIBLE_DEVICES')}))\n"
-            "time.sleep(args.sleep)\n"
+            "if args.yield_aware and os.environ.get('EXPERIMENT_QUEUE_CONTINUATION_CHECKPOINT'):\n"
+            "    print('run directory: ' + os.environ['EXPERIMENT_QUEUE_CONTINUATION_RUN_DIR'])\n"
+            "    print('manifest: ' + os.environ['EXPERIMENT_QUEUE_CONTINUATION_RUN_DIR'] + '/manifest.json')\n"
+            "    print('pull outputs with: rsync -av mutton2:fake-run local-output')\n"
+            "    raise SystemExit(0)\n"
+            "deadline = time.monotonic() + args.sleep\n"
+            "while time.monotonic() < deadline:\n"
+            "    request_value = os.environ.get('EXPERIMENT_QUEUE_YIELD_REQUEST_PATH')\n"
+            "    if args.yield_aware and request_value and Path(request_value).is_file():\n"
+            "        request = json.loads(Path(request_value).read_text())\n"
+            "        run_dir = Path.cwd() / 'outputs' / 'experiments' / 'fake-run'\n"
+            "        checkpoint_dir = run_dir / 'training' / 'checkpoints'\n"
+            "        checkpoint_dir.mkdir(parents=True, exist_ok=True)\n"
+            "        checkpoint = checkpoint_dir / 'preempt_step_00000005.msgpack'\n"
+            "        checkpoint.write_bytes(b'fake complete train state')\n"
+            "        metadata = checkpoint.with_suffix('.json')\n"
+            "        metadata.write_text(json.dumps({'step': 5}))\n"
+            "        import hashlib\n"
+            "        receipt = {'schema_version': 1, 'status': 'ready', 'request_id': request['request_id'], 'queue_item_id': request['queue_item_id'], 'step': 5, 'checkpoint': str(checkpoint), 'checkpoint_metadata': str(metadata), 'checkpoint_bytes': checkpoint.stat().st_size, 'checkpoint_sha256': hashlib.sha256(checkpoint.read_bytes()).hexdigest(), 'wandb': {'id': 'fake-wandb-id'}}\n"
+            "        receipt_path = Path(os.environ['EXPERIMENT_QUEUE_YIELD_RECEIPT_PATH'])\n"
+            "        receipt_path.parent.mkdir(parents=True, exist_ok=True)\n"
+            "        receipt_path.write_text(json.dumps(receipt))\n"
+            "        print('run directory: ' + str(run_dir))\n"
+            "        print('manifest: ' + str(run_dir / 'manifest.json'))\n"
+            "        print('pull outputs with: rsync -av mutton2:fake-run local-output')\n"
+            "        raise SystemExit(75)\n"
+            "    time.sleep(0.02)\n"
             "print('run directory: outputs/experiments/fake-run')\n"
             "print('manifest: outputs/experiments/fake-run/manifest.json')\n"
             "print('pull outputs with: rsync -av mutton2:fake-run local-output')\n"
@@ -75,6 +111,7 @@ class TemporaryQueueRepository:
         self.add_card("TST-003", sleep=30.0)
         self.add_card("TST-004", sleep=0.0, exit_code=4)
         self.add_card("TST-005", sleep=0.0, exit_code=5)
+        self.add_card("TST-007", sleep=30.0, yield_aware=True)
         self.add_real_runner_card()
         self._git("init", "-q")
         self._git("config", "user.email", "queue-test@example.invalid")
@@ -84,14 +121,22 @@ class TemporaryQueueRepository:
         self.state_dir = self.root / "outputs" / "experiment_queue"
         self.store = QueueStore(self.state_dir, self.root)
 
-    def add_card(self, experiment_id: str, *, sleep: float, exit_code: int = 0) -> None:
+    def add_card(
+        self,
+        experiment_id: str,
+        *,
+        sleep: float,
+        exit_code: int = 0,
+        yield_aware: bool = False,
+    ) -> None:
         card = self.root / "docs" / "experiments" / f"{experiment_id}.md"
         card.write_text(
             f"# {experiment_id}: Queue Test\n\n"
             "## Exact Manual Command On Mutton2\n\n"
             "```bash\n"
             f"python3 scripts/run_experiment.py --name {experiment_id.lower()} "
-            f"--require-clean --remote mutton2 --sleep {sleep} --exit-code {exit_code}\n"
+            f"--require-clean --remote mutton2 --sleep {sleep} --exit-code {exit_code} "
+            f"{'--yield-aware' if yield_aware else ''}\n"
             "```\n\n"
             "## Expected Artifacts\n\nTest-only marker.\n",
             encoding="utf-8",
@@ -182,6 +227,54 @@ class ExperimentQueueTests(unittest.TestCase):
         self.assertEqual(card.experiment_id, "TST-001")
         self.assertIn("scripts/run_experiment.py", card.command_text)
         self.assertEqual(self.repo.store.list_items(), [])
+
+    def test_v1_database_migrates_in_place_for_reservations_and_segments(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            state_dir = root / "state"
+            state_dir.mkdir()
+            database = state_dir / "queue.sqlite3"
+            with sqlite3.connect(database) as connection:
+                connection.executescript(
+                    """
+                    CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                    CREATE TABLE queue_items (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        experiment_id TEXT NOT NULL,
+                        attempt INTEGER NOT NULL,
+                        state TEXT NOT NULL,
+                        priority INTEGER NOT NULL DEFAULT 0,
+                        UNIQUE(experiment_id, attempt)
+                    );
+                    """
+                )
+                connection.executemany(
+                    "INSERT INTO metadata(key, value) VALUES (?, ?)",
+                    [
+                        ("schema_version", "1"),
+                        ("repo_root", str(root)),
+                        ("dispatch_paused", "0"),
+                        ("pause_reason", ""),
+                        ("consecutive_failures", "0"),
+                    ],
+                )
+
+            migrated = QueueStore(state_dir, root)
+
+            self.assertEqual(migrated.get_meta("schema_version"), "2")
+            with migrated.connect() as connection:
+                columns = {
+                    row["name"] for row in connection.execute("PRAGMA table_info(queue_items)")
+                }
+                tables = {
+                    row["name"]
+                    for row in connection.execute(
+                        "SELECT name FROM sqlite_schema WHERE type = 'table'"
+                    )
+                }
+            self.assertIn("preemptible", columns)
+            self.assertIn("segment", columns)
+            self.assertIn("gpu_reservations", tables)
 
     def test_current_queue_candidate_cards_have_exact_runner_commands(self) -> None:
         for experiment_id in (
@@ -313,7 +406,16 @@ class ExperimentQueueTests(unittest.TestCase):
         self.assertIn("mutton2:fake-run", item["rsync_pull_command"])
         self.assertIn("queue item 1", format_pull_commands(self.repo.store))
         self.assertEqual(json.loads(self.marker.read_text())["gpu"], gpu.uuid)
-        self.assertTrue((self.repo.state_dir / "attempts" / str(item_id) / "exit.json").is_file())
+        self.assertTrue(
+            (
+                self.repo.state_dir
+                / "attempts"
+                / str(item_id)
+                / "segments"
+                / "1"
+                / "exit.json"
+            ).is_file()
+        )
 
     def test_scheduler_invokes_existing_experiment_runner_end_to_end(self) -> None:
         gpu = self.gpu()
@@ -460,6 +562,96 @@ class ExperimentQueueTests(unittest.TestCase):
         self.assertEqual(self.repo.store.item(second)["state"], "failed")
         self.assertEqual(self.repo.store.get_meta("dispatch_paused"), "1")
         self.assertIn("circuit breaker", self.repo.store.get_meta("pause_reason"))
+
+    def test_idle_gpu_reservation_expires_without_changing_allowlist(self) -> None:
+        gpu = self.gpu()
+        update_gpu_allowlist(self.repo.store, "set", ["0"], snapshots=[gpu])
+        reservation_id = request_gpu_reservation(
+            self.repo.store,
+            gpu.uuid,
+            duration_hours=1,
+            note="Alex — short benchmark",
+            actor="web:reservation",
+            snapshots=[gpu],
+        )
+        reservation = list_reservations(self.repo.store)[0]
+        self.assertEqual(reservation["id"], reservation_id)
+        self.assertEqual(reservation["status"], "active")
+
+        expire_reservations(
+            self.repo.store,
+            now=time_to_datetime(reservation["expires_at"], seconds=1),
+        )
+
+        self.assertEqual(list_reservations(self.repo.store)[0]["status"], "expired")
+        with self.repo.store.connect() as connection:
+            allowed = connection.execute(
+                "SELECT enabled FROM gpu_allowlist WHERE uuid = ?", (gpu.uuid,)
+            ).fetchone()
+        self.assertEqual(allowed["enabled"], 1)
+
+    @unittest.skipIf(os.name != "posix", "cooperative subprocess yield is POSIX-specific")
+    def test_yield_checkpoints_reserves_old_gpu_and_resumes_at_queue_front(self) -> None:
+        gpu0 = self.gpu("0", "GPU-test-0000")
+        gpu1 = self.gpu("1", "GPU-test-1111")
+        update_gpu_allowlist(
+            self.repo.store,
+            "set",
+            ["0", "1"],
+            snapshots=[gpu0, gpu1],
+        )
+        item_id = add_experiment(
+            self.repo.store,
+            "TST-007",
+            preemptible=True,
+        )
+        scheduler = Scheduler(
+            self.repo.store,
+            poll_seconds=100,
+            min_free_disk_gib=0,
+            gpu_provider=lambda: [gpu0, gpu1],
+        )
+        scheduler.run_iteration(force_gpu_poll=True)
+        self.assertEqual(self.repo.store.item(item_id)["state"], "running")
+        reservation_id = request_gpu_reservation(
+            self.repo.store,
+            gpu0.uuid,
+            duration_hours=24,
+            note="Morgan — model sweep",
+            actor="web:reservation",
+            snapshots=[gpu0, gpu1],
+        )
+
+        deadline = time.monotonic() + 15
+        observed_requeue = False
+        while time.monotonic() < deadline:
+            scheduler.run_iteration(force_gpu_poll=False)
+            item = self.repo.store.item(item_id)
+            if item["state"] == "queued" and item["segment"] == 2:
+                observed_requeue = True
+                break
+            time.sleep(0.03)
+        self.assertTrue(observed_requeue)
+        reservation = next(
+            row for row in list_reservations(self.repo.store) if row["id"] == reservation_id
+        )
+        self.assertEqual(reservation["status"], "active")
+        self.assertIsNotNone(reservation["starts_at"])
+        item = self.repo.store.item(item_id)
+        self.assertEqual(item["continuation_step"], 5)
+        self.assertEqual(item["continuation_wandb_id"], "fake-wandb-id")
+        self.assertEqual(item["resume_front"], 1)
+
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            scheduler.run_iteration(force_gpu_poll=True)
+            if self.repo.store.item(item_id)["state"] == "succeeded":
+                break
+            time.sleep(0.03)
+        item = self.repo.store.item(item_id)
+        self.assertEqual(item["state"], "succeeded")
+        self.assertEqual(item["segment"], 2)
+        self.assertEqual(item["assigned_gpu_uuid"], gpu1.uuid)
 
     def test_query_gpus_parses_inventory_and_processes(self) -> None:
         executable = self.repo.root / "fake-nvidia-smi"
