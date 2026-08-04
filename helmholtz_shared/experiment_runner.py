@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import codecs
+import contextlib
 import json
 import os
 import platform
@@ -14,6 +15,7 @@ import re
 import select
 import shlex
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -280,19 +282,23 @@ def run_experiment(request: ExperimentRequest) -> ExperimentResult:
 
     started = time.monotonic()
     try:
-        return_code = launch_and_stream(
-            request.command,
-            cwd,
-            run_dir,
-            run_id,
-            use_pty=request.use_pty,
-        )
+        with _translate_termination_signals_to_interrupt():
+            return_code = launch_and_stream(
+                request.command,
+                cwd,
+                run_dir,
+                run_id,
+                use_pty=request.use_pty,
+            )
         if return_code == 0:
             status = "succeeded"
         elif return_code == 130:
             status = "interrupted"
         else:
             status = "failed"
+    except KeyboardInterrupt:
+        return_code = 130
+        status = "interrupted"
     except OSError as exc:
         return_code = 127
         status = "launch_failed"
@@ -318,6 +324,40 @@ def run_experiment(request: ExperimentRequest) -> ExperimentResult:
         return_code=return_code,
         rsync_pull_command=rsync_pull_command,
     )
+
+
+@contextlib.contextmanager
+def _translate_termination_signals_to_interrupt() -> Iterable[None]:
+    """Let queue-requested SIGTERM follow the runner's clean interrupt path.
+
+    Signal handlers can only be installed by the main thread. Direct library
+    callers in worker threads retain the platform defaults, while normal CLI
+    execution converts SIGTERM into the same child cleanup and manifest update
+    already used for Ctrl-C.
+    """
+
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+
+    previous: dict[int, Any] = {}
+    interruption_started = False
+
+    def interrupt(_signum: int, _frame: Any) -> None:
+        nonlocal interruption_started
+        if interruption_started:
+            return
+        interruption_started = True
+        raise KeyboardInterrupt
+
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        previous[signum] = signal.getsignal(signum)
+        signal.signal(signum, interrupt)
+    try:
+        yield
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
 
 
 def build_manifest(

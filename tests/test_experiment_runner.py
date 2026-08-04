@@ -8,8 +8,11 @@ import contextlib
 import io
 import json
 import os
+import signal
+import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -196,6 +199,53 @@ class ExperimentRunnerTests(unittest.TestCase):
             ["--no-pty", "--", sys.executable, "-c", "print('x')"]
         )
         self.assertFalse(no_pty_args.use_pty)
+
+    @unittest.skipIf(os.name != "posix", "signal handling is POSIX-specific")
+    def test_sigterm_records_interrupted_manifest(self) -> None:
+        for mode in ("--no-pty", "--pty"):
+            for signum in (signal.SIGINT, signal.SIGTERM):
+                with self.subTest(mode=mode, signal=signum), tempfile.TemporaryDirectory() as temp_dir:
+                    self._assert_signal_records_interrupted(mode, signum, Path(temp_dir))
+
+    def _assert_signal_records_interrupted(
+        self, mode: str, signum: int, root: Path
+    ) -> None:
+        output_root = root / "outputs"
+        runner = REPO_ROOT / "scripts" / "run_experiment.py"
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                str(runner),
+                "--output-root",
+                str(output_root),
+                mode,
+                "--",
+                sys.executable,
+                "-c",
+                "import time; time.sleep(60)",
+            ],
+            cwd=root,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            manifests = list(output_root.glob("*/manifest.json"))
+            if manifests:
+                break
+            time.sleep(0.05)
+        else:
+            process.kill()
+            self.fail("runner did not create a manifest before signal timeout")
+
+        process.send_signal(signum)
+        stdout, stderr = process.communicate(timeout=15)
+
+        self.assertEqual(process.returncode, 130, (stdout, stderr))
+        manifest = json.loads(manifests[0].read_text(encoding="utf-8"))
+        self.assertEqual(manifest["run"]["status"], "interrupted")
+        self.assertEqual(manifest["run"]["return_code"], 130)
 
 
 if __name__ == "__main__":

@@ -56,6 +56,12 @@ before launch, so new commands and templates must not set
 `CUDA_VISIBLE_DEVICES` or use an equivalent device-selection option. The
 actual device remains a required receipt field.
 
+For explicitly queued work, David may instead manage the mutable runtime GPU
+allowlist through `scripts/run_experiment_queue.py gpus`. This is operator
+state, not part of any run card. The queue sets child visibility after David's
+selection, and every card remains device-neutral. See `experiment_queue.md`
+for admission, polling, draining, termination, recovery, and receipt rules.
+
 Unless David explicitly specifies another target, GPU-accelerated runs use
 the NVIDIA RTX PRO 6000 Blackwell Server Edition accelerator class. This
 default hardware identity is an experiment assumption, not a device selector;
@@ -119,6 +125,16 @@ its provenance is verified and its scientific decision is recorded. Later
 compaction follows `artifact_retention.md` and the exact registry/receipt
 workflow there. Active, ambiguous, or dependency-held runs remain protected,
 and root `data/` is never part of experiment-output cleanup.
+
+## Optional Explicit Queue
+
+`scripts/run_experiment_queue.py` can wait for operator-selected GPUs on the
+shared unmanaged host and launch exact card commands through the normal
+runner. Queue admission is never inferred: David explicitly adds every
+experiment ID, and a ready card or `prepared_locally` ledger state does not
+create queue membership. The ignored `gpu_scheduler_state/` directory owns the
+live SQLite journal and receipts. `STATUS.md` remains the scientific ledger
+and is updated only from David's reports and synchronized artifacts.
 
 ## Archived Phase Runbooks
 
