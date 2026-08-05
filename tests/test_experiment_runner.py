@@ -18,8 +18,6 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
 
 from helmholtz_shared.experiment_runner import (  # noqa: E402
     DEFAULT_USE_PTY,
