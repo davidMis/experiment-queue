@@ -167,11 +167,14 @@ def test_live_sections_change_with_durable_queue_revision_and_enforce_role(
     sections = app.live_sections("admin", admin_session)
     assert set(sections) == {"dispatch", "gpus", "queue", "reservations", "events"}
     assert "Dispatch active" in sections["dispatch"]
+    assert 'data-dispatch-paused="false"' in sections["dispatch"]
     app.admin_action(
         "/admin/dispatch", {"operation": ["pause"], "reason": ["live test"]}
     )
     assert app.live_revision() > before
-    assert "Dispatch paused" in app.live_sections("admin", admin_session)["dispatch"]
+    paused_dispatch = app.live_sections("admin", admin_session)["dispatch"]
+    assert "Dispatch paused" in paused_dispatch
+    assert 'data-dispatch-paused="true"' in paused_dispatch
     with pytest.raises(QueueError, match="cannot subscribe"):
         app.live_sections("admin", reservation_session)
 
@@ -181,11 +184,11 @@ def test_admin_run_page_shows_logs_and_copyable_rsync_command(tmp_path: Path) ->
     run_dir = repo_root / "outputs" / "experiments" / "test-run"
     run_dir.mkdir(parents=True)
     (run_dir / "stdout.log").write_text(
-        "progress\rfinished\n<script>unsafe</script>\n",
+        "progress\r\x1b[32mfinished\x1b[0m\n<script>unsafe</script>\n",
         encoding="utf-8",
     )
     (run_dir / "stderr.log").write_text(
-        "\x1b[31msynthetic warning\x1b[0m\n",
+        "stderr should stay hidden\n",
         encoding="utf-8",
     )
     state_dir = repo_root / "gpu_scheduler_state"
@@ -212,18 +215,36 @@ def test_admin_run_page_shows_logs_and_copyable_rsync_command(tmp_path: Path) ->
 
     admin_page = app.render_admin(admin_session, {}).decode("utf-8")
     assert 'href="/admin/runs/1"' in admin_page
+    assert 'id="queue-search"' in admin_page
+    assert 'id="queue-state-filter"' in admin_page
+    assert 'id="queue-gpu-filter"' in admin_page
+    assert 'id="queue-sort"' in admin_page
+    assert 'id="queue-reset"' in admin_page
+    assert 'data-queue-row' in admin_page
+    assert 'data-state="succeeded"' in admin_page
+    assert 'data-state-group="terminal"' in admin_page
+    assert "scheduler priority and dispatch order are unchanged" in admin_page
+    assert "body[data-dispatch-paused=true]" in admin_page
+    assert "--paused-bg:#200b0b" in admin_page
+    assert "--paused-bg:#fff0ef" in admin_page
     page = app.render_run(admin_session, 1).decode("utf-8")
     assert 'data-live-view="run-1"' in page
     assert "finished" in page
     assert "&lt;script&gt;unsafe&lt;/script&gt;" in page
-    assert "synthetic warning" in page
-    assert "\x1b[31m" not in page
+    assert "stderr should stay hidden" not in page
+    assert ">Stderr<" not in page
+    assert page.count('class="panel log-card"') == 1
+    assert "\x1b[32m" not in page
     assert "Copy rsync command to clipboard" in page
     assert "data-copy-target=\"rsync-command\"" in page
     assert "&amp; data" in page
     assert "EXPERIMENT_TEST_EVENT" in page
     assert "navigator.clipboard" in CLIENT_SCRIPT
     assert "/events/admin/runs/" in CLIENT_SCRIPT
+    assert "applyQueueView({ refreshGpus: true })" in CLIENT_SCRIPT
+    assert 'name === "queue"' in CLIENT_SCRIPT
+    assert "syncDispatchAppearance" in CLIENT_SCRIPT
+    assert 'name === "dispatch"' in CLIENT_SCRIPT
     assert set(app.live_sections("run-1", admin_session)) == {"run"}
     with pytest.raises(QueueError, match="cannot subscribe"):
         app.live_sections("run-1", reservation_session)
@@ -251,10 +272,12 @@ def test_running_run_page_falls_back_to_combined_launcher_output(tmp_path: Path)
     page = app.render_run(admin_session, 2).decode("utf-8")
     assert "live startup output" in page
     assert "Combined queue launcher output" in page
-    assert "The runner has not published its run directory yet." in page
     assert "The runner has not recorded an rsync command yet." in page
     assert "Copy rsync command to clipboard" in page
     assert "disabled" in page
+    assert 'data-state-group="active"' in app.live_sections(
+        "admin", admin_session
+    )["queue"]
 
 
 def test_authenticated_run_detail_route_renders_the_requested_item(tmp_path: Path) -> None:
@@ -293,7 +316,6 @@ def test_run_page_does_not_read_logs_outside_the_queue_repository(tmp_path: Path
     outside = tmp_path / "outside-run"
     outside.mkdir()
     (outside / "stdout.log").write_text("host secret\n", encoding="utf-8")
-    (outside / "stderr.log").write_text("another secret\n", encoding="utf-8")
     state_dir = repo_root / "gpu_scheduler_state"
     store = QueueStore(state_dir, repo_root)
     _insert_run(store, item_id=4, state="failed", run_dir=outside)
@@ -311,7 +333,6 @@ def test_run_page_does_not_read_logs_outside_the_queue_repository(tmp_path: Path
 
     assert "outside this repository" in page
     assert "host secret" not in page
-    assert "another secret" not in page
 
 
 def test_authenticated_event_stream_pushes_status_without_page_reload(

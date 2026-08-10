@@ -29,6 +29,7 @@ from helmholtz_shared.experiment_queue import (
     MIN_RESERVATION_HOURS,
     PENDING_STATES,
     RUNNING_STATES,
+    TERMINAL_STATES,
     GpuSnapshot,
     QueueError,
     QueueStore,
@@ -329,10 +330,11 @@ def _read_log_tail(path: Path, *, source: str, note: str) -> LogSnapshot:
 
 
 STYLE = """
-:root{color-scheme:dark;--bg:#101311;--glow:#1d2a22;--panel:#171c19;--panel2:#1d2420;--field:#0e120f;--line:#334039;--text:#f2f5f0;--muted:#aab5ae;--green:#9ee37d;--amber:#f0c36a;--red:#ff8c82;--blue:#8dc7ff;--button:#263d2d;--button-hover:#31503a;--secondary:#202824;--danger:#4b2525;--danger-line:#83403b;--pill:#253029;--ok-bg:#17301d;--ok-line:#315c3b;--error-text:#ffd1cd;--error-bg:#3a2020;--error-line:#78403d;--shadow:#0004}
-:root[data-theme=light]{color-scheme:light;--bg:#f4f7f2;--glow:#dfeee2;--panel:#fff;--panel2:#f7faf6;--field:#fff;--line:#c8d4ca;--text:#172019;--muted:#5d6b61;--green:#347a2e;--amber:#9a6414;--red:#b23932;--blue:#1769aa;--button:#dcecdf;--button-hover:#cce3d1;--secondary:#edf2ed;--danger:#f7dddd;--danger-line:#d8a09c;--pill:#e7eee8;--ok-bg:#e3f3e4;--ok-line:#a8cea9;--error-text:#7d211d;--error-bg:#f9e1df;--error-line:#d9a4a0;--shadow:#253a2b1c}
-*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at top left,var(--glow) 0,var(--bg) 42%);color:var(--text);font:15px/1.45 ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;min-height:100vh;transition:background-color .18s,color .18s}
+:root{color-scheme:dark;--bg:#101311;--glow:#1d2a22;--paused-bg:#200b0b;--paused-glow:#7d2823;--panel:#171c19;--panel2:#1d2420;--field:#0e120f;--line:#334039;--text:#f2f5f0;--muted:#aab5ae;--green:#9ee37d;--amber:#f0c36a;--red:#ff8c82;--blue:#8dc7ff;--button:#263d2d;--button-hover:#31503a;--secondary:#202824;--danger:#4b2525;--danger-line:#83403b;--pill:#253029;--ok-bg:#17301d;--ok-line:#315c3b;--error-text:#ffd1cd;--error-bg:#3a2020;--error-line:#78403d;--shadow:#0004}
+:root[data-theme=light]{color-scheme:light;--bg:#f4f7f2;--glow:#dfeee2;--paused-bg:#fff0ef;--paused-glow:#f5afa9;--panel:#fff;--panel2:#f7faf6;--field:#fff;--line:#c8d4ca;--text:#172019;--muted:#5d6b61;--green:#347a2e;--amber:#9a6414;--red:#b23932;--blue:#1769aa;--button:#dcecdf;--button-hover:#cce3d1;--secondary:#edf2ed;--danger:#f7dddd;--danger-line:#d8a09c;--pill:#e7eee8;--ok-bg:#e3f3e4;--ok-line:#a8cea9;--error-text:#7d211d;--error-bg:#f9e1df;--error-line:#d9a4a0;--shadow:#253a2b1c}
+*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at top left,var(--glow) 0,var(--bg) 42%);color:var(--text);font:15px/1.45 ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;min-height:100vh;transition:background .22s,color .18s}body[data-dispatch-paused=true]{background:radial-gradient(circle at top left,var(--paused-glow) 0,var(--paused-bg) 48%)}
 a{color:var(--blue)}.shell{max-width:1180px;margin:0 auto;padding:28px 20px 64px}.top{display:flex;align-items:flex-start;justify-content:space-between;gap:24px;margin-bottom:24px}.eyebrow{text-transform:uppercase;letter-spacing:.14em;color:var(--green);font-size:12px;font-weight:700}.title{font-size:clamp(28px,5vw,48px);line-height:1.02;margin:8px 0}.subtitle{color:var(--muted);max-width:680px}.nav{display:flex;align-items:flex-start;gap:10px;flex-wrap:wrap}.nav form{margin:0}.panel,.gpu,.login{background:linear-gradient(145deg,var(--panel),var(--panel2));border:1px solid var(--line);border-radius:16px;box-shadow:0 18px 50px var(--shadow)}.panel{padding:20px;margin:18px 0}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(270px,1fr));gap:14px}.gpu{padding:18px;position:relative;overflow:hidden}.gpu:before{content:"";position:absolute;left:0;top:0;bottom:0;width:4px;background:var(--line)}.gpu.available:before{background:var(--green)}.gpu.busy:before{background:var(--amber)}.gpu.reserved:before{background:var(--blue)}.gpu.danger:before{background:var(--red)}.gpu h3{margin:0 0 4px;font-size:20px}.meta{color:var(--muted);font-size:13px}.status{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--line);border-radius:999px;padding:4px 9px;margin:10px 0;font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.06em}.dot{width:7px;height:7px;border-radius:50%;background:currentColor}.available .status{color:var(--green)}.busy .status{color:var(--amber)}.reserved .status{color:var(--blue)}.danger .status{color:var(--red)}form{margin:12px 0 0}.row{display:flex;gap:10px;flex-wrap:wrap;align-items:end}.field{display:flex;flex-direction:column;gap:5px;min-width:120px;flex:1}.field label{font-size:12px;color:var(--muted);font-weight:700}input,select,button,textarea{font:inherit}input,select,textarea{width:100%;color:var(--text);background:var(--field);border:1px solid var(--line);border-radius:9px;padding:9px 10px}textarea{min-height:72px;resize:vertical}button,.button{border:1px solid var(--line);background:var(--button);color:var(--text);border-radius:9px;padding:9px 13px;font-weight:750;cursor:pointer;text-decoration:none;display:inline-block}button:hover,.button:hover{background:var(--button-hover)}button.secondary,.button.secondary{background:var(--secondary);border-color:var(--line)}button.danger{background:var(--danger);border-color:var(--danger-line)}button:disabled{opacity:.5;cursor:not-allowed}.flash{padding:12px 14px;border-radius:10px;margin:14px 0;border:1px solid}.flash.ok{color:var(--green);background:var(--ok-bg);border-color:var(--ok-line)}.flash.error{color:var(--error-text);background:var(--error-bg);border-color:var(--error-line)}table{width:100%;border-collapse:collapse;font-size:13px}th,td{text-align:left;padding:10px 8px;border-bottom:1px solid var(--line);vertical-align:top}th{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.08em}.actions{display:flex;gap:6px;flex-wrap:wrap}.actions form{margin:0}.actions button{padding:6px 9px;font-size:12px}.pill{display:inline-block;padding:3px 7px;border-radius:999px;background:var(--pill);color:var(--muted);font-size:11px}.login{max-width:440px;margin:12vh auto 0;padding:28px}.login h1{margin-top:0}.split{display:grid;grid-template-columns:1fr 1fr;gap:18px}.muted{color:var(--muted)}.tiny{font-size:12px}.event{display:grid;grid-template-columns:150px 210px 1fr;gap:10px;padding:8px 0;border-bottom:1px solid var(--line);font-size:12px}.theme-corner{position:fixed;right:18px;top:18px;z-index:2}.live-indicator{display:inline-flex;align-items:center;gap:7px;color:var(--amber);border:1px solid var(--line);border-radius:999px;padding:8px 11px;font-size:12px;font-weight:700;background:var(--panel)}.live-indicator.connected{color:var(--green)}.live-indicator.disconnected{color:var(--red)}.live-indicator .dot{box-shadow:0 0 0 3px color-mix(in srgb,currentColor 18%,transparent)}[data-live-section]{scroll-margin-top:16px}.facts{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:14px;margin:0}.facts div{min-width:0}.facts dt{color:var(--muted);font-size:11px;font-weight:750;letter-spacing:.08em;text-transform:uppercase}.facts dd{margin:4px 0 0;overflow-wrap:anywhere}.log-grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}.log-card{min-width:0}.log-card h3{margin:0}.log-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:10px}.log{height:420px;margin:0;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;background:var(--field);border:1px solid var(--line);border-radius:10px;padding:14px;color:var(--text);font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;tab-size:4}.command{margin:10px 0;white-space:pre-wrap;overflow-wrap:anywhere;background:var(--field);border:1px solid var(--line);border-radius:10px;padding:12px;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace}.copy-status{display:inline-block;min-height:1.4em;margin-left:8px;color:var(--green);font-size:12px}.run-link{font-weight:750;text-decoration:none}.run-link:hover{text-decoration:underline}@media(max-width:760px){.top{display:block}.nav{margin-top:18px}.split,.log-grid{grid-template-columns:1fr}table{display:block;overflow-x:auto}.event{grid-template-columns:1fr}.shell{padding:20px 14px 50px}.theme-corner{position:static;margin:14px}.log{height:320px}}
+.queue-heading{display:flex;align-items:baseline;justify-content:space-between;gap:14px;flex-wrap:wrap}.queue-heading h2{margin:0}.queue-toolbar{display:grid;grid-template-columns:minmax(210px,2fr) repeat(3,minmax(140px,1fr)) auto;gap:10px;align-items:end;margin:16px 0}.queue-toolbar .field{min-width:0}.queue-summary{color:var(--muted);font-size:13px;font-weight:700}.queue-table-wrap{overflow-x:auto}.queue-empty{margin:18px 0 4px;text-align:center}[hidden]{display:none!important}@media(max-width:900px){.queue-toolbar{grid-template-columns:repeat(2,minmax(0,1fr))}.queue-toolbar .search-field{grid-column:1/-1}}@media(max-width:560px){.queue-toolbar{grid-template-columns:1fr}.queue-toolbar .search-field{grid-column:auto}.queue-toolbar button{width:100%}}
 """
 
 
@@ -405,6 +407,107 @@ CLIENT_SCRIPT = r"""
     }, 2200);
   });
 
+  const queueCollator = new Intl.Collator(undefined, {
+    numeric: true,
+    sensitivity: "base",
+  });
+  const rebuildQueueGpuOptions = (rows) => {
+    const select = document.getElementById("queue-gpu-filter");
+    if (!select) return;
+    const selected = select.value;
+    while (select.options.length > 2) select.remove(2);
+    const gpuIndices = [...new Set(rows.map((row) => row.dataset.gpu).filter(Boolean))]
+      .sort((left, right) => queueCollator.compare(left, right));
+    for (const gpu of gpuIndices) {
+      const option = document.createElement("option");
+      option.value = gpu;
+      option.textContent = `GPU ${gpu}`;
+      select.appendChild(option);
+    }
+    select.value = [...select.options].some((option) => option.value === selected)
+      ? selected
+      : "all";
+  };
+  const applyQueueView = ({ refreshGpus = false } = {}) => {
+    const body = document.querySelector("[data-queue-body]");
+    if (!body) return;
+    const rows = [...body.querySelectorAll("[data-queue-row]")];
+    if (refreshGpus) rebuildQueueGpuOptions(rows);
+    const search = document.getElementById("queue-search")?.value || "";
+    const terms = search.toLocaleLowerCase().trim().split(/\s+/).filter(Boolean);
+    const state = document.getElementById("queue-state-filter")?.value || "all";
+    const gpu = document.getElementById("queue-gpu-filter")?.value || "all";
+    const sort = document.getElementById("queue-sort")?.value || "queue";
+    for (const row of rows) {
+      const matchesSearch = terms.every((term) =>
+        (row.dataset.search || "").toLocaleLowerCase().includes(term)
+      );
+      const matchesState = state === "all"
+        || row.dataset.state === state
+        || row.dataset.stateGroup === state;
+      const matchesGpu = gpu === "all"
+        || (gpu === "unassigned" ? !row.dataset.gpu : row.dataset.gpu === gpu);
+      row.hidden = !(matchesSearch && matchesState && matchesGpu);
+    }
+    const number = (row, key) => Number(row.dataset[key] || 0);
+    const text = (row, key) => row.dataset[key] || "";
+    const byNewest = (left, right) => number(right, "id") - number(left, "id");
+    rows.sort((left, right) => {
+      let compared = 0;
+      if (sort === "id-desc") compared = byNewest(left, right);
+      else if (sort === "id-asc") compared = number(left, "id") - number(right, "id");
+      else if (sort === "experiment") {
+        compared = queueCollator.compare(text(left, "experiment"), text(right, "experiment"));
+      } else if (sort === "state") {
+        compared = queueCollator.compare(text(left, "state"), text(right, "state"));
+      } else if (sort === "priority-desc") {
+        compared = number(right, "priority") - number(left, "priority");
+      } else if (sort === "priority-asc") {
+        compared = number(left, "priority") - number(right, "priority");
+      } else if (sort === "gpu") {
+        compared = queueCollator.compare(text(left, "gpu") || "zzzz", text(right, "gpu") || "zzzz");
+      } else {
+        compared = number(left, "queueOrder") - number(right, "queueOrder");
+      }
+      return compared || byNewest(left, right);
+    });
+    for (const row of rows) body.appendChild(row);
+    const visible = rows.filter((row) => !row.hidden).length;
+    const summary = document.getElementById("queue-summary");
+    if (summary) {
+      summary.textContent = `Showing ${visible} of ${rows.length} queue item${rows.length === 1 ? "" : "s"}`;
+    }
+    const empty = document.getElementById("queue-empty");
+    if (empty) {
+      empty.textContent = rows.length
+        ? "No queue items match these filters."
+        : "No queue items have been added.";
+      empty.hidden = visible > 0;
+    }
+  };
+  document.getElementById("queue-search")?.addEventListener("input", () => applyQueueView());
+  for (const id of ["queue-state-filter", "queue-gpu-filter", "queue-sort"]) {
+    document.getElementById(id)?.addEventListener("change", () => applyQueueView());
+  }
+  document.getElementById("queue-reset")?.addEventListener("click", () => {
+    const search = document.getElementById("queue-search");
+    const state = document.getElementById("queue-state-filter");
+    const gpu = document.getElementById("queue-gpu-filter");
+    const sort = document.getElementById("queue-sort");
+    if (search) search.value = "";
+    if (state) state.value = "all";
+    if (gpu) gpu.value = "all";
+    if (sort) sort.value = "queue";
+    applyQueueView();
+    search?.focus();
+  });
+  applyQueueView({ refreshGpus: true });
+  const syncDispatchAppearance = () => {
+    const dispatch = document.querySelector("[data-dispatch-paused]");
+    if (dispatch) document.body.dataset.dispatchPaused = dispatch.dataset.dispatchPaused;
+  };
+  syncDispatchAppearance();
+
   const view = document.body.dataset.liveView;
   if (!view || !window.EventSource) return;
   const indicator = document.getElementById("live-connection");
@@ -424,6 +527,8 @@ CLIENT_SCRIPT = r"""
     }
     section.innerHTML = markup;
     pending.delete(name);
+    if (name === "queue") applyQueueView({ refreshGpus: true });
+    if (name === "dispatch") syncDispatchAppearance();
   };
   document.addEventListener("focusout", () => setTimeout(() => {
     for (const [name, markup] of pending) applySection(name, markup);
@@ -520,7 +625,7 @@ class SchedulerWebApp:
     ) -> tuple[Path | None, str | None]:
         """Resolve a fixed runner log name without exposing arbitrary host files."""
 
-        if filename not in {"stdout.log", "stderr.log"}:
+        if filename != "stdout.log":
             raise QueueError(f"unsupported runner log {filename!r}")
         run_directory = str(item.get("runner_run_dir") or "").strip()
         if not run_directory:
@@ -570,7 +675,7 @@ class SchedulerWebApp:
                 note=f"Runner log · {path}",
             )
         launcher = self._launcher_log_path(item)
-        if filename == "stdout.log" and launcher is not None:
+        if launcher is not None:
             return _read_log_tail(
                 launcher,
                 source="launcher.log",
@@ -669,7 +774,6 @@ class SchedulerWebApp:
         data = self._run_data(item_id)
         item = data["item"]
         stdout = self._log_snapshot(item, "stdout.log")
-        stderr = self._log_snapshot(item, "stderr.log")
         dependencies = " · ".join(
             f'<a href="/admin/runs/{row["dependency_item_id"]}">'
             f'#{row["dependency_item_id"]} {_escape(row["experiment_id"])}</a> '
@@ -719,7 +823,7 @@ class SchedulerWebApp:
 <p class="muted">Queue item #{item_id} · <span class="pill">{_escape(item['state'])}</span></p></div></div>
 <dl class="facts">{facts_html}</dl><p class="tiny muted">Dependencies: {dependencies}</p></section>
 <section><h2>Output</h2><p class="muted">The live page shows bounded log tails so very large training output stays responsive.</p>
-<div class="log-grid">{self._log_card('Stdout', stdout)}{self._log_card('Stderr', stderr)}</div></section>
+{self._log_card('Stdout', stdout)}</section>
 <section class="panel"><h2>Synchronize this run</h2>{rsync_html}</section>
 <section class="panel"><h2>Run audit history</h2>{event_rows or '<p>No run events recorded.</p>'}</section>"""
         }
@@ -849,6 +953,7 @@ class SchedulerWebApp:
         queue_rows: list[str] = []
         for item in data["items"]:
             item_id = int(item["id"])
+            queue_order = len(queue_rows)
             actions: list[str] = []
             base = f'<input type="hidden" name="csrf" value="{_escape(session.csrf)}"><input type="hidden" name="item_id" value="{item_id}">'
             if item["state"] in PENDING_STATES:
@@ -874,7 +979,25 @@ class SchedulerWebApp:
             detail = str(item["state_detail"] or "")
             if isolation:
                 detail = f"{detail} · {isolation}" if detail else isolation
-            queue_rows.append(f"""<tr><td>#{item_id}</td><td><a class="run-link" href="/admin/runs/{item_id}">{_escape(item['experiment_id'])}</a><br><span class="tiny muted">attempt {item['attempt']} · segment {item['segment']} · commit {_escape(str(item['git_commit'])[:12])}</span></td>
+            gpu_index = str(item["assigned_gpu_index"] or "")
+            state = str(item["state"])
+            state_group = "terminal" if state in TERMINAL_STATES else "active"
+            search_value = " ".join(
+                str(value or "")
+                for value in (
+                    item_id,
+                    item["experiment_id"],
+                    state,
+                    item["priority"],
+                    gpu_index,
+                    item["assigned_gpu_uuid"],
+                    item["git_commit"],
+                    item["card_path"],
+                    detail,
+                )
+            )
+            search_value = " ".join(search_value.split())
+            queue_rows.append(f"""<tr data-queue-row data-queue-order="{queue_order}" data-id="{item_id}" data-experiment="{_escape(item['experiment_id'])}" data-state="{_escape(state)}" data-state-group="{state_group}" data-priority="{item['priority']}" data-gpu="{_escape(gpu_index)}" data-search="{_escape(search_value)}"><td>#{item_id}</td><td><a class="run-link" href="/admin/runs/{item_id}">{_escape(item['experiment_id'])}</a><br><span class="tiny muted">attempt {item['attempt']} · segment {item['segment']} · commit {_escape(str(item['git_commit'])[:12])}</span></td>
 <td><span class="pill">{_escape(item['state'])}</span></td><td>{item['priority']}{' · front' if item['resume_front'] else ''}</td><td>{_escape(item['assigned_gpu_index'] or '—')}</td><td>{_escape(detail)}</td><td><div class="actions">{''.join(actions)}</div></td></tr>""")
         event_rows = "".join(
             f'<div class="event"><span>{_escape(row["created_at"])}</span><strong>{_escape(row["event_type"])}</strong><span>{_escape(row["actor"])} · item {_escape(row["queue_item_id"] or "—")}<br>{_escape(row["payload_json"])}</span></div>'
@@ -889,10 +1012,10 @@ class SchedulerWebApp:
             if data["telemetry_error"] else ""
         )
         return {
-            "dispatch": f"""<section class="panel"><div class="row"><div><strong>{dispatch_text}</strong><div class="muted">{_escape(data['pause_reason'])}</div></div>
+            "dispatch": f"""<section class="panel" data-dispatch-paused="{str(data['dispatch_paused']).lower()}"><div class="row"><div><strong>{dispatch_text}</strong><div class="muted">{_escape(data['pause_reason'])}</div></div>
 <form method="post" action="/admin/dispatch"><input type="hidden" name="csrf" value="{_escape(session.csrf)}"><input type="hidden" name="operation" value="{pause_action}"><input name="reason" placeholder="Reason (optional)"><button>{pause_action.title()} dispatch</button></form></div></section>""",
             "gpus": f"{telemetry_warning}<div class=\"grid\">{''.join(gpu_cards) or '<p>No GPUs are enabled.</p>'}</div>",
-            "queue": f"""<section class="panel"><h2>Queue</h2><table><thead><tr><th>ID</th><th>Experiment</th><th>State</th><th>Priority</th><th>GPU</th><th>Detail</th><th>Controls</th></tr></thead><tbody>{''.join(queue_rows)}</tbody></table></section>""",
+            "queue": f"""<div class="queue-table-wrap"><table><thead><tr><th>ID</th><th>Experiment</th><th>State</th><th>Priority</th><th>GPU</th><th>Detail</th><th>Controls</th></tr></thead><tbody data-queue-body>{''.join(queue_rows)}</tbody></table></div>""",
             "reservations": f"""<section class="panel"><h2>Reservation history</h2><table><thead><tr><th>ID</th><th>Reserved for / note</th><th>Status</th><th>Duration</th><th>Started</th><th>Expires</th></tr></thead><tbody>{reservation_rows}</tbody></table></section>""",
             "events": f"""<section class="panel"><h2>Recent audit history</h2>{event_rows or '<p>No events recorded.</p>'}</section>""",
         }
@@ -930,7 +1053,15 @@ class SchedulerWebApp:
 <section class="panel"><h2>Add experiment explicitly</h2><form method="post" action="/admin/add"><input type="hidden" name="csrf" value="{_escape(session.csrf)}"><div class="row">
 <div class="field"><label>Experiment ID</label><input name="experiment_id" placeholder="WCG-023" required></div><div class="field"><label>Card path (optional)</label><input name="card_path" placeholder="docs/experiments/WCG-023.md"></div><div class="field"><label>Priority</label><input name="priority" type="number" value="0"></div><div class="field"><label>After item IDs</label><input name="dependencies" placeholder="1, 2"></div></div>
 <div class="row"><label><input style="width:auto" type="checkbox" name="preemptible" value="1"> Checkpoint and requeue capable</label><label><input style="width:auto" type="checkbox" name="held" value="1"> Add held</label><label><input style="width:auto" type="checkbox" name="new_attempt" value="1"> Authorize new attempt</label><button type="submit">Add to queue</button></div></form></section>
-<div data-live-section="queue">{sections['queue']}</div>
+<section class="panel" aria-labelledby="queue-heading"><div class="queue-heading"><h2 id="queue-heading">Queue</h2><div id="queue-summary" class="queue-summary" role="status" aria-live="polite"></div></div>
+<div class="queue-toolbar" aria-label="Queue filters and sorting">
+<div class="field search-field"><label for="queue-search">Search queue</label><input id="queue-search" type="search" placeholder="Experiment, ID, detail, or commit" autocomplete="off"></div>
+<div class="field"><label for="queue-state-filter">State</label><select id="queue-state-filter"><option value="all">All states</option><option value="active">Active</option><option value="terminal">Finished</option><optgroup label="Active states"><option value="queued">Queued</option><option value="held">Held</option><option value="blocked">Blocked</option><option value="starting">Starting</option><option value="running">Running</option><option value="yielding">Yielding</option><option value="terminating">Terminating</option><option value="force_killing">Force killing</option></optgroup><optgroup label="Finished states"><option value="succeeded">Succeeded</option><option value="failed">Failed</option><option value="interrupted">Interrupted</option><option value="force_killed">Force killed</option><option value="removed">Removed</option></optgroup></select></div>
+<div class="field"><label for="queue-gpu-filter">GPU</label><select id="queue-gpu-filter"><option value="all">All GPUs</option><option value="unassigned">Unassigned</option></select></div>
+<div class="field"><label for="queue-sort">Sort by</label><select id="queue-sort"><option value="queue">Default order</option><option value="priority-desc">Priority: high to low</option><option value="priority-asc">Priority: low to high</option><option value="id-desc">Newest first</option><option value="id-asc">Oldest first</option><option value="experiment">Experiment A–Z</option><option value="state">State A–Z</option><option value="gpu">GPU</option></select></div>
+<button id="queue-reset" class="secondary" type="button">Reset</button></div>
+<div data-live-section="queue">{sections['queue']}</div><p id="queue-empty" class="queue-empty muted" hidden></p>
+<p class="tiny muted">Filters and sorting change only this browser view; scheduler priority and dispatch order are unchanged.</p></section>
 <div data-live-section="reservations">{sections['reservations']}</div>
 <div data-live-section="events">{sections['events']}</div></main>"""
         return self._page("Mutton2 scheduler", body, live_view="admin")

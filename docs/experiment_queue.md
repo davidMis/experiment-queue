@@ -185,19 +185,29 @@ The two entry points are:
 Every experiment name in the administrator queue links to its own
 `/admin/runs/<queue-item-id>` page. The page shows the frozen queue identity,
 state, timing, paths, dependencies, and item-specific audit history. It also
-shows the latest 128 KiB of the runner's `stdout.log` and `stderr.log`, refreshed
-about every 10 seconds while the page remains open. Before the runner publishes
-its run directory, the stdout panel falls back to the current segment's combined
-queue launcher output so startup and setup failures remain visible. The normal
-runner default uses a pseudo-terminal and therefore merges child stderr into
-`stdout.log`; in that mode `stderr.log` contains the runner's explanatory note.
-Runs launched with `--no-pty` retain separate streams.
+shows the latest 128 KiB of the runner's `stdout.log`, refreshed about every 10
+seconds while the page remains open. Before the runner publishes its run
+directory, the stdout panel falls back to the current segment's combined queue
+launcher output so startup and setup failures remain visible. The underlying
+runner still retains `stderr.log` where applicable, but job pages present only
+stdout.
 
 When the runner has recorded its pull command, the same page displays it with a
 **Copy rsync command to clipboard** button. Copying is a browser-only action: the
 web service never executes the command. Run pages and their live event streams
 require the administrator role; the shared coworker credential cannot read
 experiment output or synchronization commands.
+
+The administrator queue table has browser-local view controls. Search matches
+queue ID, experiment ID, state, priority, assigned GPU, commit, card path, and
+state detail. State filtering supports all, active, finished, or one exact
+state; GPU filtering supports one currently represented GPU or unassigned
+items. Sorting supports the default dashboard order, priority in either
+direction, newest/oldest, experiment, state, and GPU. The visible-item count and
+no-match message update immediately. These controls survive live table
+replacements for as long as the page remains open, but they do not alter the
+database, priority, or scheduler dispatch order. **Reset** returns to the
+unfiltered default dashboard order.
 
 The coworker password cannot authorize queue admission, priority, allowlist,
 dispatch, termination, or force-kill operations. The required reservation note
@@ -219,6 +229,10 @@ uses the signed session cookie, and expires with that session.
 Every page also offers light and dark appearance modes. The choice is a local
 browser preference rather than scheduler state, so coworkers can choose
 independently without creating accounts or changing the shared database.
+On the administrator dashboard, a paused dispatcher changes the complete page
+background to the theme's red pause palette. The background responds to the
+same live dispatch update as the status panel and returns to the ordinary theme
+background immediately after dispatch resumes.
 
 ## Operator Controls
 
