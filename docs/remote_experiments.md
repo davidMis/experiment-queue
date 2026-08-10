@@ -33,6 +33,9 @@ Record mutable state, runner identity, blockers, and next actions only in
 6. David runs the runner-generated `pull outputs with:` command locally.
 7. Codex inspects only synchronized local artifacts, validates provenance, and
    records the result and decision.
+8. After the analysis and repository closeout are complete, David may manually
+   remove the local run. If it is needed later, Codex asks David to re-sync the
+   exact run or files.
 
 ## Mutton2 Manual-Execution Boundary
 
@@ -120,11 +123,17 @@ Codex must not run it.
 
 ## Local Artifact Closeout
 
-Synchronization does not authorize cleanup. Keep the complete local run until
-its provenance is verified and its scientific decision is recorded. Later
-compaction follows `artifact_retention.md` and the exact registry/receipt
-workflow there. Active, ambiguous, or dependency-held runs remain protected,
-and root `data/` is never part of experiment-output cleanup.
+Treat `outputs/experiments/` as a local working cache. Keep the complete local
+run until its provenance is verified, the requested analysis is complete, and
+its scientific decision is recorded in the repository. David may then manually
+remove any local files or the whole run directory without a retention tier,
+registry, plan, receipt, or approval hash. Codex does not perform this cleanup.
+
+When later work needs an artifact that is no longer local, Codex states the
+exact run directory and required files and asks David to re-sync them from
+`mutton2`. This is expected cache restoration, not lost scientific state.
+Codex still must not execute the transfer or inspect `mutton2`. Root `data/`
+is outside this cleanup workflow. See `local_experiment_outputs.md`.
 
 ## Optional Explicit Queue
 
