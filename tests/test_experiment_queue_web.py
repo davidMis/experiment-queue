@@ -32,6 +32,50 @@ def _gpu() -> GpuSnapshot:
     )
 
 
+def _insert_run(
+    store: QueueStore,
+    *,
+    item_id: int,
+    state: str,
+    run_dir: Path | None = None,
+    rsync_command: str | None = None,
+) -> None:
+    """Insert a minimal durable queue item for read-only web rendering tests."""
+
+    with store.connect() as connection:
+        connection.execute(
+            """
+            INSERT INTO queue_items(
+                id, experiment_id, attempt, state, priority, card_path, card_sha256,
+                command_text, runner_name, git_commit, added_at, added_by,
+                runner_run_dir, runner_manifest_path, rsync_pull_command
+            ) VALUES (?, ?, 1, ?, 20, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                item_id,
+                f"TST-{item_id:03d}",
+                state,
+                f"docs/experiments/TST-{item_id:03d}.md",
+                "a" * 64,
+                "python scripts/run_experiment.py --name test",
+                f"test-{item_id}",
+                "b" * 40,
+                "2026-08-09T12:00:00+00:00",
+                "test",
+                str(run_dir) if run_dir is not None else None,
+                str(run_dir / "manifest.json") if run_dir is not None else None,
+                rsync_command,
+            ),
+        )
+        store._event(
+            connection,
+            "EXPERIMENT_TEST_EVENT",
+            queue_item_id=item_id,
+            payload={"state": state},
+            actor="test",
+        )
+
+
 def test_two_role_auth_hashes_passwords_and_signs_expiring_sessions(tmp_path: Path) -> None:
     path = initialize_web_auth(
         tmp_path,
@@ -130,6 +174,144 @@ def test_live_sections_change_with_durable_queue_revision_and_enforce_role(
     assert "Dispatch paused" in app.live_sections("admin", admin_session)["dispatch"]
     with pytest.raises(QueueError, match="cannot subscribe"):
         app.live_sections("admin", reservation_session)
+
+
+def test_admin_run_page_shows_logs_and_copyable_rsync_command(tmp_path: Path) -> None:
+    repo_root = tmp_path / "repo"
+    run_dir = repo_root / "outputs" / "experiments" / "test-run"
+    run_dir.mkdir(parents=True)
+    (run_dir / "stdout.log").write_text(
+        "progress\rfinished\n<script>unsafe</script>\n",
+        encoding="utf-8",
+    )
+    (run_dir / "stderr.log").write_text(
+        "\x1b[31msynthetic warning\x1b[0m\n",
+        encoding="utf-8",
+    )
+    state_dir = repo_root / "gpu_scheduler_state"
+    store = QueueStore(state_dir, repo_root)
+    command = "rsync -avh mutton2:'/remote/run & data/' '/local/output/'"
+    _insert_run(
+        store,
+        item_id=1,
+        state="succeeded",
+        run_dir=run_dir,
+        rsync_command=command,
+    )
+    auth = AuthManager(
+        initialize_web_auth(
+            state_dir,
+            admin_password="administrator-secret",
+            reservation_password="coworker-shared-secret",
+        )
+    )
+    app = SchedulerWebApp(store, auth)
+    app.gpu_snapshots = lambda: ([], None)  # type: ignore[method-assign]
+    _token, admin_session = auth.issue_session("admin")
+    _reservation_token, reservation_session = auth.issue_session("reservation")
+
+    admin_page = app.render_admin(admin_session, {}).decode("utf-8")
+    assert 'href="/admin/runs/1"' in admin_page
+    page = app.render_run(admin_session, 1).decode("utf-8")
+    assert 'data-live-view="run-1"' in page
+    assert "finished" in page
+    assert "&lt;script&gt;unsafe&lt;/script&gt;" in page
+    assert "synthetic warning" in page
+    assert "\x1b[31m" not in page
+    assert "Copy rsync command to clipboard" in page
+    assert "data-copy-target=\"rsync-command\"" in page
+    assert "&amp; data" in page
+    assert "EXPERIMENT_TEST_EVENT" in page
+    assert "navigator.clipboard" in CLIENT_SCRIPT
+    assert "/events/admin/runs/" in CLIENT_SCRIPT
+    assert set(app.live_sections("run-1", admin_session)) == {"run"}
+    with pytest.raises(QueueError, match="cannot subscribe"):
+        app.live_sections("run-1", reservation_session)
+
+
+def test_running_run_page_falls_back_to_combined_launcher_output(tmp_path: Path) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    state_dir = repo_root / "gpu_scheduler_state"
+    store = QueueStore(state_dir, repo_root)
+    _insert_run(store, item_id=2, state="running")
+    launcher = state_dir / "attempts" / "2" / "segments" / "1" / "launcher.log"
+    launcher.parent.mkdir(parents=True)
+    launcher.write_text("live startup output\n", encoding="utf-8")
+    auth = AuthManager(
+        initialize_web_auth(
+            state_dir,
+            admin_password="administrator-secret",
+            reservation_password="coworker-shared-secret",
+        )
+    )
+    app = SchedulerWebApp(store, auth)
+    _token, admin_session = auth.issue_session("admin")
+
+    page = app.render_run(admin_session, 2).decode("utf-8")
+    assert "live startup output" in page
+    assert "Combined queue launcher output" in page
+    assert "The runner has not published its run directory yet." in page
+    assert "The runner has not recorded an rsync command yet." in page
+    assert "Copy rsync command to clipboard" in page
+    assert "disabled" in page
+
+
+def test_authenticated_run_detail_route_renders_the_requested_item(tmp_path: Path) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    state_dir = repo_root / "gpu_scheduler_state"
+    store = QueueStore(state_dir, repo_root)
+    _insert_run(store, item_id=3, state="queued")
+    auth = AuthManager(
+        initialize_web_auth(
+            state_dir,
+            admin_password="administrator-secret",
+            reservation_password="coworker-shared-secret",
+        )
+    )
+    app = SchedulerWebApp(store, auth)
+    _token, admin_session = auth.issue_session("admin")
+    sent: list[tuple[int, bytes]] = []
+    handler = QueueWebHandler.__new__(QueueWebHandler)
+    handler.path = "/admin/runs/3"
+    handler.server = SimpleNamespace(app=app)
+    handler._require = lambda role: admin_session if role == "admin" else None  # type: ignore[method-assign]
+    handler._send = lambda status, body, **_kwargs: sent.append((status, body))  # type: ignore[method-assign]
+
+    handler.do_GET()
+
+    assert len(sent) == 1
+    assert sent[0][0] == 200
+    assert b"TST-003" in sent[0][1]
+    assert b'data-live-view="run-3"' in sent[0][1]
+
+
+def test_run_page_does_not_read_logs_outside_the_queue_repository(tmp_path: Path) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    outside = tmp_path / "outside-run"
+    outside.mkdir()
+    (outside / "stdout.log").write_text("host secret\n", encoding="utf-8")
+    (outside / "stderr.log").write_text("another secret\n", encoding="utf-8")
+    state_dir = repo_root / "gpu_scheduler_state"
+    store = QueueStore(state_dir, repo_root)
+    _insert_run(store, item_id=4, state="failed", run_dir=outside)
+    auth = AuthManager(
+        initialize_web_auth(
+            state_dir,
+            admin_password="administrator-secret",
+            reservation_password="coworker-shared-secret",
+        )
+    )
+    app = SchedulerWebApp(store, auth)
+    _token, admin_session = auth.issue_session("admin")
+
+    page = app.render_run(admin_session, 4).decode("utf-8")
+
+    assert "outside this repository" in page
+    assert "host secret" not in page
+    assert "another secret" not in page
 
 
 def test_authenticated_event_stream_pushes_status_without_page_reload(

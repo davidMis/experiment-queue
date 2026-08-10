@@ -16,6 +16,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
+import re
 import secrets
 import ssl
 import tempfile
@@ -56,6 +57,13 @@ LOGIN_MAX_FAILURES = 8
 LIVE_POLL_SECONDS = 0.5
 LIVE_TELEMETRY_SECONDS = 10.0
 LIVE_KEEPALIVE_SECONDS = 15.0
+LOG_TAIL_BYTES = 128 * 1024
+RUN_PAGE_PATTERN = re.compile(r"^/admin/runs/([1-9][0-9]*)$")
+RUN_EVENT_PATTERN = re.compile(r"^/events/admin/runs/([1-9][0-9]*)$")
+ANSI_ESCAPE_PATTERN = re.compile(
+    r"(?:\x1b\][^\x07]*(?:\x07|\x1b\\))|(?:\x1b\[[0-?]*[ -/]*[@-~])"
+)
+TERMINAL_CONTROL_PATTERN = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
 
 def _b64encode(value: bytes) -> str:
@@ -138,6 +146,18 @@ class WebSession:
     role: str
     csrf: str
     expires_epoch: int
+
+
+@dataclass(frozen=True)
+class LogSnapshot:
+    """Bounded, browser-safe view of one durable runner or launcher log."""
+
+    source: str
+    text: str
+    size_bytes: int | None
+    truncated: bool
+    available: bool
+    note: str
 
 
 class AuthManager:
@@ -267,11 +287,52 @@ def _parse_web_timestamp(value: str) -> datetime:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
+def _format_bytes(value: int) -> str:
+    if value < 1024:
+        return f"{value} B"
+    if value < 1024**2:
+        return f"{value / 1024:.1f} KiB"
+    return f"{value / 1024**2:.1f} MiB"
+
+
+def _read_log_tail(path: Path, *, source: str, note: str) -> LogSnapshot:
+    """Read a bounded terminal-log tail without rendering control sequences."""
+
+    try:
+        size = path.stat().st_size
+        offset = max(0, size - LOG_TAIL_BYTES)
+        with path.open("rb") as handle:
+            handle.seek(offset)
+            payload = handle.read(LOG_TAIL_BYTES)
+    except OSError as exc:
+        return LogSnapshot(
+            source=source,
+            text="",
+            size_bytes=None,
+            truncated=False,
+            available=False,
+            note=f"Could not read {source}: {exc}",
+        )
+    text = payload.decode("utf-8", errors="replace")
+    text = ANSI_ESCAPE_PATTERN.sub("", text)
+    text = TERMINAL_CONTROL_PATTERN.sub(
+        "", text.replace("\r\n", "\n").replace("\r", "\n")
+    )
+    return LogSnapshot(
+        source=source,
+        text=text,
+        size_bytes=size,
+        truncated=offset > 0,
+        available=True,
+        note=note,
+    )
+
+
 STYLE = """
 :root{color-scheme:dark;--bg:#101311;--glow:#1d2a22;--panel:#171c19;--panel2:#1d2420;--field:#0e120f;--line:#334039;--text:#f2f5f0;--muted:#aab5ae;--green:#9ee37d;--amber:#f0c36a;--red:#ff8c82;--blue:#8dc7ff;--button:#263d2d;--button-hover:#31503a;--secondary:#202824;--danger:#4b2525;--danger-line:#83403b;--pill:#253029;--ok-bg:#17301d;--ok-line:#315c3b;--error-text:#ffd1cd;--error-bg:#3a2020;--error-line:#78403d;--shadow:#0004}
 :root[data-theme=light]{color-scheme:light;--bg:#f4f7f2;--glow:#dfeee2;--panel:#fff;--panel2:#f7faf6;--field:#fff;--line:#c8d4ca;--text:#172019;--muted:#5d6b61;--green:#347a2e;--amber:#9a6414;--red:#b23932;--blue:#1769aa;--button:#dcecdf;--button-hover:#cce3d1;--secondary:#edf2ed;--danger:#f7dddd;--danger-line:#d8a09c;--pill:#e7eee8;--ok-bg:#e3f3e4;--ok-line:#a8cea9;--error-text:#7d211d;--error-bg:#f9e1df;--error-line:#d9a4a0;--shadow:#253a2b1c}
 *{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at top left,var(--glow) 0,var(--bg) 42%);color:var(--text);font:15px/1.45 ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;min-height:100vh;transition:background-color .18s,color .18s}
-a{color:var(--blue)}.shell{max-width:1180px;margin:0 auto;padding:28px 20px 64px}.top{display:flex;align-items:flex-start;justify-content:space-between;gap:24px;margin-bottom:24px}.eyebrow{text-transform:uppercase;letter-spacing:.14em;color:var(--green);font-size:12px;font-weight:700}.title{font-size:clamp(28px,5vw,48px);line-height:1.02;margin:8px 0}.subtitle{color:var(--muted);max-width:680px}.nav{display:flex;align-items:flex-start;gap:10px;flex-wrap:wrap}.nav form{margin:0}.panel,.gpu,.login{background:linear-gradient(145deg,var(--panel),var(--panel2));border:1px solid var(--line);border-radius:16px;box-shadow:0 18px 50px var(--shadow)}.panel{padding:20px;margin:18px 0}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(270px,1fr));gap:14px}.gpu{padding:18px;position:relative;overflow:hidden}.gpu:before{content:"";position:absolute;left:0;top:0;bottom:0;width:4px;background:var(--line)}.gpu.available:before{background:var(--green)}.gpu.busy:before{background:var(--amber)}.gpu.reserved:before{background:var(--blue)}.gpu.danger:before{background:var(--red)}.gpu h3{margin:0 0 4px;font-size:20px}.meta{color:var(--muted);font-size:13px}.status{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--line);border-radius:999px;padding:4px 9px;margin:10px 0;font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.06em}.dot{width:7px;height:7px;border-radius:50%;background:currentColor}.available .status{color:var(--green)}.busy .status{color:var(--amber)}.reserved .status{color:var(--blue)}.danger .status{color:var(--red)}form{margin:12px 0 0}.row{display:flex;gap:10px;flex-wrap:wrap;align-items:end}.field{display:flex;flex-direction:column;gap:5px;min-width:120px;flex:1}.field label{font-size:12px;color:var(--muted);font-weight:700}input,select,button,textarea{font:inherit}input,select,textarea{width:100%;color:var(--text);background:var(--field);border:1px solid var(--line);border-radius:9px;padding:9px 10px}textarea{min-height:72px;resize:vertical}button,.button{border:1px solid var(--line);background:var(--button);color:var(--text);border-radius:9px;padding:9px 13px;font-weight:750;cursor:pointer;text-decoration:none;display:inline-block}button:hover,.button:hover{background:var(--button-hover)}button.secondary,.button.secondary{background:var(--secondary);border-color:var(--line)}button.danger{background:var(--danger);border-color:var(--danger-line)}button:disabled{opacity:.5;cursor:not-allowed}.flash{padding:12px 14px;border-radius:10px;margin:14px 0;border:1px solid}.flash.ok{color:var(--green);background:var(--ok-bg);border-color:var(--ok-line)}.flash.error{color:var(--error-text);background:var(--error-bg);border-color:var(--error-line)}table{width:100%;border-collapse:collapse;font-size:13px}th,td{text-align:left;padding:10px 8px;border-bottom:1px solid var(--line);vertical-align:top}th{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.08em}.actions{display:flex;gap:6px;flex-wrap:wrap}.actions form{margin:0}.actions button{padding:6px 9px;font-size:12px}.pill{display:inline-block;padding:3px 7px;border-radius:999px;background:var(--pill);color:var(--muted);font-size:11px}.login{max-width:440px;margin:12vh auto 0;padding:28px}.login h1{margin-top:0}.split{display:grid;grid-template-columns:1fr 1fr;gap:18px}.muted{color:var(--muted)}.tiny{font-size:12px}.event{display:grid;grid-template-columns:150px 210px 1fr;gap:10px;padding:8px 0;border-bottom:1px solid var(--line);font-size:12px}.theme-corner{position:fixed;right:18px;top:18px;z-index:2}.live-indicator{display:inline-flex;align-items:center;gap:7px;color:var(--amber);border:1px solid var(--line);border-radius:999px;padding:8px 11px;font-size:12px;font-weight:700;background:var(--panel)}.live-indicator.connected{color:var(--green)}.live-indicator.disconnected{color:var(--red)}.live-indicator .dot{box-shadow:0 0 0 3px color-mix(in srgb,currentColor 18%,transparent)}[data-live-section]{scroll-margin-top:16px}@media(max-width:760px){.top{display:block}.nav{margin-top:18px}.split{grid-template-columns:1fr}table{display:block;overflow-x:auto}.event{grid-template-columns:1fr}.shell{padding:20px 14px 50px}.theme-corner{position:static;margin:14px}}
+a{color:var(--blue)}.shell{max-width:1180px;margin:0 auto;padding:28px 20px 64px}.top{display:flex;align-items:flex-start;justify-content:space-between;gap:24px;margin-bottom:24px}.eyebrow{text-transform:uppercase;letter-spacing:.14em;color:var(--green);font-size:12px;font-weight:700}.title{font-size:clamp(28px,5vw,48px);line-height:1.02;margin:8px 0}.subtitle{color:var(--muted);max-width:680px}.nav{display:flex;align-items:flex-start;gap:10px;flex-wrap:wrap}.nav form{margin:0}.panel,.gpu,.login{background:linear-gradient(145deg,var(--panel),var(--panel2));border:1px solid var(--line);border-radius:16px;box-shadow:0 18px 50px var(--shadow)}.panel{padding:20px;margin:18px 0}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(270px,1fr));gap:14px}.gpu{padding:18px;position:relative;overflow:hidden}.gpu:before{content:"";position:absolute;left:0;top:0;bottom:0;width:4px;background:var(--line)}.gpu.available:before{background:var(--green)}.gpu.busy:before{background:var(--amber)}.gpu.reserved:before{background:var(--blue)}.gpu.danger:before{background:var(--red)}.gpu h3{margin:0 0 4px;font-size:20px}.meta{color:var(--muted);font-size:13px}.status{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--line);border-radius:999px;padding:4px 9px;margin:10px 0;font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.06em}.dot{width:7px;height:7px;border-radius:50%;background:currentColor}.available .status{color:var(--green)}.busy .status{color:var(--amber)}.reserved .status{color:var(--blue)}.danger .status{color:var(--red)}form{margin:12px 0 0}.row{display:flex;gap:10px;flex-wrap:wrap;align-items:end}.field{display:flex;flex-direction:column;gap:5px;min-width:120px;flex:1}.field label{font-size:12px;color:var(--muted);font-weight:700}input,select,button,textarea{font:inherit}input,select,textarea{width:100%;color:var(--text);background:var(--field);border:1px solid var(--line);border-radius:9px;padding:9px 10px}textarea{min-height:72px;resize:vertical}button,.button{border:1px solid var(--line);background:var(--button);color:var(--text);border-radius:9px;padding:9px 13px;font-weight:750;cursor:pointer;text-decoration:none;display:inline-block}button:hover,.button:hover{background:var(--button-hover)}button.secondary,.button.secondary{background:var(--secondary);border-color:var(--line)}button.danger{background:var(--danger);border-color:var(--danger-line)}button:disabled{opacity:.5;cursor:not-allowed}.flash{padding:12px 14px;border-radius:10px;margin:14px 0;border:1px solid}.flash.ok{color:var(--green);background:var(--ok-bg);border-color:var(--ok-line)}.flash.error{color:var(--error-text);background:var(--error-bg);border-color:var(--error-line)}table{width:100%;border-collapse:collapse;font-size:13px}th,td{text-align:left;padding:10px 8px;border-bottom:1px solid var(--line);vertical-align:top}th{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.08em}.actions{display:flex;gap:6px;flex-wrap:wrap}.actions form{margin:0}.actions button{padding:6px 9px;font-size:12px}.pill{display:inline-block;padding:3px 7px;border-radius:999px;background:var(--pill);color:var(--muted);font-size:11px}.login{max-width:440px;margin:12vh auto 0;padding:28px}.login h1{margin-top:0}.split{display:grid;grid-template-columns:1fr 1fr;gap:18px}.muted{color:var(--muted)}.tiny{font-size:12px}.event{display:grid;grid-template-columns:150px 210px 1fr;gap:10px;padding:8px 0;border-bottom:1px solid var(--line);font-size:12px}.theme-corner{position:fixed;right:18px;top:18px;z-index:2}.live-indicator{display:inline-flex;align-items:center;gap:7px;color:var(--amber);border:1px solid var(--line);border-radius:999px;padding:8px 11px;font-size:12px;font-weight:700;background:var(--panel)}.live-indicator.connected{color:var(--green)}.live-indicator.disconnected{color:var(--red)}.live-indicator .dot{box-shadow:0 0 0 3px color-mix(in srgb,currentColor 18%,transparent)}[data-live-section]{scroll-margin-top:16px}.facts{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:14px;margin:0}.facts div{min-width:0}.facts dt{color:var(--muted);font-size:11px;font-weight:750;letter-spacing:.08em;text-transform:uppercase}.facts dd{margin:4px 0 0;overflow-wrap:anywhere}.log-grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}.log-card{min-width:0}.log-card h3{margin:0}.log-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:10px}.log{height:420px;margin:0;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;background:var(--field);border:1px solid var(--line);border-radius:10px;padding:14px;color:var(--text);font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;tab-size:4}.command{margin:10px 0;white-space:pre-wrap;overflow-wrap:anywhere;background:var(--field);border:1px solid var(--line);border-radius:10px;padding:12px;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace}.copy-status{display:inline-block;min-height:1.4em;margin-left:8px;color:var(--green);font-size:12px}.run-link{font-weight:750;text-decoration:none}.run-link:hover{text-decoration:underline}@media(max-width:760px){.top{display:block}.nav{margin-top:18px}.split,.log-grid{grid-template-columns:1fr}table{display:block;overflow-x:auto}.event{grid-template-columns:1fr}.shell{padding:20px 14px 50px}.theme-corner{position:static;margin:14px}.log{height:320px}}
 """
 
 
@@ -301,6 +362,49 @@ CLIENT_SCRIPT = r"""
     setTheme(next);
   });
 
+  const copyText = async (value) => {
+    if (navigator.clipboard?.writeText) {
+      try {
+        await navigator.clipboard.writeText(value);
+        return;
+      } catch (_error) { /* fall through to selection-based copying */ }
+    }
+    const helper = document.createElement("textarea");
+    helper.value = value;
+    helper.setAttribute("readonly", "");
+    helper.style.position = "fixed";
+    helper.style.opacity = "0";
+    document.body.appendChild(helper);
+    helper.select();
+    const copied = document.execCommand("copy");
+    helper.remove();
+    if (!copied) throw new Error("copy command was unavailable");
+  };
+  document.addEventListener("click", async (event) => {
+    const button = event.target.closest?.("[data-copy-target]");
+    if (!button || button.disabled) return;
+    const source = document.getElementById(button.dataset.copyTarget || "");
+    const status = document.getElementById(button.dataset.copyStatus || "");
+    if (!source) return;
+    const original = button.textContent;
+    button.disabled = true;
+    try {
+      await copyText(source.textContent || "");
+      button.textContent = "Copied";
+      if (status) status.textContent = "Command copied to clipboard.";
+    } catch (_error) {
+      button.textContent = "Copy failed";
+      if (status) status.textContent = "Select and copy the command above.";
+    }
+    setTimeout(() => {
+      if (button.isConnected) {
+        button.textContent = original;
+        button.disabled = false;
+      }
+      if (status?.isConnected) status.textContent = "";
+    }, 2200);
+  });
+
   const view = document.body.dataset.liveView;
   if (!view || !window.EventSource) return;
   const indicator = document.getElementById("live-connection");
@@ -325,7 +429,10 @@ CLIENT_SCRIPT = r"""
     for (const [name, markup] of pending) applySection(name, markup);
   }, 0));
 
-  const stream = new EventSource(`/events/${encodeURIComponent(view)}`);
+  const eventUrl = view.startsWith("run-")
+    ? `/events/admin/runs/${encodeURIComponent(view.slice(4))}`
+    : `/events/${encodeURIComponent(view)}`;
+  const stream = new EventSource(eventUrl);
   stream.onopen = () => setConnection("connected", "Live");
   stream.onerror = () => setConnection("disconnected", "Reconnecting…");
   stream.addEventListener("status", (event) => {
@@ -340,7 +447,11 @@ CLIENT_SCRIPT = r"""
     }
   });
   stream.addEventListener("session-expired", () => {
-    location.assign(view === "admin" ? "/login/admin" : "/login/reservation");
+    location.assign(
+      view === "admin" || view.startsWith("run-")
+        ? "/login/admin"
+        : "/login/reservation"
+    );
   });
   addEventListener("beforeunload", () => stream.close(), { once: true });
 })();
@@ -402,6 +513,104 @@ class SchedulerWebApp:
             "pause_reason": self.store.get_meta("pause_reason"),
         }
 
+    def _runner_log_path(
+        self,
+        item: Mapping[str, Any],
+        filename: str,
+    ) -> tuple[Path | None, str | None]:
+        """Resolve a fixed runner log name without exposing arbitrary host files."""
+
+        if filename not in {"stdout.log", "stderr.log"}:
+            raise QueueError(f"unsupported runner log {filename!r}")
+        run_directory = str(item.get("runner_run_dir") or "").strip()
+        if not run_directory:
+            return None, "The runner has not published its run directory yet."
+        repo_root = self.store.repo_root.resolve()
+        candidate = Path(run_directory)
+        if not candidate.is_absolute():
+            candidate = repo_root / candidate
+        try:
+            resolved_directory = candidate.resolve()
+            log_path = resolved_directory / filename
+            if log_path.is_symlink():
+                return None, f"The recorded {filename} path is a symbolic link."
+            resolved_log = log_path.resolve()
+        except OSError as exc:
+            return None, f"Could not resolve the recorded runner directory: {exc}"
+        if resolved_directory != repo_root and repo_root not in resolved_directory.parents:
+            return None, "The recorded runner directory is outside this repository."
+        if resolved_log.parent != resolved_directory:
+            return None, f"The recorded {filename} path is not a safe regular log path."
+        if not resolved_log.is_file():
+            return None, f"{filename} is not available in the recorded runner directory."
+        return resolved_log, None
+
+    def _launcher_log_path(self, item: Mapping[str, Any]) -> Path | None:
+        """Return the current segment's scheduler-owned combined launcher log."""
+
+        segment = max(1, int(item["segment"]))
+        path = (
+            self.store.state_dir
+            / "attempts"
+            / str(int(item["id"]))
+            / "segments"
+            / str(segment)
+            / "launcher.log"
+        )
+        return path if path.is_file() and not path.is_symlink() else None
+
+    def _log_snapshot(self, item: Mapping[str, Any], filename: str) -> LogSnapshot:
+        """Prefer canonical runner output and fall back to startup output when useful."""
+
+        path, error = self._runner_log_path(item, filename)
+        if path is not None:
+            return _read_log_tail(
+                path,
+                source=filename,
+                note=f"Runner log · {path}",
+            )
+        launcher = self._launcher_log_path(item)
+        if filename == "stdout.log" and launcher is not None:
+            return _read_log_tail(
+                launcher,
+                source="launcher.log",
+                note=(
+                    "Combined queue launcher output while the canonical runner logs "
+                    "are not available"
+                ),
+            )
+        return LogSnapshot(
+            source=filename,
+            text="",
+            size_bytes=None,
+            truncated=False,
+            available=False,
+            note=error or f"{filename} is not available yet.",
+        )
+
+    def _run_data(self, item_id: int) -> dict[str, Any]:
+        """Read one queue item and its audit context without polling GPU telemetry."""
+
+        with self.store.connect() as connection:
+            item = dict(self.store.item(item_id, connection=connection))
+            dependencies = [
+                dict(row)
+                for row in connection.execute(
+                    "SELECT dependency_item_id, experiment_id, state FROM dependencies "
+                    "JOIN queue_items ON queue_items.id = dependencies.dependency_item_id "
+                    "WHERE queue_item_id = ? ORDER BY dependency_item_id",
+                    (item_id,),
+                )
+            ]
+            events = [
+                dict(row)
+                for row in connection.execute(
+                    "SELECT * FROM events WHERE queue_item_id = ? ORDER BY id DESC LIMIT 100",
+                    (item_id,),
+                )
+            ]
+        return {"item": item, "dependencies": dependencies, "events": events}
+
     @staticmethod
     def _page(title: str, body: str, *, live_view: str | None = None) -> bytes:
         live_attribute = f' data-live-view="{_escape(live_view)}"' if live_view else ""
@@ -433,6 +642,102 @@ class SchedulerWebApp:
         if query.get("error"):
             return f'<div class="flash error">{_escape(query["error"][-1])}</div>'
         return ""
+
+    @staticmethod
+    def _log_card(title: str, snapshot: LogSnapshot) -> str:
+        if snapshot.available:
+            assert snapshot.size_bytes is not None
+            extent = (
+                f"Showing the last {_format_bytes(LOG_TAIL_BYTES)} of "
+                f"{_format_bytes(snapshot.size_bytes)}"
+                if snapshot.truncated
+                else f"Complete log · {_format_bytes(snapshot.size_bytes)}"
+            )
+            content = snapshot.text or "(empty log)"
+        else:
+            extent = "Not available"
+            content = snapshot.note
+        return f"""<article class="panel log-card"><div class="log-head"><div><h3>{_escape(title)}</h3>
+<div class="tiny muted">{_escape(snapshot.source)} · {_escape(extent)}</div></div></div>
+<p class="tiny muted">{_escape(snapshot.note)}</p><pre class="log" tabindex="0">{_escape(content)}</pre></article>"""
+
+    def _run_sections(self, session: WebSession, item_id: int) -> dict[str, str]:
+        """Render the live administrator-only detail fragment for one queue run."""
+
+        if session.role != "admin":
+            raise QueueError("administrator access is required for run details")
+        data = self._run_data(item_id)
+        item = data["item"]
+        stdout = self._log_snapshot(item, "stdout.log")
+        stderr = self._log_snapshot(item, "stderr.log")
+        dependencies = " · ".join(
+            f'<a href="/admin/runs/{row["dependency_item_id"]}">'
+            f'#{row["dependency_item_id"]} {_escape(row["experiment_id"])}</a> '
+            f'<span class="pill">{_escape(row["state"])}</span>'
+            for row in data["dependencies"]
+        ) or "None"
+        facts = [
+            ("Queue item", f"#{item_id}"),
+            ("State", str(item["state"])),
+            ("Attempt / segment", f'{item["attempt"]} / {item["segment"]}'),
+            ("Priority", str(item["priority"])),
+            ("GPU", str(item["assigned_gpu_index"] or "—")),
+            ("Return code", str(item["return_code"] if item["return_code"] is not None else "—")),
+            ("Started", str(item["started_at"] or "—")),
+            ("Finished", str(item["finished_at"] or "—")),
+            ("Commit", str(item["git_commit"])),
+            ("Card", str(item["card_path"])),
+            ("Run directory", str(item["runner_run_dir"] or "Not published yet")),
+            ("Manifest", str(item["runner_manifest_path"] or "Not published yet")),
+        ]
+        facts_html = "".join(
+            f"<div><dt>{_escape(label)}</dt><dd>{_escape(value)}</dd></div>"
+            for label, value in facts
+        )
+        rsync_command = str(item["rsync_pull_command"] or "").strip()
+        if rsync_command:
+            rsync_html = f"""<pre class="command"><code id="rsync-command">{_escape(rsync_command)}</code></pre>
+<button type="button" data-copy-target="rsync-command" data-copy-status="copy-status">Copy rsync command to clipboard</button>
+<span id="copy-status" class="copy-status" role="status" aria-live="polite"></span>"""
+        else:
+            rsync_html = """<p class="muted">The runner has not recorded an rsync command yet.</p>
+<button type="button" disabled>Copy rsync command to clipboard</button>"""
+        detail_html = (
+            f'<section class="panel"><strong>State detail</strong>'
+            f'<p class="muted">{_escape(item["state_detail"])}</p></section>'
+            if item["state_detail"]
+            else ""
+        )
+        event_rows = "".join(
+            f'<div class="event"><span>{_escape(row["created_at"])}</span>'
+            f'<strong>{_escape(row["event_type"])}</strong>'
+            f'<span>{_escape(row["actor"])}<br>{_escape(row["payload_json"])}</span></div>'
+            for row in data["events"]
+        )
+        return {
+            "run": f"""{detail_html}<section class="panel"><div class="row"><div><h2 style="margin:0">{_escape(item['experiment_id'])}</h2>
+<p class="muted">Queue item #{item_id} · <span class="pill">{_escape(item['state'])}</span></p></div></div>
+<dl class="facts">{facts_html}</dl><p class="tiny muted">Dependencies: {dependencies}</p></section>
+<section><h2>Output</h2><p class="muted">The live page shows bounded log tails so very large training output stays responsive.</p>
+<div class="log-grid">{self._log_card('Stdout', stdout)}{self._log_card('Stderr', stderr)}</div></section>
+<section class="panel"><h2>Synchronize this run</h2>{rsync_html}</section>
+<section class="panel"><h2>Run audit history</h2>{event_rows or '<p>No run events recorded.</p>'}</section>"""
+        }
+
+    def render_run(self, session: WebSession, item_id: int) -> bytes:
+        """Render an administrator run page with live logs and sync instructions."""
+
+        sections = self._run_sections(session, item_id)
+        body = f"""<main class="shell"><header class="top"><div><div class="eyebrow">Mutton2 scheduler</div>
+<h1 class="title">Run details</h1><p class="subtitle">Status and output refresh automatically while this page is open.</p></div>
+<nav class="nav">{self._live_indicator()}{self._theme_toggle()}<a class="button secondary" href="/admin">Back to queue</a>
+<form method="post" action="/logout"><input type="hidden" name="csrf" value="{_escape(session.csrf)}"><button class="secondary">Sign out</button></form></nav></header>
+<div data-live-section="run">{sections['run']}</div></main>"""
+        return self._page(
+            f"Run {item_id} · Mutton2 scheduler",
+            body,
+            live_view=f"run-{item_id}",
+        )
 
     def render_login(self, role: str, *, error: str | None = None) -> bytes:
         label = "Scheduler administrator" if role == "admin" else "GPU reservation desk"
@@ -569,7 +874,7 @@ class SchedulerWebApp:
             detail = str(item["state_detail"] or "")
             if isolation:
                 detail = f"{detail} · {isolation}" if detail else isolation
-            queue_rows.append(f"""<tr><td>#{item_id}</td><td><strong>{_escape(item['experiment_id'])}</strong><br><span class="tiny muted">attempt {item['attempt']} · segment {item['segment']} · commit {_escape(str(item['git_commit'])[:12])}</span></td>
+            queue_rows.append(f"""<tr><td>#{item_id}</td><td><a class="run-link" href="/admin/runs/{item_id}">{_escape(item['experiment_id'])}</a><br><span class="tiny muted">attempt {item['attempt']} · segment {item['segment']} · commit {_escape(str(item['git_commit'])[:12])}</span></td>
 <td><span class="pill">{_escape(item['state'])}</span></td><td>{item['priority']}{' · front' if item['resume_front'] else ''}</td><td>{_escape(item['assigned_gpu_index'] or '—')}</td><td>{_escape(detail)}</td><td><div class="actions">{''.join(actions)}</div></td></tr>""")
         event_rows = "".join(
             f'<div class="event"><span>{_escape(row["created_at"])}</span><strong>{_escape(row["event_type"])}</strong><span>{_escape(row["actor"])} · item {_escape(row["queue_item_id"] or "—")}<br>{_escape(row["payload_json"])}</span></div>'
@@ -599,6 +904,9 @@ class SchedulerWebApp:
             return self._reserve_sections(session)
         if view == "admin" and session.role == "admin":
             return self._admin_sections(session)
+        if view.startswith("run-") and session.role == "admin":
+            item_id = _integer(view.removeprefix("run-"), label="queue item ID")
+            return self._run_sections(session, item_id)
         raise QueueError(f"role {session.role!r} cannot subscribe to {view!r} status")
 
     def live_revision(self) -> int:
@@ -901,6 +1209,8 @@ class QueueWebHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         query = parse_qs(parsed.query, keep_blank_values=True)
+        run_event = RUN_EVENT_PATTERN.fullmatch(parsed.path)
+        run_page = RUN_PAGE_PATTERN.fullmatch(parsed.path)
         if parsed.path == "/healthz":
             self._send(HTTPStatus.OK, b"ok\n", content_type="text/plain; charset=utf-8")
             return
@@ -910,6 +1220,17 @@ class QueueWebHandler(BaseHTTPRequestHandler):
                 CLIENT_SCRIPT.encode("utf-8"),
                 content_type="text/javascript; charset=utf-8",
             )
+            return
+        if run_event:
+            session = self._authorized_session("admin")
+            if session is None:
+                self._send(
+                    HTTPStatus.UNAUTHORIZED,
+                    b"authentication required\n",
+                    content_type="text/plain; charset=utf-8",
+                )
+                return
+            self._send_live_events(f"run-{run_event.group(1)}", session)
             return
         if parsed.path in {"/events/admin", "/events/reserve"}:
             view = parsed.path.rsplit("/", 1)[-1]
@@ -941,6 +1262,24 @@ class QueueWebHandler(BaseHTTPRequestHandler):
             session = self._require("admin")
             if session:
                 self._send(HTTPStatus.OK, self.server.app.render_admin(session, query))
+            return
+        if run_page:
+            session = self._require("admin")
+            if session:
+                try:
+                    page = self.server.app.render_run(session, int(run_page.group(1)))
+                except QueueError as exc:
+                    self._send(
+                        HTTPStatus.NOT_FOUND,
+                        self.server.app._page(
+                            "Run not found",
+                            f'<main class="shell"><h1>Run not found</h1>'
+                            f'<div class="flash error">{_escape(exc)}</div>'
+                            '<a class="button secondary" href="/admin">Back to queue</a></main>',
+                        ),
+                    )
+                else:
+                    self._send(HTTPStatus.OK, page)
             return
         self._send(HTTPStatus.NOT_FOUND, self.server.app._page("Not found", '<main class="shell"><h1>Not found</h1></main>'))
 

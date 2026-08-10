@@ -182,6 +182,23 @@ The two entry points are:
 - `https://<private-mutton2-host>:8443/admin`: David's complete queue, GPU
   pool, dispatch, termination, force-kill, reservation, and audit dashboard.
 
+Every experiment name in the administrator queue links to its own
+`/admin/runs/<queue-item-id>` page. The page shows the frozen queue identity,
+state, timing, paths, dependencies, and item-specific audit history. It also
+shows the latest 128 KiB of the runner's `stdout.log` and `stderr.log`, refreshed
+about every 10 seconds while the page remains open. Before the runner publishes
+its run directory, the stdout panel falls back to the current segment's combined
+queue launcher output so startup and setup failures remain visible. The normal
+runner default uses a pseudo-terminal and therefore merges child stderr into
+`stdout.log`; in that mode `stderr.log` contains the runner's explanatory note.
+Runs launched with `--no-pty` retain separate streams.
+
+When the runner has recorded its pull command, the same page displays it with a
+**Copy rsync command to clipboard** button. Copying is a browser-only action: the
+web service never executes the command. Run pages and their live event streams
+require the administrator role; the shared coworker credential cannot read
+experiment output or synchronization commands.
+
 The coworker password cannot authorize queue admission, priority, allowlist,
 dispatch, termination, or force-kill operations. The required reservation note
 is the self-reported identity because coworkers share one credential. Sessions
