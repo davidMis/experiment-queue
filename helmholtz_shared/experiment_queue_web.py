@@ -454,7 +454,7 @@ CLIENT_SCRIPT = r"""
     const byNewest = (left, right) => number(right, "id") - number(left, "id");
     rows.sort((left, right) => {
       let compared = 0;
-      if (sort === "id-desc") compared = byNewest(left, right);
+      if (sort === "queue" || sort === "id-desc") compared = byNewest(left, right);
       else if (sort === "id-asc") compared = number(left, "id") - number(right, "id");
       else if (sort === "experiment") {
         compared = queueCollator.compare(text(left, "experiment"), text(right, "experiment"));
@@ -466,8 +466,6 @@ CLIENT_SCRIPT = r"""
         compared = number(left, "priority") - number(right, "priority");
       } else if (sort === "gpu") {
         compared = queueCollator.compare(text(left, "gpu") || "zzzz", text(right, "gpu") || "zzzz");
-      } else {
-        compared = number(left, "queueOrder") - number(right, "queueOrder");
       }
       return compared || byNewest(left, right);
     });
@@ -587,7 +585,7 @@ class SchedulerWebApp:
                 "SELECT * FROM gpu_allowlist ORDER BY CAST(last_index AS INTEGER), uuid"
             )]
             items = [dict(row) for row in connection.execute(
-                "SELECT * FROM queue_items ORDER BY resume_front DESC, priority DESC, id DESC"
+                "SELECT * FROM queue_items ORDER BY id DESC"
             )]
             reservations = [dict(row) for row in connection.execute(
                 "SELECT * FROM gpu_reservations ORDER BY id DESC"
@@ -953,7 +951,6 @@ class SchedulerWebApp:
         queue_rows: list[str] = []
         for item in data["items"]:
             item_id = int(item["id"])
-            queue_order = len(queue_rows)
             actions: list[str] = []
             base = f'<input type="hidden" name="csrf" value="{_escape(session.csrf)}"><input type="hidden" name="item_id" value="{item_id}">'
             if item["state"] in PENDING_STATES:
@@ -997,7 +994,7 @@ class SchedulerWebApp:
                 )
             )
             search_value = " ".join(search_value.split())
-            queue_rows.append(f"""<tr data-queue-row data-queue-order="{queue_order}" data-id="{item_id}" data-experiment="{_escape(item['experiment_id'])}" data-state="{_escape(state)}" data-state-group="{state_group}" data-priority="{item['priority']}" data-gpu="{_escape(gpu_index)}" data-search="{_escape(search_value)}"><td>#{item_id}</td><td><a class="run-link" href="/admin/runs/{item_id}">{_escape(item['experiment_id'])}</a><br><span class="tiny muted">attempt {item['attempt']} · segment {item['segment']} · commit {_escape(str(item['git_commit'])[:12])}</span></td>
+            queue_rows.append(f"""<tr data-queue-row data-id="{item_id}" data-experiment="{_escape(item['experiment_id'])}" data-state="{_escape(state)}" data-state-group="{state_group}" data-priority="{item['priority']}" data-gpu="{_escape(gpu_index)}" data-search="{_escape(search_value)}"><td>#{item_id}</td><td><a class="run-link" href="/admin/runs/{item_id}">{_escape(item['experiment_id'])}</a><br><span class="tiny muted">attempt {item['attempt']} · segment {item['segment']} · commit {_escape(str(item['git_commit'])[:12])}</span></td>
 <td><span class="pill">{_escape(item['state'])}</span></td><td>{item['priority']}{' · front' if item['resume_front'] else ''}</td><td>{_escape(item['assigned_gpu_index'] or '—')}</td><td>{_escape(detail)}</td><td><div class="actions">{''.join(actions)}</div></td></tr>""")
         event_rows = "".join(
             f'<div class="event"><span>{_escape(row["created_at"])}</span><strong>{_escape(row["event_type"])}</strong><span>{_escape(row["actor"])} · item {_escape(row["queue_item_id"] or "—")}<br>{_escape(row["payload_json"])}</span></div>'

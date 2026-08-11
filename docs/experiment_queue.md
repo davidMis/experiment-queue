@@ -202,12 +202,12 @@ The administrator queue table has browser-local view controls. Search matches
 queue ID, experiment ID, state, priority, assigned GPU, commit, card path, and
 state detail. State filtering supports all, active, finished, or one exact
 state; GPU filtering supports one currently represented GPU or unassigned
-items. Sorting supports the default dashboard order, priority in either
-direction, newest/oldest, experiment, state, and GPU. The visible-item count and
-no-match message update immediately. These controls survive live table
-replacements for as long as the page remains open, but they do not alter the
-database, priority, or scheduler dispatch order. **Reset** returns to the
-unfiltered default dashboard order.
+items. Sorting defaults to queue-item ID in decreasing order, independent of
+job priority, and also supports priority in either direction, newest/oldest,
+experiment, state, and GPU. The visible-item count and no-match message update
+immediately. These controls survive live table replacements for as long as the
+page remains open, but they do not alter the database, priority, or scheduler
+dispatch order. **Reset** returns to the unfiltered decreasing-ID order.
 
 The coworker password cannot authorize queue admission, priority, allowlist,
 dispatch, termination, or force-kill operations. The required reservation note

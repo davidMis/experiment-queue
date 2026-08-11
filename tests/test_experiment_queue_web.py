@@ -250,6 +250,36 @@ def test_admin_run_page_shows_logs_and_copyable_rsync_command(tmp_path: Path) ->
         app.live_sections("run-1", reservation_session)
 
 
+def test_admin_queue_default_order_is_descending_id_not_priority(tmp_path: Path) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    state_dir = repo_root / "gpu_scheduler_state"
+    store = QueueStore(state_dir, repo_root)
+    _insert_run(store, item_id=1, state="queued")
+    _insert_run(store, item_id=2, state="queued")
+    _insert_run(store, item_id=3, state="queued")
+    with store.connect() as connection:
+        connection.execute(
+            "UPDATE queue_items SET priority = 1000, resume_front = 1 WHERE id = 1"
+        )
+        connection.execute("UPDATE queue_items SET priority = -1000 WHERE id = 3")
+    auth = AuthManager(
+        initialize_web_auth(
+            state_dir,
+            admin_password="administrator-secret",
+            reservation_password="coworker-shared-secret",
+        )
+    )
+    app = SchedulerWebApp(store, auth)
+    app.gpu_snapshots = lambda: ([], None)  # type: ignore[method-assign]
+    _token, admin_session = auth.issue_session("admin")
+
+    page = app.render_admin(admin_session, {}).decode("utf-8")
+
+    assert page.index('data-id="3"') < page.index('data-id="2"') < page.index('data-id="1"')
+    assert 'if (sort === "queue" || sort === "id-desc") compared = byNewest' in CLIENT_SCRIPT
+
+
 def test_running_run_page_falls_back_to_combined_launcher_output(tmp_path: Path) -> None:
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
