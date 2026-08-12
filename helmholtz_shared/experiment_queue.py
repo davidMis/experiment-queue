@@ -16,6 +16,7 @@ import getpass
 import hashlib
 import hmac
 import json
+import math
 import os
 import re
 import shutil
@@ -225,6 +226,20 @@ def _parse_csv_number(value: str, *, field: str) -> float:
         return float(cleaned)
     except ValueError as exc:
         raise QueueError(f"nvidia-smi returned invalid {field}: {value!r}") from exc
+
+
+def _scheduler_float(value: Any, *, field: str) -> float:
+    """Normalize one finite scheduler scalar with an actionable queue error."""
+
+    if isinstance(value, bool):
+        raise QueueError(f"{field} must be a finite number, got {value!r}")
+    try:
+        normalized = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise QueueError(f"{field} must be a finite number, got {value!r}") from exc
+    if not math.isfinite(normalized):
+        raise QueueError(f"{field} must be finite, got {value!r}")
+    return normalized
 
 
 class QueueStore:
@@ -1712,7 +1727,7 @@ def request_gpu_reservation(
 ) -> int:
     """Reserve an idle GPU or cooperatively yield one preemptible queue job."""
 
-    if not isinstance(duration_hours, int) or not (
+    if isinstance(duration_hours, bool) or not isinstance(duration_hours, int) or not (
         MIN_RESERVATION_HOURS <= duration_hours <= MAX_RESERVATION_HOURS
     ):
         raise QueueError(
@@ -1859,9 +1874,15 @@ def request_gpu_reservation(
         except OSError as exc:
             with store.connect() as connection:
                 connection.execute("BEGIN IMMEDIATE")
-                connection.execute(
-                    "UPDATE queue_items SET state = 'running', state_detail = ? WHERE id = ?",
-                    (f"yield request could not be written: {exc}", item_id),
+                restored = connection.execute(
+                    """
+                    UPDATE queue_items SET state = 'running', state_detail = ?,
+                        yield_requested_at = NULL, yield_requested_by = NULL,
+                        yield_request_id = NULL, yield_note = NULL,
+                        yield_duration_hours = NULL
+                    WHERE id = ? AND state = 'yielding' AND yield_request_id = ?
+                    """,
+                    (f"yield request could not be written: {exc}", item_id, request_id),
                 )
                 connection.execute(
                     "UPDATE gpu_reservations SET status = 'failed', state_detail = ? WHERE id = ?",
@@ -1871,7 +1892,11 @@ def request_gpu_reservation(
                     connection,
                     "GPU_RESERVATION_FAILED",
                     queue_item_id=item_id,
-                    payload={"reservation_id": reservation_id, "error": str(exc)},
+                    payload={
+                        "reservation_id": reservation_id,
+                        "error": str(exc),
+                        "item_state_restored": restored.rowcount == 1,
+                    },
                     actor=actor,
                 )
             raise QueueError(f"could not deliver yield request: {exc}") from exc
@@ -1884,7 +1909,7 @@ def release_gpu_reservation(
     *,
     actor: str,
 ) -> None:
-    """Release a pending or active reservation without changing the allowlist."""
+    """Release an active reservation without changing the allowlist."""
 
     with store.connect() as connection:
         connection.execute("BEGIN IMMEDIATE")
@@ -1893,7 +1918,12 @@ def release_gpu_reservation(
         ).fetchone()
         if row is None:
             raise QueueError(f"GPU reservation {reservation_id} does not exist")
-        if row["status"] not in {"pending", "active"}:
+        if row["status"] == "pending":
+            raise QueueError(
+                f"GPU reservation {reservation_id} is still checkpointing; wait until "
+                "the reservation becomes active before releasing it"
+            )
+        if row["status"] != "active":
             raise QueueError(
                 f"GPU reservation {reservation_id} is already {row['status']}"
             )
@@ -2052,14 +2082,66 @@ class Scheduler:
         max_consecutive_failures: int = 2,
         gpu_provider: Callable[[], list[GpuSnapshot]] = query_gpus,
     ):
+        poll_seconds = _scheduler_float(poll_seconds, field="poll_seconds")
+        control_seconds = _scheduler_float(control_seconds, field="control_seconds")
+        min_free_memory_fraction = _scheduler_float(
+            min_free_memory_fraction,
+            field="min_free_memory_fraction",
+        )
+        max_utilization_percent = _scheduler_float(
+            max_utilization_percent,
+            field="max_utilization_percent",
+        )
+        min_free_disk_gib = _scheduler_float(
+            min_free_disk_gib,
+            field="min_free_disk_gib",
+        )
+        termination_grace_seconds = _scheduler_float(
+            termination_grace_seconds,
+            field="termination_grace_seconds",
+        )
+        if poll_seconds <= 0.0:
+            raise QueueError(f"poll_seconds must be finite and positive, got {poll_seconds!r}")
+        if control_seconds <= 0.0:
+            raise QueueError(
+                f"control_seconds must be finite and positive, got {control_seconds!r}"
+            )
+        if not 0.0 <= min_free_memory_fraction <= 1.0:
+            raise QueueError(
+                "min_free_memory_fraction must be finite and between 0 and 1, got "
+                f"{min_free_memory_fraction!r}"
+            )
+        if not 0.0 <= max_utilization_percent <= 100.0:
+            raise QueueError(
+                "max_utilization_percent must be finite and between 0 and 100, got "
+                f"{max_utilization_percent!r}"
+            )
+        if min_free_disk_gib < 0.0:
+            raise QueueError(
+                f"min_free_disk_gib must be finite and nonnegative, got {min_free_disk_gib!r}"
+            )
+        if termination_grace_seconds < 0.0:
+            raise QueueError(
+                "termination_grace_seconds must be finite and nonnegative, got "
+                f"{termination_grace_seconds!r}"
+            )
+        if (
+            isinstance(max_consecutive_failures, bool)
+            or not isinstance(max_consecutive_failures, int)
+            or max_consecutive_failures < 1
+        ):
+            raise QueueError(
+                "max_consecutive_failures must be a positive integer, got "
+                f"{max_consecutive_failures!r}"
+            )
         self.store = store
-        self.poll_seconds = poll_seconds
-        self.control_seconds = control_seconds
-        self.min_free_memory_fraction = min_free_memory_fraction
-        self.max_utilization_percent = max_utilization_percent
-        self.min_free_disk_gib = min_free_disk_gib
-        self.termination_grace_seconds = termination_grace_seconds
-        self.max_consecutive_failures = max_consecutive_failures
+        self.poll_seconds = float(poll_seconds)
+        self.control_seconds = float(control_seconds)
+        self.min_free_memory_fraction = float(min_free_memory_fraction)
+        self.max_utilization_percent = float(max_utilization_percent)
+        self.min_free_disk_gib = float(min_free_disk_gib)
+        self.termination_grace_seconds = float(termination_grace_seconds)
+        self.max_consecutive_failures = int(max_consecutive_failures)
         self.gpu_provider = gpu_provider
         self.processes: dict[int, subprocess.Popen[bytes]] = {}
         self.gpu_locks: dict[str, Any] = {}
@@ -2331,9 +2413,10 @@ class Scheduler:
                     utc_now_iso(),
                     return_code,
                     detail,
-                    runner_receipt.get("run_directory"),
-                    runner_receipt.get("manifest"),
-                    runner_receipt.get("rsync_pull_command"),
+                    runner_receipt.get("run_directory") or item["runner_run_dir"],
+                    runner_receipt.get("manifest") or item["runner_manifest_path"],
+                    runner_receipt.get("rsync_pull_command")
+                    or item["rsync_pull_command"],
                     item["id"],
                 ),
             )

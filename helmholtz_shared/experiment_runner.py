@@ -19,6 +19,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
@@ -283,6 +284,17 @@ def run_experiment(request: ExperimentRequest) -> ExperimentResult:
     cwd = request.cwd.resolve()
     output_root = _resolve_from_cwd(request.output_root, cwd)
     resolved_config_paths = resolve_config_paths(request.config_paths, cwd)
+    resolved_output_root = output_root.resolve()
+    for config_path in resolved_config_paths:
+        resolved_config = config_path.resolve()
+        if config_path.is_dir() and (
+            resolved_config == resolved_output_root
+            or resolved_config in resolved_output_root.parents
+        ):
+            raise ExperimentError(
+                f"config directory {config_path} contains output root {output_root}; "
+                "select a narrower config directory to avoid recursively copying the run"
+            )
 
     git_context = collect_git_context(cwd)
     if request.require_clean:
@@ -312,13 +324,12 @@ def run_experiment(request: ExperimentRequest) -> ExperimentResult:
     append_logs = continuation is not None
     if continuation is None:
         _ensure_output_root(output_root)
-        run_id, run_dir = _choose_run_dir(
+        run_id, run_dir = _create_run_dir(
             output_root=output_root,
             timestamp=_timestamp_for_id(),
             name=request.name,
             short_commit=str(git_context.get("short_commit") or ""),
         )
-        run_dir.mkdir(parents=True)
         copied_configs = copy_config_paths(resolved_config_paths, run_dir)
         write_git_snapshots(git_context, cwd, run_dir)
         rsync_pull_command = build_rsync_pull_command(
@@ -358,36 +369,11 @@ def run_experiment(request: ExperimentRequest) -> ExperimentResult:
     manifest["run"]["status"] = "running"
     manifest["run"]["finished_at"] = None
     manifest["run"]["return_code"] = None
-    write_manifest(manifest_path, manifest)
-
     started = time.monotonic()
-    try:
-        with _translate_termination_signals_to_interrupt():
-            return_code = launch_and_stream(
-                request.command,
-                cwd,
-                run_dir,
-                run_id,
-                use_pty=request.use_pty,
-                append=append_logs,
-            )
-        if return_code == 0:
-            status = "succeeded"
-        elif (
-            return_code == YIELD_EXIT_CODE
-            and os.environ.get(YIELD_RECEIPT_ENV)
-        ):
-            status = "yielded"
-        elif return_code == 130:
-            status = "interrupted"
-        else:
-            status = "failed"
-    except KeyboardInterrupt:
-        return_code = 130
-        status = "interrupted"
-    except OSError as exc:
-        return_code = 127
-        status = "launch_failed"
+
+    def finish_manifest(status: str, return_code: int) -> None:
+        """Record one terminal segment while the runner owns signal handling."""
+
         duration = round(time.monotonic() - started, 3)
         segment.update(
             status=status,
@@ -405,27 +391,43 @@ def run_experiment(request: ExperimentRequest) -> ExperimentResult:
             ),
         )
         write_manifest(manifest_path, manifest)
-        raise ExperimentError(
-            f"could not start command {request.command[0]!r}: {exc.strerror or exc}"
-        ) from exc
 
-    duration = round(time.monotonic() - started, 3)
-    segment.update(
-        status=status,
-        return_code=return_code,
-        finished_at=utc_now_iso(),
-        duration_seconds=duration,
-    )
-    manifest["run"].update(
-        status=status,
-        return_code=return_code,
-        finished_at=segment["finished_at"],
-        duration_seconds=round(
-            sum(float(row.get("duration_seconds") or 0.0) for row in manifest["segments"]),
-            3,
-        ),
-    )
-    write_manifest(manifest_path, manifest)
+    with _translate_termination_signals_to_interrupt():
+        try:
+            # Publish only after termination signals have a cleanup handler;
+            # monitoring code treats manifest visibility as launch readiness.
+            write_manifest(manifest_path, manifest)
+            try:
+                return_code = launch_and_stream(
+                    request.command,
+                    cwd,
+                    run_dir,
+                    run_id,
+                    use_pty=request.use_pty,
+                    append=append_logs,
+                )
+            except OSError as exc:
+                return_code = 127
+                finish_manifest("launch_failed", return_code)
+                raise ExperimentError(
+                    f"could not start command {request.command[0]!r}: "
+                    f"{exc.strerror or exc}"
+                ) from exc
+            if return_code == 0:
+                status = "succeeded"
+            elif (
+                return_code == YIELD_EXIT_CODE
+                and os.environ.get(YIELD_RECEIPT_ENV)
+            ):
+                status = "yielded"
+            elif return_code == 130:
+                status = "interrupted"
+            else:
+                status = "failed"
+            finish_manifest(status, return_code)
+        except KeyboardInterrupt:
+            return_code = 130
+            finish_manifest("interrupted", return_code)
 
     return ExperimentResult(
         run_id=run_id,
@@ -759,6 +761,7 @@ def copy_config_paths(
                 source_path,
                 target,
                 ignore=shutil.ignore_patterns("__pycache__", "*.pyc", ".pytest_cache"),
+                symlinks=True,
             )
         else:
             shutil.copy2(source_path, target)
@@ -806,17 +809,45 @@ def build_rsync_pull_command(
         return None
 
     local_destination = local_output_root / run_id
+    remote_source = f"{remote}:{remote_run_dir}/"
+    local_target = f"{local_destination}/"
     return (
-        "rsync -avh --progress "
-        f"{remote}:{shlex.quote(str(remote_run_dir))}/ "
-        f"{shlex.quote(str(local_destination))}/"
+        "rsync -avh --progress -- "
+        f"{shlex.quote(remote_source)} "
+        f"{shlex.quote(local_target)}"
     )
 
 
 def write_manifest(path: Path, manifest: dict[str, Any]) -> None:
-    """Write a stable, human-readable JSON manifest."""
+    """Atomically replace a stable, human-readable JSON manifest."""
 
-    path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+            handle.write(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+        try:
+            mode = path.stat().st_mode & 0o777
+        except FileNotFoundError:
+            # NamedTemporaryFile creates mode 0600. Keep that conservative
+            # default rather than overriding a caller's restrictive umask.
+            pass
+        else:
+            temporary.chmod(mode)
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
 
 
 def slugify(value: str) -> str:
@@ -836,13 +867,15 @@ def _timestamp_for_id() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 
 
-def _choose_run_dir(
+def _create_run_dir(
     *,
     output_root: Path,
     timestamp: str,
     name: str,
     short_commit: str,
 ) -> tuple[str, Path]:
+    """Atomically claim one unique run directory across concurrent runners."""
+
     parts = [timestamp, slugify(name)]
     if short_commit:
         parts.append(short_commit)
@@ -851,9 +884,15 @@ def _choose_run_dir(
     for index in range(1, 1000):
         run_id = base_run_id if index == 1 else f"{base_run_id}_{index:03d}"
         run_dir = output_root / run_id
-        if not run_dir.exists():
+        try:
+            run_dir.mkdir()
+        except FileExistsError:
+            continue
+        except OSError as exc:
+            raise ExperimentError(f"could not create run directory {run_dir}: {exc}") from exc
+        else:
             return run_id, run_dir
-    raise ExperimentError(f"could not choose an unused run directory under {output_root}")
+    raise ExperimentError(f"could not create an unused run directory under {output_root}")
 
 
 def _ensure_output_root(output_root: Path) -> None:

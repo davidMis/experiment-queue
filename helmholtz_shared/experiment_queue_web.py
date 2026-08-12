@@ -20,6 +20,7 @@ import re
 import secrets
 import ssl
 import tempfile
+import threading
 import time
 from typing import Any, Mapping, Sequence
 from urllib.parse import parse_qs, urlencode, urlparse
@@ -568,7 +569,8 @@ class SchedulerWebApp:
         self.store = store
         self.auth = auth
         self.nvidia_smi = nvidia_smi
-        self.login_failures: dict[str, list[float]] = {}
+        self.login_failures: dict[tuple[str, str], list[float]] = {}
+        self._login_failure_lock = threading.Lock()
 
     def gpu_snapshots(self) -> tuple[list[GpuSnapshot], str | None]:
         try:
@@ -879,8 +881,14 @@ class SchedulerWebApp:
                 card_class, status = "reserved", (
                     "checkpointing" if reservation["status"] == "pending" else "reserved"
                 )
-                action = f"""<p><strong>{_escape(reservation['note'])}</strong><br>
-<span class="muted">{_escape(_format_remaining(reservation['expires_at']))}</span></p>
+                reservation_detail = f"""<p><strong>{_escape(reservation['note'])}</strong><br>
+<span class="muted">{_escape(_format_remaining(reservation['expires_at']))}</span></p>"""
+                if reservation["status"] == "pending":
+                    action = reservation_detail + (
+                        '<p class="muted">Release is available after checkpointing finishes.</p>'
+                    )
+                else:
+                    action = reservation_detail + f"""
 <form method="post" action="/reserve/release"><input type="hidden" name="csrf" value="{_escape(session.csrf)}">
 <input type="hidden" name="reservation_id" value="{reservation['id']}"><button class="secondary" type="submit">Release early</button></form>"""
             elif job:
@@ -1179,17 +1187,29 @@ class SchedulerWebApp:
             return f"Reservation {reservation_id} released"
         raise QueueError(f"unknown reservation action {route}")
 
-    def login_allowed(self, client: str) -> bool:
+    def begin_login_attempt(self, client: str, role: str) -> bool:
+        """Atomically reserve one attempt within the per-client, per-role window."""
+
+        if role not in {"admin", "reservation"}:
+            raise QueueError(f"unknown web role {role!r}")
         now = time.monotonic()
-        recent = [stamp for stamp in self.login_failures.get(client, []) if now - stamp < LOGIN_WINDOW_SECONDS]
-        self.login_failures[client] = recent
-        return len(recent) < LOGIN_MAX_FAILURES
+        key = (client, role)
+        with self._login_failure_lock:
+            recent = [
+                stamp
+                for stamp in self.login_failures.get(key, [])
+                if now - stamp < LOGIN_WINDOW_SECONDS
+            ]
+            if len(recent) >= LOGIN_MAX_FAILURES:
+                self.login_failures[key] = recent
+                return False
+            recent.append(now)
+            self.login_failures[key] = recent
+            return True
 
-    def login_failed(self, client: str) -> None:
-        self.login_failures.setdefault(client, []).append(time.monotonic())
-
-    def login_succeeded(self, client: str) -> None:
-        self.login_failures.pop(client, None)
+    def login_succeeded(self, client: str, role: str) -> None:
+        with self._login_failure_lock:
+            self.login_failures.pop((client, role), None)
 
 
 class QueueWebServer(ThreadingHTTPServer):
@@ -1332,7 +1352,16 @@ class QueueWebHandler(BaseHTTPRequestHandler):
             raise QueueError("invalid request length") from exc
         if length <= 0 or length > MAX_FORM_BYTES:
             raise QueueError(f"request body must be between 1 and {MAX_FORM_BYTES} bytes")
-        return parse_qs(self.rfile.read(length).decode("utf-8"), keep_blank_values=True)
+        body = self.rfile.read(length)
+        if len(body) != length:
+            raise QueueError(
+                f"incomplete request body: expected {length} bytes, received {len(body)}"
+            )
+        try:
+            decoded = body.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise QueueError("request body must contain valid UTF-8") from exc
+        return parse_qs(decoded, keep_blank_values=True)
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
@@ -1421,14 +1450,13 @@ class QueueWebHandler(BaseHTTPRequestHandler):
         if parsed.path in {"/login/admin", "/login/reservation"}:
             role = parsed.path.rsplit("/", 1)[-1]
             client = self.client_address[0]
-            if not self.server.app.login_allowed(client):
+            if not self.server.app.begin_login_attempt(client, role):
                 self._send(HTTPStatus.TOO_MANY_REQUESTS, self.server.app.render_login(role, error="Too many failed attempts; wait five minutes."))
                 return
             if not self.server.app.auth.verify_password(role, _field(form, "password")):
-                self.server.app.login_failed(client)
                 self._send(HTTPStatus.UNAUTHORIZED, self.server.app.render_login(role, error="Incorrect password."))
                 return
-            self.server.app.login_succeeded(client)
+            self.server.app.login_succeeded(client, role)
             token, _session = self.server.app.auth.issue_session(role)
             self._redirect("/admin" if role == "admin" else "/reserve", cookie=self._cookie(token))
             return

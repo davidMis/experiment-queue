@@ -13,6 +13,7 @@ import time
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
+from unittest import mock
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -33,6 +34,7 @@ from helmholtz_shared.experiment_queue import (  # noqa: E402
     list_reservations,
     query_gpus,
     read_card_command,
+    release_gpu_reservation,
     remove_item,
     request_termination,
     request_gpu_reservation,
@@ -219,6 +221,26 @@ class ExperimentQueueTests(unittest.TestCase):
             self.assertEqual(active.execute("SELECT 1").fetchone()[0], 1)
         with self.assertRaisesRegex(sqlite3.ProgrammingError, "closed database"):
             connection.execute("SELECT 1")
+
+    def test_scheduler_rejects_invalid_tuning_values(self) -> None:
+        invalid_options = (
+            ("poll_seconds", 0.0),
+            ("poll_seconds", "not-a-number"),
+            ("control_seconds", float("nan")),
+            ("control_seconds", True),
+            ("min_free_memory_fraction", 1.1),
+            ("max_utilization_percent", float("inf")),
+            ("max_utilization_percent", 101.0),
+            ("min_free_disk_gib", -1.0),
+            ("termination_grace_seconds", -1.0),
+            ("max_consecutive_failures", 0),
+            ("max_consecutive_failures", 1.5),
+            ("max_consecutive_failures", True),
+        )
+        for field, value in invalid_options:
+            with self.subTest(field=field, value=value):
+                with self.assertRaisesRegex(QueueError, field):
+                    Scheduler(self.repo.store, **{field: value})
 
     @staticmethod
     def gpu(index: str = "0", uuid: str = "GPU-test-0000") -> GpuSnapshot:
@@ -687,6 +709,119 @@ class ExperimentQueueTests(unittest.TestCase):
                 "SELECT enabled FROM gpu_allowlist WHERE uuid = ?", (gpu.uuid,)
             ).fetchone()
         self.assertEqual(allowed["enabled"], 1)
+
+    def test_gpu_reservation_duration_rejects_boolean_values(self) -> None:
+        with self.assertRaisesRegex(QueueError, "whole number"):
+            request_gpu_reservation(
+                self.repo.store,
+                "GPU-test-0000",
+                duration_hours=True,
+                note="Alex — short benchmark",
+                actor="web:reservation",
+            )
+
+    def test_pending_gpu_reservation_cannot_be_released_mid_checkpoint(self) -> None:
+        gpu = self.gpu()
+        update_gpu_allowlist(self.repo.store, "set", ["0"], snapshots=[gpu])
+        item_id = add_experiment(
+            self.repo.store,
+            "TST-007",
+            preemptible=True,
+        )
+        with self.repo.store.connect() as connection:
+            connection.execute(
+                "UPDATE queue_items SET state = 'running', assigned_gpu_uuid = ?, "
+                "assigned_gpu_index = ? WHERE id = ?",
+                (gpu.uuid, gpu.index, item_id),
+            )
+        reservation_id = request_gpu_reservation(
+            self.repo.store,
+            gpu.uuid,
+            duration_hours=2,
+            note="Alex — short benchmark",
+            actor="web:reservation",
+            snapshots=[gpu],
+        )
+
+        with self.assertRaisesRegex(QueueError, "still checkpointing"):
+            release_gpu_reservation(
+                self.repo.store,
+                reservation_id,
+                actor="web:reservation",
+            )
+
+        reservation = list_reservations(self.repo.store)[0]
+        self.assertEqual(reservation["status"], "pending")
+        self.assertEqual(self.repo.store.item(item_id)["state"], "yielding")
+
+    def test_failed_yield_delivery_does_not_clobber_concurrent_termination(self) -> None:
+        gpu = self.gpu()
+        update_gpu_allowlist(self.repo.store, "set", ["0"], snapshots=[gpu])
+        item_id = add_experiment(self.repo.store, "TST-007", preemptible=True)
+        with self.repo.store.connect() as connection:
+            connection.execute(
+                "UPDATE queue_items SET state = 'running', assigned_gpu_uuid = ?, "
+                "assigned_gpu_index = ? WHERE id = ?",
+                (gpu.uuid, gpu.index, item_id),
+            )
+
+        def fail_after_termination(_path, _payload) -> None:
+            with self.repo.store.connect() as connection:
+                connection.execute(
+                    "UPDATE queue_items SET state = 'terminating', state_detail = ? WHERE id = ?",
+                    ("admin requested termination", item_id),
+                )
+            raise OSError("simulated request write failure")
+
+        with mock.patch(
+            "helmholtz_shared.experiment_queue._atomic_write_json",
+            side_effect=fail_after_termination,
+        ):
+            with self.assertRaisesRegex(QueueError, "could not deliver yield request"):
+                request_gpu_reservation(
+                    self.repo.store,
+                    gpu.uuid,
+                    duration_hours=2,
+                    note="Alex — short benchmark",
+                    actor="web:reservation",
+                    snapshots=[gpu],
+                )
+
+        item = self.repo.store.item(item_id)
+        self.assertEqual(item["state"], "terminating")
+        self.assertEqual(item["state_detail"], "admin requested termination")
+        self.assertEqual(list_reservations(self.repo.store)[0]["status"], "failed")
+
+    def test_terminal_continuation_preserves_original_runner_receipt_paths(self) -> None:
+        item_id = add_experiment(self.repo.store, "TST-001")
+        run_dir = self.repo.root / "outputs" / "experiments" / "original-run"
+        manifest = run_dir / "manifest.json"
+        pull_command = "rsync -av mutton2:original-run local-output"
+        with self.repo.store.connect() as connection:
+            connection.execute(
+                """
+                UPDATE queue_items SET state = 'terminating', segment = 2,
+                    runner_run_dir = ?, runner_manifest_path = ?, rsync_pull_command = ?
+                WHERE id = ?
+                """,
+                (str(run_dir), str(manifest), pull_command, item_id),
+            )
+        scheduler = Scheduler(
+            self.repo.store,
+            min_free_disk_gib=0,
+            gpu_provider=lambda: [],
+        )
+
+        scheduler._finalize_item(  # noqa: SLF001 - focused recovery regression test
+            self.repo.store.item(item_id),
+            {"return_code": 130},
+        )
+
+        item = self.repo.store.item(item_id)
+        self.assertEqual(item["state"], "interrupted")
+        self.assertEqual(item["runner_run_dir"], str(run_dir))
+        self.assertEqual(item["runner_manifest_path"], str(manifest))
+        self.assertEqual(item["rsync_pull_command"], pull_command)
 
     @unittest.skipIf(os.name != "posix", "cooperative subprocess yield is POSIX-specific")
     def test_yield_checkpoints_reserves_old_gpu_and_resumes_at_queue_front(self) -> None:

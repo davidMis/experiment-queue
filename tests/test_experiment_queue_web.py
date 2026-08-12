@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
@@ -94,6 +95,37 @@ def test_two_role_auth_hashes_passwords_and_signs_expiring_sessions(tmp_path: Pa
     assert auth.verify_session(token, now_epoch=101) == session
     assert auth.verify_session(token + "changed", now_epoch=101) is None
     assert auth.verify_session(token, now_epoch=session.expires_epoch) is None
+
+
+def test_login_attempt_limit_is_atomic_across_handler_threads(tmp_path: Path) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    state_dir = repo_root / "gpu_scheduler_state"
+    store = QueueStore(state_dir, repo_root)
+    auth = AuthManager(
+        initialize_web_auth(
+            state_dir,
+            admin_password="administrator-secret",
+            reservation_password="coworker-shared-secret",
+        )
+    )
+    app = SchedulerWebApp(store, auth)
+
+    with ThreadPoolExecutor(max_workers=16) as executor:
+        admitted = list(
+            executor.map(
+                lambda client: app.begin_login_attempt(client, "admin"),
+                ["192.0.2.1"] * 32,
+            )
+        )
+
+    assert sum(admitted) == 8
+    assert app.begin_login_attempt("192.0.2.1", "admin") is False
+    assert app.begin_login_attempt("192.0.2.1", "reservation") is True
+    app.login_succeeded("192.0.2.1", "reservation")
+    assert app.begin_login_attempt("192.0.2.1", "admin") is False
+    app.login_succeeded("192.0.2.1", "admin")
+    assert app.begin_login_attempt("192.0.2.1", "admin") is True
 
 
 def test_reservation_page_and_admin_actions_use_same_durable_queue(tmp_path: Path) -> None:
@@ -413,6 +445,25 @@ def test_authenticated_event_stream_pushes_status_without_page_reload(
     assert b"id: 7\n" in event_stream
     assert b'\"reserve\":\"<section>live status</section>\"' in event_stream
     assert handler.close_connection is True
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    ((b"", "incomplete request body"), (b"\xff", "valid UTF-8")),
+)
+def test_form_parser_rejects_incomplete_or_malformed_bodies(
+    body: bytes,
+    expected: str,
+) -> None:
+    handler = QueueWebHandler.__new__(QueueWebHandler)
+    handler.headers = {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Content-Length": "1",
+    }
+    handler.rfile = BytesIO(body)
+
+    with pytest.raises(QueueError, match=expected):
+        handler._form()  # noqa: SLF001 - direct parser boundary regression test
 
 
 def test_https_is_required_except_for_explicit_loopback_testing(tmp_path: Path) -> None:

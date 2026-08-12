@@ -1,13 +1,13 @@
-# This test module verifies the lightweight experiment runner's core behavior.
-# It uses temporary directories and subprocesses so tests exercise real manifest,
-# log, config-copy, and rsync-command generation without requiring a GPU.
+"""Exercise runner manifests, subprocess logs, configs, and sync commands."""
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import contextlib
 import io
 import json
 import os
+import shlex
 import signal
 import subprocess
 import sys
@@ -23,9 +23,12 @@ from helmholtz_shared.experiment_runner import (  # noqa: E402
     DEFAULT_USE_PTY,
     ExperimentError,
     ExperimentRequest,
+    _create_run_dir,
+    build_rsync_pull_command,
     build_arg_parser,
     run_experiment,
     slugify,
+    write_manifest,
 )
 
 
@@ -36,6 +39,83 @@ class ExperimentRunnerTests(unittest.TestCase):
         self.assertEqual(slugify("Baseline GPU Run"), "baseline-gpu-run")
         self.assertEqual(slugify("  weird/value!!  "), "weird-value")
         self.assertEqual(slugify("!!!"), "run")
+
+    def test_write_manifest_atomically_replaces_existing_content(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "manifest.json"
+            path.write_text('{"status": "old"}\n', encoding="utf-8")
+            path.chmod(0o640)
+
+            write_manifest(path, {"status": "new", "attempt": 2})
+
+            self.assertEqual(
+                json.loads(path.read_text(encoding="utf-8")),
+                {"attempt": 2, "status": "new"},
+            )
+            self.assertEqual(path.stat().st_mode & 0o777, 0o640)
+            self.assertEqual(list(path.parent.glob(".manifest.json.*.tmp")), [])
+
+    def test_new_manifest_keeps_private_temporary_file_permissions(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "manifest.json"
+            previous_umask = os.umask(0o077)
+            try:
+                write_manifest(path, {"status": "new"})
+            finally:
+                os.umask(previous_umask)
+
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_write_manifest_supports_concurrent_same_process_writers(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "manifest.json"
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                list(
+                    executor.map(
+                        lambda index: write_manifest(path, {"writer": index}),
+                        range(8),
+                    )
+                )
+
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            self.assertIn(payload["writer"], range(8))
+            self.assertEqual(list(path.parent.glob(".manifest.json.*.tmp")), [])
+
+    def test_rsync_command_quotes_remote_and_local_operands_as_whole_arguments(self) -> None:
+        command = build_rsync_pull_command(
+            remote="host;echo unsafe",
+            remote_run_dir=Path("/remote/run with spaces"),
+            local_output_root=Path("local output"),
+            run_id="run-id",
+        )
+
+        self.assertIsNotNone(command)
+        arguments = shlex.split(str(command))
+        self.assertEqual(arguments[-3], "--")
+        self.assertEqual(arguments[-2], "host;echo unsafe:/remote/run with spaces/")
+        self.assertEqual(arguments[-1], "local output/run-id/")
+
+    def test_run_directory_claim_skips_an_already_claimed_name(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_root = Path(temp_dir)
+
+            first_id, first_path = _create_run_dir(
+                output_root=output_root,
+                timestamp="20260811_120000",
+                name="same run",
+                short_commit="abc12345",
+            )
+            second_id, second_path = _create_run_dir(
+                output_root=output_root,
+                timestamp="20260811_120000",
+                name="same run",
+                short_commit="abc12345",
+            )
+
+            self.assertEqual(first_id, "20260811_120000_same-run_abc12345")
+            self.assertEqual(second_id, "20260811_120000_same-run_abc12345_002")
+            self.assertTrue(first_path.is_dir())
+            self.assertTrue(second_path.is_dir())
 
     def test_run_experiment_creates_manifest_logs_configs_and_rsync(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -105,6 +185,49 @@ class ExperimentRunnerTests(unittest.TestCase):
                 run_experiment(request)
 
             self.assertFalse((root / "outputs").exists())
+
+    def test_config_directory_cannot_contain_the_output_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            request = ExperimentRequest(
+                name="Recursive Config",
+                command=[sys.executable, "-c", "print('should not run')"],
+                output_root=root / "outputs",
+                config_paths=[root],
+                cwd=root,
+            )
+
+            with self.assertRaisesRegex(ExperimentError, "recursively copying"):
+                run_experiment(request)
+
+            self.assertFalse((root / "outputs").exists())
+
+    @unittest.skipIf(os.name == "nt", "symlink behavior is POSIX-specific")
+    def test_config_directory_copies_symlink_without_following_output_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config_dir = root / "config"
+            config_dir.mkdir()
+            (config_dir / "output-link").symlink_to(
+                root / "outputs",
+                target_is_directory=True,
+            )
+            request = ExperimentRequest(
+                name="Symlink Config",
+                command=[sys.executable, "-c", "print('done')"],
+                output_root=root / "outputs",
+                config_paths=[config_dir],
+                cwd=root,
+            )
+
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(
+                io.StringIO()
+            ):
+                result = run_experiment(request)
+
+            copied_link = result.run_dir / "configs" / "config" / "output-link"
+            self.assertTrue(copied_link.is_symlink())
+            self.assertEqual(copied_link.readlink(), root / "outputs")
 
     def test_require_clean_requires_git_worktree(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
