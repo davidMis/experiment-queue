@@ -312,6 +312,51 @@ def test_admin_queue_default_order_is_descending_id_not_priority(tmp_path: Path)
     assert 'if (sort === "queue" || sort === "id-desc") compared = byNewest' in CLIENT_SCRIPT
 
 
+def test_admin_queue_color_codes_every_job_state_in_both_themes(tmp_path: Path) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    state_dir = repo_root / "gpu_scheduler_state"
+    store = QueueStore(state_dir, repo_root)
+    states = (
+        "queued",
+        "held",
+        "blocked",
+        "starting",
+        "running",
+        "yielding",
+        "terminating",
+        "force_killing",
+        "succeeded",
+        "failed",
+        "interrupted",
+        "force_killed",
+        "removed",
+    )
+    for item_id, state in enumerate(states, start=1):
+        _insert_run(store, item_id=item_id, state=state)
+    auth = AuthManager(
+        initialize_web_auth(
+            state_dir,
+            admin_password="administrator-secret",
+            reservation_password="coworker-shared-secret",
+        )
+    )
+    app = SchedulerWebApp(store, auth)
+    app.gpu_snapshots = lambda: ([], None)  # type: ignore[method-assign]
+    _token, admin_session = auth.issue_session("admin")
+
+    page = app.render_admin(admin_session, {}).decode("utf-8")
+
+    for state in states:
+        css_state = state.replace("_", "-")
+        assert f'class="pill state-pill state-{css_state}"' in page
+        assert f'aria-label="State: {state}"' in page
+        assert f".state-{css_state}" in page
+    assert page.count('class="state-dot" aria-hidden="true"') == len(states)
+    assert page.count("--state-running-bg:") == 2
+    assert page.count("--state-force-bg:") == 2
+
+
 def test_running_run_page_falls_back_to_combined_launcher_output(tmp_path: Path) -> None:
     repo_root = tmp_path / "repo"
     repo_root.mkdir()

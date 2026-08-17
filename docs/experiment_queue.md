@@ -207,7 +207,9 @@ job priority, and also supports priority in either direction, newest/oldest,
 experiment, state, and GPU. The visible-item count and no-match message update
 immediately. These controls survive live table replacements for as long as the
 page remains open, but they do not alter the database, priority, or scheduler
-dispatch order. **Reset** returns to the unfiltered decreasing-ID order.
+dispatch order. **Reset** returns to the unfiltered decreasing-ID order. Job
+state badges use a consistent, theme-aware color palette while retaining their
+text labels, including during live table and run-detail updates.
 
 The coworker password cannot authorize queue admission, priority, allowlist,
 dispatch, termination, or force-kill operations. The required reservation note
