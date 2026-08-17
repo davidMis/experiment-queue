@@ -348,6 +348,10 @@ class ExperimentQueueTests(unittest.TestCase):
             "HNO-SPECFEM-W05-002",
             "HNO-SPECFEM-W06-002",
             "HNO-SPECFEM-W07-002",
+            "HNO-SPECFEM-W00-003",
+            "HNO-SPECFEM-W01-003",
+            "HNO-SPECFEM-W02-003",
+            "HNO-SPECFEM-W03-003",
         ):
             with self.subTest(experiment_id=experiment_id):
                 card = read_card_command(REPO_ROOT, experiment_id)
