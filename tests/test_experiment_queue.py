@@ -261,6 +261,25 @@ class ExperimentQueueTests(unittest.TestCase):
         self.assertIn("scripts/run_experiment.py", card.command_text)
         self.assertEqual(self.repo.store.list_items(), [])
 
+    def test_card_rejects_doubled_shell_line_continuation(self) -> None:
+        experiment_id = "TST-008"
+        card = self.repo.root / "docs" / "experiments" / f"{experiment_id}.md"
+        card.write_text(
+            f"# {experiment_id}: Invalid Continuation\n\n"
+            "## Exact Manual Command On Mutton2\n\n"
+            "```bash\n"
+            "cd ~/3D_Helmholtz\n"
+            "python3 scripts/run_experiment.py \\\\\n"
+            "  --name invalid --require-clean --remote mutton2 -- python3 -V\n"
+            "```\n",
+            encoding="utf-8",
+        )
+        self.repo._git("add", str(card.relative_to(self.repo.root)))
+        self.repo._git("commit", "-qm", "add invalid continuation card")
+
+        with self.assertRaisesRegex(QueueError, "doubled trailing backslash"):
+            read_card_command(self.repo.root, experiment_id)
+
     def test_v1_database_migrates_in_place_for_reservations_and_segments(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -321,6 +340,14 @@ class ExperimentQueueTests(unittest.TestCase):
             "WCG-022",
             "WCG-023",
             "WCG-024",
+            "HNO-SPECFEM-W00-002",
+            "HNO-SPECFEM-W01-002",
+            "HNO-SPECFEM-W02-002",
+            "HNO-SPECFEM-W03-002",
+            "HNO-SPECFEM-W04-002",
+            "HNO-SPECFEM-W05-002",
+            "HNO-SPECFEM-W06-002",
+            "HNO-SPECFEM-W07-002",
         ):
             with self.subTest(experiment_id=experiment_id):
                 card = read_card_command(REPO_ROOT, experiment_id)

@@ -1113,6 +1113,12 @@ def read_card_command(repo_root: Path, experiment_id: str, card_path: Path | Non
             f"found {len(blocks)}"
         )
     command_text = blocks[0].strip()
+    if re.search(r"\\\\[ \t]*$", command_text, flags=re.MULTILINE):
+        raise QueueError(
+            "card command contains a doubled trailing backslash; use exactly "
+            "one backslash for each shell line continuation in "
+            f"{absolute}"
+        )
     required_fragments = ("scripts/run_experiment.py", "--require-clean", "--remote mutton2")
     missing = [fragment for fragment in required_fragments if fragment not in command_text]
     if missing:
