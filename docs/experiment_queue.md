@@ -315,17 +315,24 @@ unambiguous, so a resumed or replacement worker neither skips nor duplicates a
 unit.
 
 `scripts/run_hno_specfem_pipeline.py --role consumer` implements this contract
-at a settled SPECFEM row. A reservation request waits for the in-flight row and
-its cleanup receipt, after which the worker exits 75 and may resume on another
-eligible GPU against the same shared root. An explicit queue `terminate` or
-`kill` is different: it interrupts the process immediately and does not create
-an automatic continuation segment. A handled terminate stops the registered
-solver child. A force-killed Python owner cannot do that cleanup, and its
-separate-session SPECFEM child may remain alive; released pipeline locks alone
-must never trigger deletion of that attempt. The shared ledger can recover the
-row, but the operator must use the recorded new-attempt workflow for the
-terminal queue item and verify child termination before cleaning its partial
-work or admitting a replacement for that worker.
+at a safe SPECFEM GPU handoff. In legacy mode, a reservation request waits for
+the in-flight row and cleanup receipt. In compact-production mode, it may exit
+75 immediately after the immutable raw success terminal, while the CPU-only
+assembler still owns compact commitment and cache cleanup. That receipt keeps
+the prior `settled_rows` count—possibly zero—because the raw row is not yet
+settled. A resumed segment validates the same pipeline/assembly plans and
+destination, accepts progress peers made while it was absent, and never repeats
+the solve. If that row completes the entire plan's GPU work, the consumer exits
+normally instead of creating an unnecessary continuation; CPU-only assembly
+continues independently. An explicit queue `terminate` or `kill` is different: it interrupts
+the process immediately and does not create an automatic continuation segment.
+A handled terminate stops the registered solver child. A force-killed Python
+owner cannot do that cleanup, and its separate-session SPECFEM child may remain
+alive; released pipeline locks alone must never trigger deletion of that
+attempt. The shared ledger can recover the row, but the operator must use the
+recorded new-attempt workflow for the terminal queue item and verify child
+termination before cleaning its partial work or admitting a replacement for
+that worker.
 
 The yielded GPU is excluded while the reservation is pending or active. The
 front item may therefore resume on another eligible idle GPU. The experiment
