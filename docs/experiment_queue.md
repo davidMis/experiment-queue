@@ -322,9 +322,13 @@ assembler still owns compact commitment and cache cleanup. That receipt keeps
 the prior `settled_rows` count—possibly zero—because the raw row is not yet
 settled. A resumed segment validates the same pipeline/assembly plans and
 destination, accepts progress peers made while it was absent, and never repeats
-the solve. If that row completes the entire plan's GPU work, the consumer exits
-normally instead of creating an unnecessary continuation; CPU-only assembly
-continues independently. An explicit queue `terminate` or `kill` is different: it interrupts
+the solve. Under the rolling v4/v2 compact policy, that no-resolve barrier is
+the immutable success terminal: a resumed worker still accepts it after the
+CPU assembler has fully validated the sealed destination shard and retired the
+raw NPZ through its authorization/completion chain. If that row completes the
+entire plan's GPU work, the consumer exits normally instead of creating an
+unnecessary continuation; CPU-only assembly and retirement continue
+independently. An explicit queue `terminate` or `kill` is different: it interrupts
 the process immediately and does not create an automatic continuation segment.
 A handled terminate stops the registered solver child. A force-killed Python
 owner cannot do that cleanup, and its separate-session SPECFEM child may remain
