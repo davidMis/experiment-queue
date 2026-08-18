@@ -69,6 +69,7 @@ TERMINAL_STATES = {"succeeded", "failed", "interrupted", "force_killed", "remove
 SUCCESS_STATE = "succeeded"
 CARD_COMMAND_HEADING = "## Exact Manual Command On Mutton2"
 YIELD_EXIT_CODE = 75
+YIELD_PROGRESS_UNIT_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,31}")
 MIN_RESERVATION_HOURS = 1
 MAX_RESERVATION_HOURS = 24
 WORKTREE_CLEANUP_RETRY_SECONDS = 60
@@ -240,6 +241,34 @@ def _scheduler_float(value: Any, *, field: str) -> float:
     if not math.isfinite(normalized):
         raise QueueError(f"{field} must be finite, got {value!r}")
     return normalized
+
+
+def _validated_yield_progress(
+    receipt: Mapping[str, Any],
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Normalize optional workflow progress without trusting display text."""
+
+    if "progress" not in receipt:
+        return None, None
+    progress = receipt.get("progress")
+    if not isinstance(progress, Mapping):
+        return None, "yield receipt progress must be an object"
+    unit = progress.get("unit")
+    if not isinstance(unit, str) or not YIELD_PROGRESS_UNIT_PATTERN.fullmatch(unit):
+        return None, (
+            "yield receipt progress unit must be a 1-32 character ASCII token "
+            "starting with a letter"
+        )
+    completed = progress.get("completed")
+    if isinstance(completed, bool) or not isinstance(completed, int) or completed < 0:
+        return None, "yield receipt progress completed must be an integer >= 0"
+    normalized = {"unit": unit, "completed": completed}
+    if "total" in progress:
+        total = progress["total"]
+        if isinstance(total, bool) or not isinstance(total, int) or total < completed:
+            return None, "yield receipt progress total must be an integer >= completed"
+        normalized["total"] = total
+    return normalized, None
 
 
 class QueueStore:
@@ -2227,7 +2256,7 @@ class Scheduler:
         *,
         runner_run_dir: str | None,
     ) -> tuple[dict[str, Any] | None, str | None]:
-        """Verify the trainer's checkpoint receipt before allowing requeue."""
+        """Verify a workflow checkpoint receipt before allowing requeue."""
 
         receipt_path = _yield_receipt_path(
             self.store,
@@ -2279,13 +2308,31 @@ class Scheduler:
         actual_hash = _sha256_file(checkpoint)
         if not expected_hash or not hmac.compare_digest(actual_hash, expected_hash):
             return None, "yield checkpoint SHA-256 differs from its receipt"
-        try:
-            step = int(receipt["step"])
-        except (KeyError, TypeError, ValueError):
-            return None, "yield receipt has no valid optimizer step"
-        if step < 1:
-            return None, f"yield receipt has invalid optimizer step {step}"
+        has_progress = "progress" in receipt
+        progress, progress_error = _validated_yield_progress(receipt)
+        if progress_error is not None:
+            return None, progress_error
+        if progress is not None:
+            receipt["progress"] = progress
+        step = receipt.get("step")
+        step_label = "continuation" if has_progress else "optimizer"
+        if isinstance(step, bool) or not isinstance(step, int):
+            return None, f"yield receipt has no valid {step_label} step"
+        if step < 0 or (progress is None and step < 1):
+            return None, f"yield receipt has invalid {step_label} step {step}"
         return receipt, None
+
+    @staticmethod
+    def _yield_progress_text(yield_receipt: Mapping[str, Any]) -> str:
+        """Format validated generic progress or the legacy training step."""
+
+        progress = yield_receipt.get("progress")
+        if isinstance(progress, Mapping):
+            completed = f"{int(progress['completed']):,}"
+            total = progress.get("total")
+            amount = completed if total is None else f"{completed}/{int(total):,}"
+            return f"{amount} {progress['unit']}"
+        return f"step {int(yield_receipt['step']):,}"
 
     def _activate_pending_reservation(
         self,
@@ -2324,9 +2371,31 @@ class Scheduler:
         """Activate the reservation and return the same experiment to queue front."""
 
         wandb = yield_receipt.get("wandb") or {}
+        progress_text = self._yield_progress_text(yield_receipt)
+        event_payload = {
+            "segment_finished": int(item["segment"]),
+            "next_segment": int(item["segment"]) + 1,
+            "checkpoint": yield_receipt["checkpoint"],
+            "checkpoint_sha256": yield_receipt["checkpoint_sha256"],
+            "step": int(yield_receipt["step"]),
+            "wandb_id": wandb.get("id"),
+            "reservation_id": None,
+            "reservation_expires_at": None,
+            "executor_receipt": executor_receipt,
+        }
+        if yield_receipt.get("progress") is not None:
+            event_payload.update(
+                {
+                    "progress": yield_receipt["progress"],
+                    "progress_text": progress_text,
+                }
+            )
         with self.store.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             reservation = self._activate_pending_reservation(connection, item)
+            if reservation is not None:
+                event_payload["reservation_id"] = int(reservation["id"])
+                event_payload["reservation_expires_at"] = reservation["expires_at"]
             connection.execute(
                 """
                 UPDATE queue_items SET state = 'queued', state_detail = ?, segment = segment + 1,
@@ -2338,7 +2407,7 @@ class Scheduler:
                 WHERE id = ?
                 """,
                 (
-                    f"resume from verified step {int(yield_receipt['step']):,}",
+                    f"resume from verified {progress_text}",
                     str(yield_receipt["checkpoint"]),
                     str(yield_receipt["checkpoint_sha256"]),
                     int(yield_receipt["step"]),
@@ -2354,22 +2423,12 @@ class Scheduler:
                 connection,
                 "EXPERIMENT_YIELDED_AND_REQUEUED",
                 queue_item_id=int(item["id"]),
-                payload={
-                    "segment_finished": int(item["segment"]),
-                    "next_segment": int(item["segment"]) + 1,
-                    "checkpoint": yield_receipt["checkpoint"],
-                    "checkpoint_sha256": yield_receipt["checkpoint_sha256"],
-                    "step": int(yield_receipt["step"]),
-                    "wandb_id": wandb.get("id"),
-                    "reservation_id": int(reservation["id"]) if reservation else None,
-                    "reservation_expires_at": reservation["expires_at"] if reservation else None,
-                    "executor_receipt": executor_receipt,
-                },
+                payload=event_payload,
             )
         self._release_gpu_lock(item["assigned_gpu_uuid"])
         print(
-            f"[{utc_now_iso()}] queue item {item['id']} yielded at step "
-            f"{int(yield_receipt['step']):,} and returned to the queue front",
+            f"[{utc_now_iso()}] queue item {item['id']} yielded at {progress_text} "
+            "and returned to the queue front",
             flush=True,
         )
 
@@ -2605,8 +2664,14 @@ class Scheduler:
                 continue
             if receipt.get("status") != "failed":
                 continue
+            progress, progress_error = _validated_yield_progress(receipt)
+            if progress is not None and progress_error is None:
+                receipt["progress"] = progress
+                progress_text = self._yield_progress_text(receipt)
+            else:
+                progress_text = f"step {receipt.get('step')}"
             detail = (
-                f"cooperative yield failed at step {receipt.get('step')}: "
+                f"cooperative yield failed at {progress_text}: "
                 f"{receipt.get('error', 'unknown checkpoint error')}"
             )
             with self.store.connect() as connection:
@@ -2628,14 +2693,17 @@ class Scheduler:
                         "UPDATE gpu_reservations SET status = 'failed', state_detail = ? WHERE id = ?",
                         (detail, reservation["id"]),
                     )
+                event_payload = {
+                    "reservation_id": int(reservation["id"]) if reservation else None,
+                    "receipt": receipt,
+                }
+                if progress is not None and progress_error is None:
+                    event_payload["progress_text"] = progress_text
                 self.store._event(
                     connection,
                     "COOPERATIVE_YIELD_FAILED",
                     queue_item_id=int(item["id"]),
-                    payload={
-                        "reservation_id": int(reservation["id"]) if reservation else None,
-                        "receipt": receipt,
-                    },
+                    payload=event_payload,
                 )
 
     def _escalate_terminations(self) -> None:

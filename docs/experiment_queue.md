@@ -62,8 +62,9 @@ Useful admission controls are:
 ```
 
 `--preemptible` is an explicit operational promise, not a property inferred
-from card or ledger status. Use it only for workflows whose trainer implements
-the queue yield contract. The frozen WCG wrapper and Flowers trainer do so.
+from card or ledger status. Use it only for workflows that implement the queue
+yield contract. The frozen WCG wrapper and Flowers trainer do so; data
+workflows may implement the same contract around a durable work-unit boundary.
 
 An experiment can have only one active queue item. Removing a never-launched
 item and adding it again creates a new recorded membership. After any launched
@@ -274,10 +275,57 @@ training batch and dropout randomness are step-derived, so the recorded global
 step restores their exact progression without an extra sampler cursor.
 
 The scheduler verifies the checkpoint path, size, digest, queue/request
-identity, metadata, and optimizer step before it does either of the following:
+identity, metadata, and continuation `step` before it does either of the
+following. Legacy training receipts still require a positive optimizer step;
+generic progress receipts may use a nonnegative cursor:
 
 1. starts the reservation clock after the GPU-owning process has exited; and
 2. returns the same queue item to the front with a new execution segment.
+
+Non-training workflows may additionally report generic progress alongside the
+existing receipt fields:
+
+```json
+{
+  "step": 0,
+  "progress": {
+    "unit": "settled_rows",
+    "completed": 0,
+    "total": 30000
+  }
+}
+```
+
+`step` remains the nonnegative resume cursor stored by the queue. In
+`progress`, `completed` is a nonnegative integer, optional `total` is an
+integer no smaller than `completed`, and `unit` is a 1--32 character ASCII
+token that starts with a letter and otherwise uses only letters, digits,
+underscores, or hyphens. The scheduler records and displays
+`completed[/total] unit` when this object is present, including a durable event
+`progress_text`. Legacy receipts without it retain the existing `step N` state
+and console wording and the existing numeric `step` event field.
+
+A preemptible data workflow may checkpoint a manifest or other durable shared
+state after settling one complete work unit, then publish that checkpoint and
+its metadata through the same path, size, and SHA-256 receipt fields. If the
+number of GPU workers can change, workers should claim units from that shared
+durable state instead of relying on a fixed partition made at launch. The
+checkpoint must make already settled work and the next safe claims
+unambiguous, so a resumed or replacement worker neither skips nor duplicates a
+unit.
+
+`scripts/run_hno_specfem_pipeline.py --role consumer` implements this contract
+at a settled SPECFEM row. A reservation request waits for the in-flight row and
+its cleanup receipt, after which the worker exits 75 and may resume on another
+eligible GPU against the same shared root. An explicit queue `terminate` or
+`kill` is different: it interrupts the process immediately and does not create
+an automatic continuation segment. A handled terminate stops the registered
+solver child. A force-killed Python owner cannot do that cleanup, and its
+separate-session SPECFEM child may remain alive; released pipeline locks alone
+must never trigger deletion of that attempt. The shared ledger can recover the
+row, but the operator must use the recorded new-attempt workflow for the
+terminal queue item and verify child termination before cleaning its partial
+work or admitting a replacement for that worker.
 
 The yielded GPU is excluded while the reservation is pending or active. The
 front item may therefore resume on another eligible idle GPU. The experiment
@@ -324,7 +372,9 @@ Force-kill is a separate explicit operation and requires acknowledgement:
 
 `SIGKILL` prevents graceful cleanup. The queue records `force_killed`, retains
 the launcher log and any existing experiment artifacts, and will not reuse the
-GPU until polling observes it idle.
+GPU until polling observes it idle. For SPECFEM, the external solver is in a
+separate process session and may outlive the force-killed Python worker; verify
+that child has ended before removing its preserved partial attempt.
 
 ## Failure And Recovery
 

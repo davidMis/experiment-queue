@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import contextlib
+import hashlib
+import io
 import json
 import os
 import shlex
@@ -14,6 +17,13 @@ import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
 from unittest import mock
+
+from data_generation.hno_specfem_worker_control import (
+    PipelineYieldController,
+    RUNNER_OUTPUT_ENV,
+    YIELD_RECEIPT_ENV,
+    YIELD_REQUEST_ENV,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -71,10 +81,11 @@ class TemporaryQueueRepository:
             "parser.add_argument('--sleep', type=float, default=0.0)\n"
             "parser.add_argument('--exit-code', type=int, default=0)\n"
             "parser.add_argument('--yield-aware', action='store_true')\n"
+            "parser.add_argument('--generic-progress', action='store_true')\n"
             "args = parser.parse_args()\n"
             "marker = Path(os.environ['QUEUE_TEST_MARKER'])\n"
             "head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()\n"
-            "marker.write_text(json.dumps({'gpu': os.environ.get('CUDA_VISIBLE_DEVICES'), 'cwd': str(Path.cwd()), 'head': head, 'worktree': os.environ.get('EXPERIMENT_QUEUE_WORKTREE')}))\n"
+            "marker.write_text(json.dumps({'gpu': os.environ.get('CUDA_VISIBLE_DEVICES'), 'cwd': str(Path.cwd()), 'head': head, 'worktree': os.environ.get('EXPERIMENT_QUEUE_WORKTREE'), 'continuation_checkpoint': os.environ.get('EXPERIMENT_QUEUE_CONTINUATION_CHECKPOINT')}))\n"
             "if args.yield_aware and os.environ.get('EXPERIMENT_QUEUE_CONTINUATION_CHECKPOINT'):\n"
             "    print('run directory: ' + os.environ['EXPERIMENT_QUEUE_CONTINUATION_RUN_DIR'])\n"
             "    print('manifest: ' + os.environ['EXPERIMENT_QUEUE_CONTINUATION_RUN_DIR'] + '/manifest.json')\n"
@@ -88,12 +99,15 @@ class TemporaryQueueRepository:
             "        run_dir = (Path.cwd() / 'outputs' / 'experiments' / 'fake-run').resolve()\n"
             "        checkpoint_dir = run_dir / 'training' / 'checkpoints'\n"
             "        checkpoint_dir.mkdir(parents=True, exist_ok=True)\n"
-            "        checkpoint = checkpoint_dir / 'preempt_step_00000005.msgpack'\n"
+            "        step = 0 if args.generic_progress else 5\n"
+            "        checkpoint = checkpoint_dir / f'preempt_step_{step:08d}.msgpack'\n"
             "        checkpoint.write_bytes(b'fake complete train state')\n"
             "        metadata = checkpoint.with_suffix('.json')\n"
-            "        metadata.write_text(json.dumps({'step': 5}))\n"
+            "        metadata.write_text(json.dumps({'step': step}))\n"
             "        import hashlib\n"
-            "        receipt = {'schema_version': 1, 'status': 'ready', 'request_id': request['request_id'], 'queue_item_id': request['queue_item_id'], 'step': 5, 'checkpoint': str(checkpoint), 'checkpoint_metadata': str(metadata), 'checkpoint_bytes': checkpoint.stat().st_size, 'checkpoint_sha256': hashlib.sha256(checkpoint.read_bytes()).hexdigest(), 'wandb': {'id': 'fake-wandb-id'}}\n"
+            "        receipt = {'schema_version': 1, 'status': 'ready', 'request_id': request['request_id'], 'queue_item_id': request['queue_item_id'], 'step': step, 'checkpoint': str(checkpoint), 'checkpoint_metadata': str(metadata), 'checkpoint_bytes': checkpoint.stat().st_size, 'checkpoint_sha256': hashlib.sha256(checkpoint.read_bytes()).hexdigest(), 'wandb': None if args.generic_progress else {'id': 'fake-wandb-id'}}\n"
+            "        if args.generic_progress:\n"
+            "            receipt['progress'] = {'unit': 'settled_rows', 'completed': 0, 'total': 12}\n"
             "        receipt_path = Path(os.environ['EXPERIMENT_QUEUE_YIELD_RECEIPT_PATH'])\n"
             "        receipt_path.parent.mkdir(parents=True, exist_ok=True)\n"
             "        receipt_path.write_text(json.dumps(receipt))\n"
@@ -114,6 +128,12 @@ class TemporaryQueueRepository:
         self.add_card("TST-004", sleep=0.0, exit_code=4)
         self.add_card("TST-005", sleep=0.0, exit_code=5)
         self.add_card("TST-007", sleep=30.0, yield_aware=True)
+        self.add_card(
+            "TST-009",
+            sleep=30.0,
+            yield_aware=True,
+            generic_progress=True,
+        )
         self.add_real_runner_card()
         self._git("init", "-q")
         self._git("config", "user.email", "queue-test@example.invalid")
@@ -130,6 +150,7 @@ class TemporaryQueueRepository:
         sleep: float,
         exit_code: int = 0,
         yield_aware: bool = False,
+        generic_progress: bool = False,
     ) -> None:
         card = self.root / "docs" / "experiments" / f"{experiment_id}.md"
         card.write_text(
@@ -141,7 +162,8 @@ class TemporaryQueueRepository:
             "cd ~/3D_Helmholtz\n"
             f"python3 scripts/run_experiment.py --name {experiment_id.lower()} "
             f"--require-clean --remote mutton2 --sleep {sleep} --exit-code {exit_code} "
-            f"{'--yield-aware' if yield_aware else ''}\n"
+            f"{'--yield-aware' if yield_aware else ''} "
+            f"{'--generic-progress' if generic_progress else ''}\n"
             ")\n"
             "```\n\n"
             "## Expected Artifacts\n\nTest-only marker.\n",
@@ -854,6 +876,168 @@ class ExperimentQueueTests(unittest.TestCase):
         self.assertEqual(item["runner_manifest_path"], str(manifest))
         self.assertEqual(item["rsync_pull_command"], pull_command)
 
+    def test_yield_receipt_rejects_invalid_generic_progress(self) -> None:
+        item_id = add_experiment(self.repo.store, "TST-009", preemptible=True)
+        request_id = "test-yield-request"
+        run_dir = self.repo.root / "outputs" / "experiments" / "validation-run"
+        checkpoint = run_dir / "shared_state.json"
+        metadata = run_dir / "shared_state.metadata.json"
+        checkpoint.parent.mkdir(parents=True)
+        checkpoint.write_text('{"next_row": 0}\n', encoding="utf-8")
+        metadata.write_text('{"schema_version": 1}\n', encoding="utf-8")
+        with self.repo.store.connect() as connection:
+            connection.execute(
+                "UPDATE queue_items SET state = 'yielding', yield_request_id = ?, "
+                "runner_run_dir = ? WHERE id = ?",
+                (request_id, str(run_dir), item_id),
+            )
+        receipt_path = (
+            self.repo.state_dir
+            / "attempts"
+            / str(item_id)
+            / "segments"
+            / "1"
+            / "yield"
+            / "receipt.json"
+        )
+        receipt_path.parent.mkdir(parents=True)
+        base_receipt = {
+            "schema_version": 1,
+            "status": "ready",
+            "request_id": request_id,
+            "queue_item_id": item_id,
+            "step": 0,
+            "checkpoint": str(checkpoint),
+            "checkpoint_metadata": str(metadata),
+            "checkpoint_bytes": checkpoint.stat().st_size,
+            "checkpoint_sha256": hashlib.sha256(checkpoint.read_bytes()).hexdigest(),
+        }
+        invalid_cases = (
+            (None, 0, "progress must be an object"),
+            ({"unit": "settled rows", "completed": 0}, 0, "progress unit"),
+            ({"unit": "settled_rows", "completed": False}, 0, "progress completed"),
+            ({"unit": "settled_rows", "completed": -1}, 0, "progress completed"),
+            (
+                {"unit": "settled_rows", "completed": 2, "total": 1},
+                2,
+                "progress total",
+            ),
+            ({"unit": "settled_rows", "completed": 0}, -1, "continuation step"),
+        )
+        scheduler = Scheduler(
+            self.repo.store,
+            min_free_disk_gib=0,
+            gpu_provider=lambda: [],
+        )
+
+        for progress, step, expected_error in invalid_cases:
+            with self.subTest(progress=progress, step=step):
+                receipt = dict(base_receipt, progress=progress, step=step)
+                receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+                validated, error = scheduler._validated_yield_receipt(  # noqa: SLF001
+                    self.repo.store.item(item_id),
+                    runner_run_dir=str(run_dir),
+                )
+                self.assertIsNone(validated)
+                self.assertIn(expected_error, str(error))
+
+        receipt_path.write_text(
+            json.dumps(
+                dict(
+                    base_receipt,
+                    progress={"unit": "settled_rows", "completed": 0},
+                    step=0,
+                )
+            ),
+            encoding="utf-8",
+        )
+        validated, error = scheduler._validated_yield_receipt(  # noqa: SLF001
+            self.repo.store.item(item_id),
+            runner_run_dir=str(run_dir),
+        )
+        self.assertIsNone(error)
+        self.assertEqual(
+            validated["progress"],
+            {"unit": "settled_rows", "completed": 0},
+        )
+
+        legacy_step_zero = dict(base_receipt, step=0)
+        receipt_path.write_text(json.dumps(legacy_step_zero), encoding="utf-8")
+        validated, error = scheduler._validated_yield_receipt(  # noqa: SLF001
+            self.repo.store.item(item_id),
+            runner_run_dir=str(run_dir),
+        )
+        self.assertIsNone(validated)
+        self.assertIn("invalid optimizer step 0", str(error))
+
+    def test_specfem_controller_receipt_matches_queue_contract(self) -> None:
+        item_id = add_experiment(self.repo.store, "TST-009", preemptible=True)
+        request_id = "specfem-yield-request"
+        run_dir = self.repo.root / "outputs" / "experiments" / "specfem-run"
+        segment_dir = (
+            self.repo.state_dir
+            / "attempts"
+            / str(item_id)
+            / "segments"
+            / "1"
+            / "yield"
+        )
+        request_path = segment_dir / "request.json"
+        receipt_path = segment_dir / "receipt.json"
+        request_path.parent.mkdir(parents=True)
+        request_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "request_id": request_id,
+                    "queue_item_id": item_id,
+                    "segment": 1,
+                    "gpu_uuid": "GPU-test-0000",
+                    "requested_at": "2026-08-18T12:00:00+00:00",
+                }
+            ),
+            encoding="utf-8",
+        )
+        with self.repo.store.connect() as connection:
+            connection.execute(
+                "UPDATE queue_items SET state = 'yielding', yield_request_id = ?, "
+                "runner_run_dir = ? WHERE id = ?",
+                (request_id, str(run_dir), item_id),
+            )
+        controller = PipelineYieldController.from_environment(
+            {
+                YIELD_REQUEST_ENV: str(request_path),
+                YIELD_RECEIPT_ENV: str(receipt_path),
+                RUNNER_OUTPUT_ENV: str(run_dir),
+            }
+        )
+        self.assertIsNotNone(controller)
+        self.assertTrue(
+            controller.publish_if_requested(
+                pipeline_root=self.repo.root / "shared-pipeline",
+                pipeline_plan_sha256="pipeline-plan",
+                case_plan_sha256="case-plan",
+                worker_token="W00",
+                completed_rows=0,
+                total_rows=30_000,
+            )
+        )
+        scheduler = Scheduler(
+            self.repo.store,
+            min_free_disk_gib=0,
+            gpu_provider=lambda: [],
+        )
+        validated, error = scheduler._validated_yield_receipt(  # noqa: SLF001
+            self.repo.store.item(item_id),
+            runner_run_dir=str(run_dir),
+        )
+        self.assertIsNone(error)
+        self.assertEqual(validated["step"], 0)
+        self.assertEqual(
+            validated["progress"],
+            {"unit": "settled_rows", "completed": 0, "total": 30_000},
+        )
+
     @unittest.skipIf(os.name != "posix", "cooperative subprocess yield is POSIX-specific")
     def test_yield_checkpoints_reserves_old_gpu_and_resumes_at_queue_front(self) -> None:
         gpu0 = self.gpu("0", "GPU-test-0000")
@@ -905,6 +1089,17 @@ class ExperimentQueueTests(unittest.TestCase):
         self.assertEqual(item["continuation_step"], 5)
         self.assertEqual(item["continuation_wandb_id"], "fake-wandb-id")
         self.assertEqual(item["resume_front"], 1)
+        self.assertEqual(item["state_detail"], "resume from verified step 5")
+        with self.repo.store.connect() as connection:
+            event = connection.execute(
+                "SELECT payload_json FROM events WHERE queue_item_id = ? "
+                "AND event_type = 'EXPERIMENT_YIELDED_AND_REQUEUED'",
+                (item_id,),
+            ).fetchone()
+        legacy_payload = json.loads(event["payload_json"])
+        self.assertEqual(legacy_payload["step"], 5)
+        self.assertNotIn("progress", legacy_payload)
+        self.assertNotIn("progress_text", legacy_payload)
         worktree = Path(str(item["worktree_path"]))
         git_ref = str(item["git_ref"])
         self.assertTrue(worktree.is_dir())
@@ -928,6 +1123,83 @@ class ExperimentQueueTests(unittest.TestCase):
         self.assertEqual(item["assigned_gpu_uuid"], gpu1.uuid)
         self.assertIsNotNone(item["worktree_removed_at"])
         self.assertFalse(worktree.exists())
+
+    @unittest.skipIf(os.name != "posix", "cooperative subprocess yield is POSIX-specific")
+    def test_generic_zero_row_progress_yields_and_resumes(self) -> None:
+        gpu0 = self.gpu("0", "GPU-test-0000")
+        gpu1 = self.gpu("1", "GPU-test-1111")
+        update_gpu_allowlist(
+            self.repo.store,
+            "set",
+            ["0", "1"],
+            snapshots=[gpu0, gpu1],
+        )
+        item_id = add_experiment(
+            self.repo.store,
+            "TST-009",
+            preemptible=True,
+        )
+        scheduler = Scheduler(
+            self.repo.store,
+            poll_seconds=100,
+            min_free_disk_gib=0,
+            gpu_provider=lambda: [gpu0, gpu1],
+        )
+        scheduler.run_iteration(force_gpu_poll=True)
+        self.assertEqual(self.repo.store.item(item_id)["state"], "running")
+        request_gpu_reservation(
+            self.repo.store,
+            gpu0.uuid,
+            duration_hours=24,
+            note="Morgan — model sweep",
+            actor="web:reservation",
+            snapshots=[gpu0, gpu1],
+        )
+
+        console = io.StringIO()
+        deadline = time.monotonic() + 15
+        with contextlib.redirect_stdout(console):
+            while time.monotonic() < deadline:
+                scheduler.run_iteration(force_gpu_poll=False)
+                item = self.repo.store.item(item_id)
+                if item["state"] == "queued" and item["segment"] == 2:
+                    break
+                time.sleep(0.03)
+        item = self.repo.store.item(item_id)
+        self.assertEqual(item["state"], "queued")
+        self.assertEqual(item["segment"], 2)
+        self.assertEqual(item["continuation_step"], 0)
+        self.assertEqual(item["state_detail"], "resume from verified 0/12 settled_rows")
+        self.assertIn(
+            "yielded at 0/12 settled_rows and returned to the queue front",
+            console.getvalue(),
+        )
+        with self.repo.store.connect() as connection:
+            event = connection.execute(
+                "SELECT payload_json FROM events WHERE queue_item_id = ? "
+                "AND event_type = 'EXPERIMENT_YIELDED_AND_REQUEUED'",
+                (item_id,),
+            ).fetchone()
+        payload = json.loads(event["payload_json"])
+        self.assertEqual(payload["step"], 0)
+        self.assertEqual(
+            payload["progress"],
+            {"unit": "settled_rows", "completed": 0, "total": 12},
+        )
+        self.assertEqual(payload["progress_text"], "0/12 settled_rows")
+
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            scheduler.run_iteration(force_gpu_poll=True)
+            if self.repo.store.item(item_id)["state"] == "succeeded":
+                break
+            time.sleep(0.03)
+        item = self.repo.store.item(item_id)
+        self.assertEqual(item["state"], "succeeded")
+        self.assertEqual(item["segment"], 2)
+        self.assertEqual(item["assigned_gpu_uuid"], gpu1.uuid)
+        marker = json.loads(self.marker.read_text(encoding="utf-8"))
+        self.assertEqual(marker["continuation_checkpoint"], item["continuation_checkpoint"])
 
     def test_query_gpus_parses_inventory_and_processes(self) -> None:
         executable = self.repo.root / "fake-nvidia-smi"
