@@ -36,7 +36,7 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 from helmholtz_shared.experiment_runner import collect_git_context
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 DEFAULT_STATE_DIR = Path("gpu_scheduler_state")
 WORKTREE_ROOT_NAME = "worktrees"
 SHARED_WORKTREE_PATHS = (
@@ -133,6 +133,10 @@ raise SystemExit(return_code)
 
 class QueueError(RuntimeError):
     """Raised when a queue operation cannot be completed safely."""
+
+
+class ContinuationIntegrityError(QueueError):
+    """Raised when a queued continuation no longer matches its sealed files."""
 
 
 class _ClosingConnection(sqlite3.Connection):
@@ -379,6 +383,8 @@ class QueueStore:
                     yield_duration_hours INTEGER,
                     continuation_checkpoint TEXT,
                     continuation_checkpoint_sha256 TEXT,
+                    continuation_checkpoint_metadata TEXT,
+                    continuation_checkpoint_metadata_sha256 TEXT,
                     continuation_step INTEGER,
                     continuation_wandb_id TEXT,
                     git_ref TEXT,
@@ -457,10 +463,10 @@ class QueueStore:
                 self._event(connection, "QUEUE_INITIALIZED", payload={"repo_root": str(self.repo_root)})
             else:
                 version = int(existing_version["value"])
-                if version not in {1, 2, SCHEMA_VERSION}:
+                if version not in {1, 2, 3, SCHEMA_VERSION}:
                     raise QueueError(
                         f"queue schema {existing_version['value']} is not supported; "
-                        f"expected 1, 2, or {SCHEMA_VERSION}"
+                        f"expected 1, 2, 3, or {SCHEMA_VERSION}"
                     )
                 recorded_root = self.get_meta("repo_root", connection=connection)
                 if Path(recorded_root).resolve() != self.repo_root:
@@ -472,6 +478,9 @@ class QueueStore:
                     version = 2
                 if version == 2:
                     self._migrate_v2_to_v3(connection)
+                    version = 3
+                if version == 3:
+                    self._migrate_v3_to_v4(connection)
             connection.execute("PRAGMA optimize")
 
     def _migrate_v1_to_v2(self, connection: sqlite3.Connection) -> None:
@@ -571,11 +580,127 @@ class QueueStore:
                     "UPDATE queue_items SET state = 'held', state_detail = ? WHERE id = ?",
                     (detail, item_id),
                 )
+        self._set_meta(connection, "schema_version", "3")
+        self._event(
+            connection,
+            "QUEUE_SCHEMA_MIGRATED",
+            payload={"from": 2, "to": 3},
+        )
+
+    def _migrate_v3_to_v4(self, connection: sqlite3.Connection) -> None:
+        """Bind continuation metadata so accepted yields cannot rot before resume."""
+
+        columns = {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(queue_items)")
+        }
+        additions = {
+            "continuation_checkpoint_metadata": "TEXT",
+            "continuation_checkpoint_metadata_sha256": "TEXT",
+        }
+        for name, declaration in additions.items():
+            if name not in columns:
+                connection.execute(
+                    f"ALTER TABLE queue_items ADD COLUMN {name} {declaration}"
+                )
+        required_columns = {
+            "id",
+            "state",
+            "state_detail",
+            "segment",
+            "runner_run_dir",
+            "continuation_checkpoint",
+            "continuation_checkpoint_sha256",
+            *additions,
+        }
+        if required_columns.issubset(columns | set(additions)):
+            candidates = list(
+                connection.execute(
+                    "SELECT * FROM queue_items WHERE segment > 1 "
+                    "AND continuation_checkpoint IS NOT NULL "
+                    "AND continuation_checkpoint_metadata IS NULL "
+                    "AND state IN ('queued','held','blocked')"
+                )
+            )
+            for item in candidates:
+                item_id = int(item["id"])
+                prior_segment = int(item["segment"]) - 1
+                receipt_path = (
+                    self.state_dir
+                    / "attempts"
+                    / str(item_id)
+                    / "segments"
+                    / str(prior_segment)
+                    / "yield"
+                    / "receipt.json"
+                )
+                try:
+                    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+                    if not isinstance(receipt, dict):
+                        raise QueueError("yield receipt is not a JSON object")
+                    runner_value = item["runner_run_dir"]
+                    if not runner_value:
+                        raise QueueError("runner directory is missing")
+                    runner = Path(str(runner_value)).resolve()
+                    checkpoint_source = Path(str(receipt.get("checkpoint", "")))
+                    metadata_source = Path(
+                        str(receipt.get("checkpoint_metadata", ""))
+                    )
+                    if checkpoint_source.is_symlink() or metadata_source.is_symlink():
+                        raise QueueError("yield continuation uses a symlink")
+                    checkpoint = checkpoint_source.resolve()
+                    metadata = metadata_source.resolve()
+                    checkpoint.relative_to(runner)
+                    metadata.relative_to(runner)
+                    if (
+                        not checkpoint.is_file()
+                        or not metadata.is_file()
+                        or checkpoint
+                        != Path(str(item["continuation_checkpoint"])).resolve()
+                        or not hmac.compare_digest(
+                            _sha256_file(checkpoint),
+                            str(item["continuation_checkpoint_sha256"]),
+                        )
+                    ):
+                        raise QueueError("yield continuation files changed")
+                except (OSError, ValueError, json.JSONDecodeError, QueueError) as exc:
+                    detail = (
+                        "queue schema v4 could not bind the legacy continuation "
+                        f"metadata; inspect segment {prior_segment} yield evidence: "
+                        f"{exc}"
+                    )
+                    connection.execute(
+                        "UPDATE queue_items SET state = 'held', state_detail = ? "
+                        "WHERE id = ?",
+                        (detail, item_id),
+                    )
+                    self._event(
+                        connection,
+                        "QUEUE_CONTINUATION_MIGRATION_HELD",
+                        queue_item_id=item_id,
+                        payload={"detail": detail},
+                    )
+                    continue
+                connection.execute(
+                    "UPDATE queue_items SET continuation_checkpoint_metadata = ?, "
+                    "continuation_checkpoint_metadata_sha256 = ? WHERE id = ?",
+                    (str(metadata), _sha256_file(metadata), item_id),
+                )
+                self._event(
+                    connection,
+                    "QUEUE_CONTINUATION_METADATA_BOUND",
+                    queue_item_id=item_id,
+                    payload={
+                        "segment": int(item["segment"]),
+                        "checkpoint_metadata": str(metadata),
+                        "checkpoint_metadata_sha256": _sha256_file(metadata),
+                    },
+                )
         self._set_meta(connection, "schema_version", str(SCHEMA_VERSION))
         self._event(
             connection,
             "QUEUE_SCHEMA_MIGRATED",
-            payload={"from": 2, "to": SCHEMA_VERSION},
+            payload={"from": 3, "to": SCHEMA_VERSION},
         )
 
     @staticmethod
@@ -1005,6 +1130,81 @@ def _command_for_worktree(command_text: str, worktree: Path) -> str:
     return transformed
 
 
+def _validated_continuation_checkpoint(item: Mapping[str, Any]) -> Path:
+    """Revalidate both files accepted by the prior yield before resuming."""
+
+    required = {
+        "runner directory": item["runner_run_dir"],
+        "continuation checkpoint": item["continuation_checkpoint"],
+        "checkpoint SHA-256": item["continuation_checkpoint_sha256"],
+        "continuation checkpoint metadata": item[
+            "continuation_checkpoint_metadata"
+        ],
+        "checkpoint metadata SHA-256": item[
+            "continuation_checkpoint_metadata_sha256"
+        ],
+    }
+    missing = [label for label, value in required.items() if not value]
+    if missing:
+        raise ContinuationIntegrityError(
+            f"queue item {item['id']} segment {item['segment']} lacks "
+            + ", ".join(missing)
+        )
+    try:
+        runner = Path(str(item["runner_run_dir"])).resolve()
+        checkpoint_source = Path(str(item["continuation_checkpoint"]))
+        metadata_source = Path(str(item["continuation_checkpoint_metadata"]))
+        checkpoint = checkpoint_source.resolve()
+        metadata = metadata_source.resolve()
+    except OSError as error:
+        raise ContinuationIntegrityError(
+            f"queue item {item['id']} continuation paths cannot be resolved: {error}"
+        ) from error
+    for path, label in (
+        (checkpoint, "continuation checkpoint"),
+        (metadata, "continuation checkpoint metadata"),
+    ):
+        try:
+            path.relative_to(runner)
+        except ValueError as error:
+            raise ContinuationIntegrityError(
+                f"queue item {item['id']} {label} is outside runner directory: {path}"
+            ) from error
+    try:
+        checkpoint_valid = (
+            not checkpoint_source.is_symlink()
+            and checkpoint.is_file()
+            and hmac.compare_digest(
+                _sha256_file(checkpoint),
+                str(item["continuation_checkpoint_sha256"]),
+            )
+        )
+        metadata_valid = (
+            not metadata_source.is_symlink()
+            and metadata.is_file()
+            and hmac.compare_digest(
+                _sha256_file(metadata),
+                str(item["continuation_checkpoint_metadata_sha256"]),
+            )
+        )
+    except OSError as error:
+        raise ContinuationIntegrityError(
+            f"queue item {item['id']} continuation files cannot be verified: {error}"
+        ) from error
+    if not checkpoint_valid:
+        raise ContinuationIntegrityError(
+            f"queue item {item['id']} continuation checkpoint is missing or changed: "
+            f"{checkpoint}"
+        )
+    if not metadata_valid:
+        raise ContinuationIntegrityError(
+            "queue item "
+            f"{item['id']} continuation checkpoint metadata is missing or "
+            f"changed: {metadata}"
+        )
+    return checkpoint
+
+
 def _item_execution_context(
     store: QueueStore,
     item: Mapping[str, Any],
@@ -1042,24 +1242,7 @@ def _item_execution_context(
             _yield_receipt_path(store, int(item["id"]), segment)
         )
     if segment > 1:
-        required = {
-            "runner directory": item["runner_run_dir"],
-            "continuation checkpoint": item["continuation_checkpoint"],
-            "checkpoint SHA-256": item["continuation_checkpoint_sha256"],
-        }
-        missing = [label for label, value in required.items() if not value]
-        if missing:
-            raise QueueError(
-                f"queue item {item['id']} segment {segment} lacks " + ", ".join(missing)
-            )
-        checkpoint = Path(str(item["continuation_checkpoint"]))
-        if not checkpoint.is_file() or not hmac.compare_digest(
-            _sha256_file(checkpoint), str(item["continuation_checkpoint_sha256"])
-        ):
-            raise QueueError(
-                f"queue item {item['id']} continuation checkpoint is missing or changed: "
-                f"{checkpoint}"
-            )
+        checkpoint = _validated_continuation_checkpoint(item)
         child_environment["EXPERIMENT_QUEUE_CONTINUATION_RUN_DIR"] = str(
             item["runner_run_dir"]
         )
@@ -2283,31 +2466,54 @@ class Scheduler:
         metadata_value = receipt.get("checkpoint_metadata")
         if not checkpoint_value or not metadata_value:
             return None, "yield receipt omits checkpoint paths"
-        checkpoint = Path(str(checkpoint_value)).resolve()
-        metadata = Path(str(metadata_value)).resolve()
-        if not checkpoint.is_file() or checkpoint.is_symlink():
-            return None, f"yield checkpoint is missing or unsafe: {checkpoint}"
-        if not metadata.is_file() or metadata.is_symlink():
-            return None, f"yield checkpoint metadata is missing or unsafe: {metadata}"
-        if runner_run_dir:
-            run_dir = Path(runner_run_dir)
-            if not run_dir.is_absolute():
-                run_dir = self.store.repo_root / run_dir
-            try:
-                checkpoint.relative_to(run_dir.resolve())
-            except ValueError:
-                return None, f"yield checkpoint is outside runner directory {run_dir}"
-        expected_bytes = receipt.get("checkpoint_bytes")
+        checkpoint_source = Path(str(checkpoint_value))
+        metadata_source = Path(str(metadata_value))
         try:
-            expected_size = int(expected_bytes)
-        except (TypeError, ValueError):
-            return None, "yield receipt has no valid checkpoint size"
-        if checkpoint.stat().st_size != expected_size:
-            return None, "yield checkpoint size differs from its receipt"
-        expected_hash = str(receipt.get("checkpoint_sha256") or "")
-        actual_hash = _sha256_file(checkpoint)
-        if not expected_hash or not hmac.compare_digest(actual_hash, expected_hash):
-            return None, "yield checkpoint SHA-256 differs from its receipt"
+            if checkpoint_source.is_symlink():
+                return None, f"yield checkpoint is missing or unsafe: {checkpoint_source}"
+            if metadata_source.is_symlink():
+                return None, (
+                    "yield checkpoint metadata is missing or unsafe: "
+                    f"{metadata_source}"
+                )
+            checkpoint = checkpoint_source.resolve()
+            metadata = metadata_source.resolve()
+            if not checkpoint.is_file():
+                return None, f"yield checkpoint is missing or unsafe: {checkpoint}"
+            if not metadata.is_file():
+                return None, f"yield checkpoint metadata is missing or unsafe: {metadata}"
+            if runner_run_dir:
+                run_dir = Path(runner_run_dir)
+                if not run_dir.is_absolute():
+                    run_dir = self.store.repo_root / run_dir
+                try:
+                    checkpoint.relative_to(run_dir.resolve())
+                except ValueError:
+                    return None, f"yield checkpoint is outside runner directory {run_dir}"
+                try:
+                    metadata.relative_to(run_dir.resolve())
+                except ValueError:
+                    return None, (
+                        "yield checkpoint metadata is outside runner directory "
+                        f"{run_dir}"
+                    )
+            expected_bytes = receipt.get("checkpoint_bytes")
+            try:
+                expected_size = int(expected_bytes)
+            except (TypeError, ValueError):
+                return None, "yield receipt has no valid checkpoint size"
+            if checkpoint.stat().st_size != expected_size:
+                return None, "yield checkpoint size differs from its receipt"
+            expected_hash = str(receipt.get("checkpoint_sha256") or "")
+            actual_hash = _sha256_file(checkpoint)
+            if not expected_hash or not hmac.compare_digest(actual_hash, expected_hash):
+                return None, "yield checkpoint SHA-256 differs from its receipt"
+            receipt["checkpoint"] = str(checkpoint)
+            receipt["checkpoint_metadata"] = str(metadata)
+            receipt["checkpoint_metadata_bytes"] = metadata.stat().st_size
+            receipt["checkpoint_metadata_sha256"] = _sha256_file(metadata)
+        except (OSError, RuntimeError) as exc:
+            return None, f"yield checkpoint files could not be verified: {exc}"
         has_progress = "progress" in receipt
         progress, progress_error = _validated_yield_progress(receipt)
         if progress_error is not None:
@@ -2367,8 +2573,8 @@ class Scheduler:
         executor_receipt: dict[str, Any],
         runner_receipt: dict[str, str],
         yield_receipt: dict[str, Any],
-    ) -> None:
-        """Activate the reservation and return the same experiment to queue front."""
+    ) -> bool:
+        """Requeue a still-current yield without clobbering a later termination."""
 
         wandb = yield_receipt.get("wandb") or {}
         progress_text = self._yield_progress_text(yield_receipt)
@@ -2392,7 +2598,14 @@ class Scheduler:
             )
         with self.store.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
-            reservation = self._activate_pending_reservation(connection, item)
+            current = self.store.item(int(item["id"]), connection=connection)
+            if (
+                current["state"] != "yielding"
+                or int(current["segment"]) != int(item["segment"])
+                or current["yield_request_id"] != item["yield_request_id"]
+            ):
+                return False
+            reservation = self._activate_pending_reservation(connection, current)
             if reservation is not None:
                 event_payload["reservation_id"] = int(reservation["id"])
                 event_payload["reservation_expires_at"] = reservation["expires_at"]
@@ -2402,7 +2615,9 @@ class Scheduler:
                     resume_front = 1, assigned_gpu_uuid = NULL, assigned_gpu_index = NULL,
                     pid = NULL, pgid = NULL, proc_start_ticks = NULL, return_code = NULL,
                     continuation_checkpoint = ?, continuation_checkpoint_sha256 = ?,
-                    continuation_step = ?, continuation_wandb_id = ?, runner_run_dir = ?,
+                    continuation_checkpoint_metadata = ?,
+                    continuation_checkpoint_metadata_sha256 = ?, continuation_step = ?,
+                    continuation_wandb_id = ?, runner_run_dir = ?,
                     runner_manifest_path = ?, rsync_pull_command = ?
                 WHERE id = ?
                 """,
@@ -2410,6 +2625,8 @@ class Scheduler:
                     f"resume from verified {progress_text}",
                     str(yield_receipt["checkpoint"]),
                     str(yield_receipt["checkpoint_sha256"]),
+                    str(yield_receipt["checkpoint_metadata"]),
+                    str(yield_receipt["checkpoint_metadata_sha256"]),
                     int(yield_receipt["step"]),
                     wandb.get("id"),
                     runner_receipt.get("run_directory") or item["runner_run_dir"],
@@ -2431,6 +2648,7 @@ class Scheduler:
             "and returned to the queue front",
             flush=True,
         )
+        return True
 
     def _finalize_item(self, item: sqlite3.Row, receipt: dict[str, Any] | None) -> None:
         prior_state = str(item["state"])
@@ -2448,8 +2666,10 @@ class Scheduler:
                 runner_run_dir=run_dir,
             )
             if return_code == YIELD_EXIT_CODE and yield_receipt is not None:
-                self._finalize_yield(item, receipt, runner_receipt, yield_receipt)
-                return
+                if self._finalize_yield(item, receipt, runner_receipt, yield_receipt):
+                    return
+                item = self.store.item(int(item["id"]))
+                prior_state = str(item["state"])
         else:
             yield_error = None
         if prior_state == "force_killing":
@@ -2795,6 +3015,28 @@ class Scheduler:
             execution_root, effective_command, execution_environment = (
                 _item_execution_context(self.store, item, os.environ)
             )
+        except ContinuationIntegrityError as exc:
+            detail = str(exc)
+            with self.store.connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                cursor = connection.execute(
+                    "UPDATE queue_items SET state = 'held', state_detail = ? "
+                    "WHERE id = ? AND state = 'queued'",
+                    (detail, item["id"]),
+                )
+                if cursor.rowcount == 1:
+                    self.store._event(
+                        connection,
+                        "QUEUE_CONTINUATION_INTEGRITY_HELD",
+                        queue_item_id=int(item["id"]),
+                        payload={"reason": detail},
+                    )
+            print(
+                f"[{utc_now_iso()}] continuation held: {detail}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return False
         except QueueError as exc:
             detail = str(exc)
             with self.store.connect() as connection:

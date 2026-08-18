@@ -282,6 +282,12 @@ generic progress receipts may use a nonnegative cursor:
 1. starts the reservation clock after the GPU-owning process has exited; and
 2. returns the same queue item to the front with a new execution segment.
 
+Both checkpoint and metadata paths and SHA-256 digests are stored in the queue
+and revalidated immediately before every continuation launch. Missing, linked,
+or changed continuation evidence holds only that item and lets unrelated queued
+work continue. A termination or force-kill accepted while yield finalization is
+in flight wins atomically; a stale yield receipt cannot requeue the killed job.
+
 Non-training workflows may additionally report generic progress alongside the
 existing receipt fields:
 
@@ -322,7 +328,7 @@ assembler still owns compact commitment and cache cleanup. That receipt keeps
 the prior `settled_rows` count—possibly zero—because the raw row is not yet
 settled. A resumed segment validates the same pipeline/assembly plans and
 destination, accepts progress peers made while it was absent, and never repeats
-the solve. Under the rolling v4/v2 compact policy, that no-resolve barrier is
+the solve. Under the strict rolling v5/v3 compact policy, that no-resolve barrier is
 the immutable success terminal: a resumed worker still accepts it after the
 CPU assembler has fully validated the sealed destination shard and retired the
 raw NPZ through its authorization/completion chain. If that row completes the

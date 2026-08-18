@@ -24,6 +24,7 @@ from data_generation.hno_specfem_worker_control import (
     YIELD_RECEIPT_ENV,
     YIELD_REQUEST_ENV,
 )
+import helmholtz_shared.experiment_queue as queue_module
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -335,7 +336,7 @@ class ExperimentQueueTests(unittest.TestCase):
 
             migrated = QueueStore(state_dir, root)
 
-            self.assertEqual(migrated.get_meta("schema_version"), "3")
+            self.assertEqual(migrated.get_meta("schema_version"), "4")
             with migrated.connect() as connection:
                 columns = {
                     row["name"] for row in connection.execute("PRAGMA table_info(queue_items)")
@@ -408,7 +409,7 @@ class ExperimentQueueTests(unittest.TestCase):
         migrated = QueueStore(self.repo.state_dir, self.repo.root)
 
         item = migrated.item(item_id)
-        self.assertEqual(migrated.get_meta("schema_version"), "3")
+        self.assertEqual(migrated.get_meta("schema_version"), "4")
         self.assertEqual(item["git_ref"], f"refs/experiment-queue/items/{item_id}")
         pinned = subprocess.check_output(
             ["git", "rev-parse", str(item["git_ref"])],
@@ -416,6 +417,78 @@ class ExperimentQueueTests(unittest.TestCase):
             text=True,
         ).strip()
         self.assertEqual(pinned, item["git_commit"])
+
+    def test_v3_migration_binds_legacy_continuation_metadata_or_holds(
+        self,
+    ) -> None:
+        item_id = add_experiment(self.repo.store, "TST-001")
+        runner = self.repo.root / "outputs" / "legacy-yield"
+        runner.mkdir(parents=True)
+        checkpoint = runner / "checkpoint.json"
+        metadata = runner / "checkpoint.metadata.json"
+        checkpoint.write_text('{"step": 4}\n', encoding="utf-8")
+        metadata.write_text('{"checkpoint": "bound"}\n', encoding="utf-8")
+        receipt = (
+            self.repo.state_dir
+            / "attempts"
+            / str(item_id)
+            / "segments"
+            / "1"
+            / "yield"
+            / "receipt.json"
+        )
+        receipt.parent.mkdir(parents=True)
+        receipt.write_text(
+            json.dumps(
+                {
+                    "checkpoint": str(checkpoint),
+                    "checkpoint_metadata": str(metadata),
+                }
+            ),
+            encoding="utf-8",
+        )
+        with self.repo.store.connect() as connection:
+            connection.execute(
+                "UPDATE metadata SET value = '3' WHERE key = 'schema_version'"
+            )
+            connection.execute(
+                "UPDATE queue_items SET state = 'queued', segment = 2, "
+                "runner_run_dir = ?, continuation_checkpoint = ?, "
+                "continuation_checkpoint_sha256 = ?, "
+                "continuation_checkpoint_metadata = NULL, "
+                "continuation_checkpoint_metadata_sha256 = NULL WHERE id = ?",
+                (
+                    str(runner),
+                    str(checkpoint),
+                    hashlib.sha256(checkpoint.read_bytes()).hexdigest(),
+                    item_id,
+                ),
+            )
+
+        migrated = QueueStore(self.repo.state_dir, self.repo.root)
+        migrated_item = migrated.item(item_id)
+        self.assertEqual(migrated_item["state"], "queued")
+        self.assertEqual(
+            migrated_item["continuation_checkpoint_metadata"], str(metadata.resolve())
+        )
+        self.assertEqual(
+            migrated_item["continuation_checkpoint_metadata_sha256"],
+            hashlib.sha256(metadata.read_bytes()).hexdigest(),
+        )
+
+        metadata.unlink()
+        with migrated.connect() as connection:
+            connection.execute(
+                "UPDATE metadata SET value = '3' WHERE key = 'schema_version'"
+            )
+            connection.execute(
+                "UPDATE queue_items SET continuation_checkpoint_metadata = NULL, "
+                "continuation_checkpoint_metadata_sha256 = NULL WHERE id = ?",
+                (item_id,),
+            )
+        held = QueueStore(self.repo.state_dir, self.repo.root).item(item_id)
+        self.assertEqual(held["state"], "held")
+        self.assertIn("could not bind", held["state_detail"])
 
     def test_remove_preserves_history_and_explicit_readd_creates_new_membership(self) -> None:
         first = add_experiment(self.repo.store, "TST-001")
@@ -970,6 +1043,17 @@ class ExperimentQueueTests(unittest.TestCase):
         self.assertIsNone(validated)
         self.assertIn("invalid optimizer step 0", str(error))
 
+        with mock.patch(
+            "helmholtz_shared.experiment_queue._sha256_file",
+            side_effect=OSError("checkpoint disappeared during hashing"),
+        ):
+            validated, error = scheduler._validated_yield_receipt(  # noqa: SLF001
+                self.repo.store.item(item_id),
+                runner_run_dir=str(run_dir),
+            )
+        self.assertIsNone(validated)
+        self.assertIn("could not be verified", str(error))
+
     def test_specfem_controller_receipt_matches_queue_contract(self) -> None:
         item_id = add_experiment(self.repo.store, "TST-009", preemptible=True)
         request_id = "specfem-yield-request"
@@ -1037,6 +1121,126 @@ class ExperimentQueueTests(unittest.TestCase):
             validated["progress"],
             {"unit": "settled_rows", "completed": 0, "total": 30_000},
         )
+        metadata = Path(validated["checkpoint_metadata"])
+        self.assertEqual(
+            validated["checkpoint_metadata_bytes"], metadata.stat().st_size
+        )
+        self.assertEqual(
+            validated["checkpoint_metadata_sha256"],
+            hashlib.sha256(metadata.read_bytes()).hexdigest(),
+        )
+
+        scheduler._finalize_yield(  # noqa: SLF001
+            self.repo.store.item(item_id),
+            executor_receipt={},
+            runner_receipt={"run_directory": str(run_dir)},
+            yield_receipt=validated,
+        )
+        queued = self.repo.store.item(item_id)
+        self.assertEqual(queued["continuation_checkpoint_metadata"], str(metadata))
+        metadata.write_text('{"corrupt": true}\n', encoding="utf-8")
+        with self.assertRaisesRegex(QueueError, "metadata is missing or changed"):
+            queue_module._validated_continuation_checkpoint(queued)  # noqa: SLF001
+
+    def test_corrupt_continuation_is_held_without_blocking_next_item(self) -> None:
+        gpu = self.gpu()
+        update_gpu_allowlist(self.repo.store, "set", ["0"], snapshots=[gpu])
+        corrupt_id = add_experiment(self.repo.store, "TST-001")
+        healthy_id = add_experiment(self.repo.store, "TST-002")
+        runner = self.repo.root / "outputs" / "corrupt-continuation"
+        runner.mkdir(parents=True)
+        checkpoint = runner / "checkpoint.json"
+        metadata = runner / "checkpoint.metadata.json"
+        checkpoint.write_text('{"step": 4}\n', encoding="utf-8")
+        metadata.write_text('{"metadata": "original"}\n', encoding="utf-8")
+        with self.repo.store.connect() as connection:
+            connection.execute(
+                "UPDATE queue_items SET segment = 2, resume_front = 1, "
+                "runner_run_dir = ?, continuation_checkpoint = ?, "
+                "continuation_checkpoint_sha256 = ?, "
+                "continuation_checkpoint_metadata = ?, "
+                "continuation_checkpoint_metadata_sha256 = ?, "
+                "continuation_step = 4 WHERE id = ?",
+                (
+                    str(runner.resolve()),
+                    str(checkpoint.resolve()),
+                    hashlib.sha256(checkpoint.read_bytes()).hexdigest(),
+                    str(metadata.resolve()),
+                    hashlib.sha256(metadata.read_bytes()).hexdigest(),
+                    corrupt_id,
+                ),
+            )
+        metadata.write_text('{"metadata": "changed"}\n', encoding="utf-8")
+        scheduler = Scheduler(
+            self.repo.store,
+            poll_seconds=0.01,
+            min_free_disk_gib=0,
+            gpu_provider=lambda: [gpu],
+        )
+
+        scheduler.run_iteration(force_gpu_poll=True)
+        corrupt = self.repo.store.item(corrupt_id)
+        self.assertEqual(corrupt["state"], "held")
+        self.assertIn("metadata is missing or changed", corrupt["state_detail"])
+
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            scheduler.run_iteration(force_gpu_poll=True)
+            if self.repo.store.item(healthy_id)["state"] == "succeeded":
+                break
+            time.sleep(0.05)
+        self.assertEqual(self.repo.store.item(healthy_id)["state"], "succeeded")
+        with self.repo.store.connect() as connection:
+            events = list(
+                connection.execute(
+                    "SELECT event_type FROM events WHERE queue_item_id = ?",
+                    (corrupt_id,),
+                )
+            )
+        self.assertIn(
+            "QUEUE_CONTINUATION_INTEGRITY_HELD",
+            {row["event_type"] for row in events},
+        )
+
+    def test_stale_yield_finalization_preserves_newer_termination(self) -> None:
+        gpu = self.gpu()
+        item_id = add_experiment(self.repo.store, "TST-007", preemptible=True)
+        request_id = "stale-yield-request"
+        with self.repo.store.connect() as connection:
+            connection.execute(
+                "UPDATE queue_items SET state = 'yielding', yield_request_id = ?, "
+                "assigned_gpu_uuid = ?, assigned_gpu_index = ? WHERE id = ?",
+                (request_id, gpu.uuid, gpu.index, item_id),
+            )
+        stale = self.repo.store.item(item_id)
+        with self.repo.store.connect() as connection:
+            connection.execute(
+                "UPDATE queue_items SET state = 'force_killing', state_detail = ? "
+                "WHERE id = ?",
+                ("operator force kill", item_id),
+            )
+        scheduler = Scheduler(
+            self.repo.store,
+            min_free_disk_gib=0,
+            gpu_provider=lambda: [],
+        )
+        finalized = scheduler._finalize_yield(  # noqa: SLF001
+            stale,
+            executor_receipt={"return_code": 75},
+            runner_receipt={},
+            yield_receipt={
+                "checkpoint": "/tmp/checkpoint",
+                "checkpoint_sha256": "a" * 64,
+                "checkpoint_metadata": "/tmp/checkpoint.metadata",
+                "checkpoint_metadata_sha256": "b" * 64,
+                "step": 1,
+                "wandb": None,
+            },
+        )
+        self.assertFalse(finalized)
+        current = self.repo.store.item(item_id)
+        self.assertEqual(current["state"], "force_killing")
+        self.assertEqual(current["state_detail"], "operator force kill")
 
     @unittest.skipIf(os.name != "posix", "cooperative subprocess yield is POSIX-specific")
     def test_yield_checkpoints_reserves_old_gpu_and_resumes_at_queue_front(self) -> None:
