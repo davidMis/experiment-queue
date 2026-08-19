@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "experiment-queue"
+version = "0.1.0"
+description = "A durable, operator-controlled queue for scientific GPU experiments."
+readme = "README.md"
+requires-python = ">=3.14"
+license = { file = "LICENSE" }
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[project.scripts]
+experiment-queue = "experiment_queue.queue:main"
+experiment-queue-web = "experiment_queue.web:main"
+run-experiment = "experiment_queue.runner:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "--strict-markers"
+markers = [
+  "fast: short unit tests",
+  "integration: filesystem, subprocess, or end-to-end tests",
+]

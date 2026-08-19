@@ -18,13 +18,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from unittest import mock
 
-from data_generation.hno_specfem_worker_control import (
-    PipelineYieldController,
-    RUNNER_OUTPUT_ENV,
-    YIELD_RECEIPT_ENV,
-    YIELD_REQUEST_ENV,
-)
-import helmholtz_shared.experiment_queue as queue_module
+import experiment_queue.queue as queue_module
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -33,7 +27,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 def time_to_datetime(value: str, *, seconds: int = 0):
     return datetime.fromisoformat(value) + timedelta(seconds=seconds)
 
-from helmholtz_shared.experiment_queue import (  # noqa: E402
+from experiment_queue.queue import (  # noqa: E402
     GpuSnapshot,
     QueueError,
     QueueStore,
@@ -353,34 +347,6 @@ class ExperimentQueueTests(unittest.TestCase):
             self.assertIn("git_ref", columns)
             self.assertIn("worktree_path", columns)
             self.assertIn("gpu_reservations", tables)
-
-    def test_current_queue_candidate_cards_have_exact_runner_commands(self) -> None:
-        for experiment_id in (
-            "WCG-008",
-            "WCG-017",
-            "WCG-019",
-            "WCG-020",
-            "WCG-021",
-            "WCG-022",
-            "WCG-023",
-            "WCG-024",
-            "HNO-SPECFEM-W00-002",
-            "HNO-SPECFEM-W01-002",
-            "HNO-SPECFEM-W02-002",
-            "HNO-SPECFEM-W03-002",
-            "HNO-SPECFEM-W04-002",
-            "HNO-SPECFEM-W05-002",
-            "HNO-SPECFEM-W06-002",
-            "HNO-SPECFEM-W07-002",
-            "HNO-SPECFEM-W00-003",
-            "HNO-SPECFEM-W01-003",
-            "HNO-SPECFEM-W02-003",
-            "HNO-SPECFEM-W03-003",
-        ):
-            with self.subTest(experiment_id=experiment_id):
-                card = read_card_command(REPO_ROOT, experiment_id)
-                self.assertIn("scripts/run_experiment.py", card.command_text)
-                self.assertIn("--require-clean", card.command_text)
 
     def test_add_does_not_scan_other_cards_or_status(self) -> None:
         item_id = add_experiment(self.repo.store, "TST-001", priority=7)
@@ -935,7 +901,7 @@ class ExperimentQueueTests(unittest.TestCase):
             raise OSError("simulated request write failure")
 
         with mock.patch(
-            "helmholtz_shared.experiment_queue._atomic_write_json",
+            "experiment_queue.queue._atomic_write_json",
             side_effect=fail_after_termination,
         ):
             with self.assertRaisesRegex(QueueError, "could not deliver yield request"):
@@ -997,7 +963,7 @@ class ExperimentQueueTests(unittest.TestCase):
             raise OSError("simulated request write failure")
 
         with mock.patch(
-            "helmholtz_shared.experiment_queue._atomic_write_json",
+            "experiment_queue.queue._atomic_write_json",
             side_effect=fail_after_termination,
         ):
             with self.assertRaisesRegex(
@@ -1136,7 +1102,7 @@ class ExperimentQueueTests(unittest.TestCase):
         self.assertIn("invalid optimizer step 0", str(error))
 
         with mock.patch(
-            "helmholtz_shared.experiment_queue._sha256_file",
+            "experiment_queue.queue._sha256_file",
             side_effect=OSError("checkpoint disappeared during hashing"),
         ):
             validated, error = scheduler._validated_yield_receipt(  # noqa: SLF001
@@ -1145,94 +1111,6 @@ class ExperimentQueueTests(unittest.TestCase):
             )
         self.assertIsNone(validated)
         self.assertIn("could not be verified", str(error))
-
-    def test_specfem_controller_receipt_matches_queue_contract(self) -> None:
-        item_id = add_experiment(self.repo.store, "TST-009", preemptible=True)
-        request_id = "specfem-yield-request"
-        run_dir = self.repo.root / "outputs" / "experiments" / "specfem-run"
-        segment_dir = (
-            self.repo.state_dir
-            / "attempts"
-            / str(item_id)
-            / "segments"
-            / "1"
-            / "yield"
-        )
-        request_path = segment_dir / "request.json"
-        receipt_path = segment_dir / "receipt.json"
-        request_path.parent.mkdir(parents=True)
-        request_path.write_text(
-            json.dumps(
-                {
-                    "schema_version": 1,
-                    "request_id": request_id,
-                    "queue_item_id": item_id,
-                    "segment": 1,
-                    "gpu_uuid": "GPU-test-0000",
-                    "requested_at": "2026-08-18T12:00:00+00:00",
-                }
-            ),
-            encoding="utf-8",
-        )
-        with self.repo.store.connect() as connection:
-            connection.execute(
-                "UPDATE queue_items SET state = 'yielding', yield_request_id = ?, "
-                "runner_run_dir = ? WHERE id = ?",
-                (request_id, str(run_dir), item_id),
-            )
-        controller = PipelineYieldController.from_environment(
-            {
-                YIELD_REQUEST_ENV: str(request_path),
-                YIELD_RECEIPT_ENV: str(receipt_path),
-                RUNNER_OUTPUT_ENV: str(run_dir),
-            }
-        )
-        self.assertIsNotNone(controller)
-        self.assertTrue(
-            controller.publish_if_requested(
-                pipeline_root=self.repo.root / "shared-pipeline",
-                pipeline_plan_sha256="pipeline-plan",
-                case_plan_sha256="case-plan",
-                worker_token="W00",
-                completed_rows=0,
-                total_rows=30_000,
-            )
-        )
-        scheduler = Scheduler(
-            self.repo.store,
-            min_free_disk_gib=0,
-            gpu_provider=lambda: [],
-        )
-        validated, error = scheduler._validated_yield_receipt(  # noqa: SLF001
-            self.repo.store.item(item_id),
-            runner_run_dir=str(run_dir),
-        )
-        self.assertIsNone(error)
-        self.assertEqual(validated["step"], 0)
-        self.assertEqual(
-            validated["progress"],
-            {"unit": "settled_rows", "completed": 0, "total": 30_000},
-        )
-        metadata = Path(validated["checkpoint_metadata"])
-        self.assertEqual(
-            validated["checkpoint_metadata_bytes"], metadata.stat().st_size
-        )
-        self.assertEqual(
-            validated["checkpoint_metadata_sha256"],
-            hashlib.sha256(metadata.read_bytes()).hexdigest(),
-        )
-
-        scheduler._finalize_yield(  # noqa: SLF001
-            self.repo.store.item(item_id),
-            executor_receipt={},
-            runner_receipt={"run_directory": str(run_dir)},
-            yield_receipt=validated,
-        )
-        queued = self.repo.store.item(item_id)
-        self.assertEqual(queued["continuation_checkpoint_metadata"], str(metadata))
-        metadata.write_text('{"corrupt": true}\n', encoding="utf-8")
-        with self.assertRaisesRegex(QueueError, "metadata is missing or changed"):
-            queue_module._validated_continuation_checkpoint(queued)  # noqa: SLF001
 
     def test_corrupt_continuation_is_held_without_blocking_next_item(self) -> None:
         gpu = self.gpu()

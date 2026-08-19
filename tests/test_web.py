@@ -10,8 +10,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from helmholtz_shared.experiment_queue import GpuSnapshot, QueueError, QueueStore, update_gpu_allowlist
-from helmholtz_shared.experiment_queue_web import (
+from experiment_queue.queue import GpuSnapshot, QueueError, QueueStore, update_gpu_allowlist
+from experiment_queue.web import (
     AUTH_FILENAME,
     AuthManager,
     CLIENT_SCRIPT,
@@ -546,7 +546,7 @@ def test_authenticated_event_stream_pushes_status_without_page_reload(
             return {"reserve": "<section>live status</section>"}
 
     monkeypatch.setattr(
-        "helmholtz_shared.experiment_queue_web.LIVE_POLL_SECONDS", 0.0
+        "experiment_queue.web.LIVE_POLL_SECONDS", 0.0
     )
     handler = QueueWebHandler.__new__(QueueWebHandler)
     handler.server = SimpleNamespace(app=OneUpdateApp())

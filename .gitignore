@@ -1,0 +1,15 @@
+# Local Python and test artifacts.
+.DS_Store
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Operator configuration and legacy local state must not be committed.
+.env
+gpu_scheduler_state/

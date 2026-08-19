@@ -33,11 +33,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
-from helmholtz_shared.experiment_runner import collect_git_context
+from experiment_queue.config import StateDirectoryError, resolve_state_dir
+from experiment_queue.runner import collect_git_context
 
 
 SCHEMA_VERSION = 4
-DEFAULT_STATE_DIR = Path("gpu_scheduler_state")
 WORKTREE_ROOT_NAME = "worktrees"
 SHARED_WORKTREE_PATHS = (
     ".env",
@@ -3832,10 +3832,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--state-dir",
         type=Path,
-        default=DEFAULT_STATE_DIR,
+        default=None,
         help=(
-            "Ignored durable state directory for the SQLite database, logs, and receipts. "
-            "Relative paths are resolved from --repo-root. Default: gpu_scheduler_state."
+            "Absolute durable state directory for the SQLite database, logs, and receipts. "
+            "Required unless EXPERIMENT_QUEUE_STATE_DIR is set."
         ),
     )
     subparsers = parser.add_subparsers(dest="action", required=True)
@@ -4006,8 +4006,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def _resolve_paths(args: argparse.Namespace) -> tuple[Path, Path]:
     repo_root = args.repo_root.resolve()
-    state_dir = args.state_dir if args.state_dir.is_absolute() else repo_root / args.state_dir
-    return repo_root, state_dir.resolve()
+    return repo_root, resolve_state_dir(args.state_dir)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -4015,8 +4014,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     parser = build_arg_parser()
     args = parser.parse_args(argv)
-    repo_root, state_dir = _resolve_paths(args)
     try:
+        repo_root, state_dir = _resolve_paths(args)
         store = QueueStore(state_dir, repo_root)
         if args.action == "add":
             item_id = add_experiment(
@@ -4132,7 +4131,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             return execute_item(store, args.item_id)
         else:
             parser.error(f"unsupported action {args.action!r}")
-    except QueueError as exc:
+    except (QueueError, StateDirectoryError) as exc:
         print(f"experiment queue error: {exc}", file=sys.stderr)
         return 2
     return 0

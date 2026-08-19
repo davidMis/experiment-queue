@@ -19,7 +19,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
-from helmholtz_shared.experiment_runner import (  # noqa: E402
+from experiment_queue.runner import (  # noqa: E402
     DEFAULT_USE_PTY,
     ExperimentError,
     ExperimentRequest,

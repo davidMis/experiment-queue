@@ -25,7 +25,8 @@ import time
 from typing import Any, Mapping, Sequence
 from urllib.parse import parse_qs, urlencode, urlparse
 
-from helmholtz_shared.experiment_queue import (
+from experiment_queue.config import StateDirectoryError, resolve_state_dir
+from experiment_queue.queue import (
     MAX_RESERVATION_HOURS,
     MIN_RESERVATION_HOURS,
     PENDING_STATES,
@@ -1580,8 +1581,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--state-dir",
         type=Path,
-        default=Path("gpu_scheduler_state"),
-        help="Ignored scheduler state directory. Relative paths resolve from --repo-root.",
+        default=None,
+        help=(
+            "Absolute scheduler state directory. Required unless "
+            "EXPERIMENT_QUEUE_STATE_DIR is set."
+        ),
     )
     subparsers = parser.add_subparsers(dest="action", required=True)
     subparsers.add_parser(
@@ -1612,8 +1616,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def _resolve_paths(args: argparse.Namespace) -> tuple[Path, Path]:
     repo_root = args.repo_root.resolve()
-    state_dir = args.state_dir if args.state_dir.is_absolute() else repo_root / args.state_dir
-    return repo_root, state_dir.resolve()
+    return repo_root, resolve_state_dir(args.state_dir)
 
 
 def _prompt_password(label: str) -> str:
@@ -1628,8 +1631,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Configure credentials or run the private web service."""
 
     args = build_arg_parser().parse_args(argv)
-    repo_root, state_dir = _resolve_paths(args)
     try:
+        repo_root, state_dir = _resolve_paths(args)
         store = QueueStore(state_dir, repo_root)
         if args.action == "auth-setup":
             path = initialize_web_auth(
@@ -1650,7 +1653,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             insecure_http=args.insecure_http,
         )
         return 0
-    except QueueError as exc:
+    except (QueueError, StateDirectoryError) as exc:
         print(f"scheduler web error: {exc}", file=os.sys.stderr)
         return 2
 
