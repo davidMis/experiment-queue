@@ -29,6 +29,7 @@ from helmholtz_shared.experiment_queue import (
     MAX_RESERVATION_HOURS,
     MIN_RESERVATION_HOURS,
     PENDING_STATES,
+    PRIORITY_MUTABLE_STATES,
     RUNNING_STATES,
     TERMINAL_STATES,
     GpuSnapshot,
@@ -42,6 +43,7 @@ from helmholtz_shared.experiment_queue import (
     release_item,
     remove_item,
     request_gpu_reservation,
+    request_preemption,
     request_termination,
     set_dispatch_paused,
     set_priority,
@@ -949,7 +951,7 @@ class SchedulerWebApp:
         sections = self._reserve_sections(session)
         admin_link = '<a class="button secondary" href="/admin">Administrator</a>' if session.role == "admin" else ""
         body = f"""<main class="shell"><header class="top"><div><div class="eyebrow">Shared GPU courtesy desk</div>
-<h1 class="title">Need a GPU? Take a window.</h1><p class="subtitle">A running preemptible job will save a continuation checkpoint, leave the device, and return to the front of David’s queue on another available GPU.</p></div>
+<h1 class="title">Need a GPU? Take a window.</h1><p class="subtitle">A running preemptible job will save a continuation checkpoint, leave the device, and return to the front of its priority band on another available GPU.</p></div>
 <nav class="nav">{self._live_indicator()}{self._theme_toggle()}{admin_link}<form method="post" action="/logout"><input type="hidden" name="csrf" value="{_escape(session.csrf)}"><button class="secondary">Sign out</button></form></nav></header>
 {self._flash(query)}<div data-live-section="reserve">{sections['reserve']}</div>
 <section class="panel"><strong>Reservation rules</strong><p class="muted">Choose 1–24 whole hours. The timer for a yielded job starts only after its checkpoint is verified and its GPU process exits. Expiry removes the temporary reservation; normal GPU polling still prevents launch while another process is present.</p></section></main>"""
@@ -983,7 +985,10 @@ class SchedulerWebApp:
                 else:
                     actions.append(f'<form method="post" action="/admin/item">{base}<input type="hidden" name="operation" value="hold"><button class="secondary">Hold</button></form>')
                 actions.append(f'<form method="post" action="/admin/item">{base}<input type="hidden" name="operation" value="remove"><button class="danger">Remove</button></form>')
+            if item["state"] in PRIORITY_MUTABLE_STATES:
                 actions.append(f'<form method="post" action="/admin/item">{base}<input type="hidden" name="operation" value="priority"><input style="width:76px" name="priority" type="number" value="{item["priority"]}" aria-label="Priority"><button>Set</button></form>')
+            if item["state"] == "running" and item["preemptible"]:
+                actions.append(f'<form method="post" action="/admin/item">{base}<input type="hidden" name="operation" value="preempt"><input style="width:150px" name="reason" placeholder="reason (optional)" aria-label="Preemption reason"><button class="secondary">Checkpoint &amp; requeue</button></form>')
             if item["state"] in RUNNING_STATES:
                 actions.append(f'<form method="post" action="/admin/item">{base}<input type="hidden" name="operation" value="terminate"><button class="secondary">Terminate</button></form>')
                 actions.append(f'<form method="post" action="/admin/item">{base}<input type="hidden" name="operation" value="kill"><input style="width:88px" name="confirm" placeholder="type KILL" aria-label="Type KILL to confirm force kill" required><button class="danger">Force kill</button></form>')
@@ -1067,7 +1072,7 @@ class SchedulerWebApp:
     ) -> bytes:
         sections = self._admin_sections(session)
         body = f"""<main class="shell"><header class="top"><div><div class="eyebrow">Mutton2 scheduler</div><h1 class="title">Queue control</h1>
-<p class="subtitle">Explicit experiment admission, mutable GPU pool, safe yield reservations, and complete operational history.</p></div><nav class="nav">{self._live_indicator()}{self._theme_toggle()}<a class="button secondary" href="/reserve">Reservation page</a><form method="post" action="/logout"><input type="hidden" name="csrf" value="{_escape(session.csrf)}"><button class="secondary">Sign out</button></form></nav></header>
+<p class="subtitle">Explicit experiment admission, mutable priorities and GPU pool, safe manual preemption and yield reservations, and complete operational history.</p></div><nav class="nav">{self._live_indicator()}{self._theme_toggle()}<a class="button secondary" href="/reserve">Reservation page</a><form method="post" action="/logout"><input type="hidden" name="csrf" value="{_escape(session.csrf)}"><button class="secondary">Sign out</button></form></nav></header>
 {self._flash(query)}<div data-live-section="dispatch">{sections['dispatch']}</div>
 <section><h2>GPU pool</h2><div data-live-section="gpus">{sections['gpus']}</div>
 <div class="panel"><form method="post" action="/admin/gpu"><input type="hidden" name="csrf" value="{_escape(session.csrf)}"><div class="row"><div class="field"><label>Indices, UUIDs, or UUID prefixes</label><input name="identifiers" placeholder="0 2 GPU-…"></div><button name="operation" value="add">Add GPUs</button><button class="secondary" name="operation" value="set">Replace pool</button><button class="danger" name="operation" value="clear">Clear pool</button></div></form></div></section>
@@ -1121,6 +1126,13 @@ class SchedulerWebApp:
                     self.store,
                     item_id,
                     _integer(_field(form, "priority"), label="priority"),
+                    actor=actor,
+                )
+            elif operation == "preempt":
+                request_preemption(
+                    self.store,
+                    item_id,
+                    reason=_field(form, "reason").strip() or "administrator web request",
                     actor=actor,
                 )
             elif operation == "terminate":

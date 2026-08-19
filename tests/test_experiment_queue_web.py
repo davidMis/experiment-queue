@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -40,6 +41,9 @@ def _insert_run(
     state: str,
     run_dir: Path | None = None,
     rsync_command: str | None = None,
+    preemptible: bool = False,
+    assigned_gpu_uuid: str | None = None,
+    assigned_gpu_index: str | None = None,
 ) -> None:
     """Insert a minimal durable queue item for read-only web rendering tests."""
 
@@ -49,8 +53,9 @@ def _insert_run(
             INSERT INTO queue_items(
                 id, experiment_id, attempt, state, priority, card_path, card_sha256,
                 command_text, runner_name, git_commit, added_at, added_by,
-                runner_run_dir, runner_manifest_path, rsync_pull_command
-            ) VALUES (?, ?, 1, ?, 20, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                runner_run_dir, runner_manifest_path, rsync_pull_command,
+                preemptible, assigned_gpu_uuid, assigned_gpu_index
+            ) VALUES (?, ?, 1, ?, 20, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 item_id,
@@ -66,6 +71,9 @@ def _insert_run(
                 str(run_dir) if run_dir is not None else None,
                 str(run_dir / "manifest.json") if run_dir is not None else None,
                 rsync_command,
+                int(preemptible),
+                assigned_gpu_uuid,
+                assigned_gpu_index,
             ),
         )
         store._event(
@@ -173,6 +181,69 @@ def test_reservation_page_and_admin_actions_use_same_durable_queue(tmp_path: Pat
         "/admin/dispatch", {"operation": ["pause"], "reason": ["maintenance"]}
     )
     assert store.get_meta("dispatch_paused") == "1"
+
+
+def test_admin_can_reprioritize_and_manually_preempt_a_running_item(tmp_path: Path) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    state_dir = repo_root / "gpu_scheduler_state"
+    store = QueueStore(state_dir, repo_root)
+    gpu = _gpu()
+    _insert_run(
+        store,
+        item_id=1,
+        state="running",
+        preemptible=True,
+        assigned_gpu_uuid=gpu.uuid,
+        assigned_gpu_index=gpu.index,
+    )
+    auth = AuthManager(
+        initialize_web_auth(
+            state_dir,
+            admin_password="administrator-secret",
+            reservation_password="coworker-shared-secret",
+        )
+    )
+    app = SchedulerWebApp(store, auth)
+    app.gpu_snapshots = lambda: ([gpu], None)  # type: ignore[method-assign]
+    _token, admin_session = auth.issue_session("admin")
+
+    page = app.render_admin(admin_session, {}).decode("utf-8")
+    assert "Checkpoint &amp; requeue" in page
+    assert 'name="operation" value="priority"' in page
+    assert "priority recorded" in app.admin_action(
+        "/admin/item",
+        {"item_id": ["1"], "operation": ["priority"], "priority": ["77"]},
+    )
+    assert store.item(1)["priority"] == 77
+
+    assert "preempt recorded" in app.admin_action(
+        "/admin/item",
+        {
+            "item_id": ["1"],
+            "operation": ["preempt"],
+            "reason": ["stakeholder overnight run"],
+        },
+    )
+
+    item = store.item(1)
+    assert item["state"] == "yielding"
+    assert item["yield_duration_hours"] is None
+    request_path = state_dir / "attempts" / "1" / "segments" / "1" / "yield" / "request.json"
+    request = json.loads(request_path.read_text(encoding="utf-8"))
+    assert request["request_kind"] == "manual_preemption"
+    assert request["requested_by"] == "web:admin"
+    assert request["note"] == "stakeholder overnight run"
+    with store.connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM gpu_reservations").fetchone()[0] == 0
+        events = {
+            str(row["event_type"])
+            for row in connection.execute(
+                "SELECT event_type FROM events WHERE queue_item_id = 1"
+            )
+        }
+    assert "PRIORITY_CHANGED" in events
+    assert "MANUAL_PREEMPTION_REQUESTED" in events
 
 
 def test_live_sections_change_with_durable_queue_revision_and_enforce_role(

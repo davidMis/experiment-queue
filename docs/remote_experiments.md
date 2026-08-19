@@ -148,9 +148,13 @@ shared artifacts. The ignored `gpu_scheduler_state/` directory owns the live
 SQLite journal, code worktrees, web authentication hashes, reservations,
 continuation segments, and receipts. The separate private HTTPS interface in
 `scripts/run_experiment_queue_web.py` exposes an administrator dashboard and a
-restricted coworker reservation page over that same state. `STATUS.md` remains
-the scientific ledger and is updated only from David's reports and synchronized
-artifacts.
+restricted coworker reservation page over that same state. Queue priorities
+may be edited while capable work is active, but never cause automatic
+preemption. David may manually request a checkpoint-and-requeue from the CLI or
+administrator dashboard; the released GPU is then scheduled priority-first,
+with continuations first only within their own priority band. `STATUS.md`
+remains the scientific ledger and is updated only from David's reports and
+synchronized artifacts.
 
 ## Archived Phase Runbooks
 

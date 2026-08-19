@@ -47,8 +47,9 @@ from helmholtz_shared.experiment_queue import (  # noqa: E402
     read_card_command,
     release_gpu_reservation,
     remove_item,
-    request_termination,
     request_gpu_reservation,
+    request_preemption,
+    request_termination,
     set_priority,
     update_gpu_allowlist,
 )
@@ -536,14 +537,48 @@ class ExperimentQueueTests(unittest.TestCase):
         second = add_experiment(self.repo.store, "TST-001", new_attempt=True)
         self.assertEqual(self.repo.store.item(second)["attempt"], 2)
 
-    def test_priority_changes_only_pending_items(self) -> None:
+    def test_priority_changes_pending_and_resumable_active_items(self) -> None:
         item_id = add_experiment(self.repo.store, "TST-001")
-        set_priority(self.repo.store, item_id, 42)
-        self.assertEqual(self.repo.store.item(item_id)["priority"], 42)
+        for priority, state in enumerate(
+            ("queued", "held", "blocked", "starting", "running", "yielding"),
+            start=40,
+        ):
+            with self.repo.store.connect() as connection:
+                connection.execute(
+                    "UPDATE queue_items SET state = ? WHERE id = ?",
+                    (state, item_id),
+                )
+            set_priority(self.repo.store, item_id, priority)
+            self.assertEqual(self.repo.store.item(item_id)["priority"], priority)
+
         with self.repo.store.connect() as connection:
-            connection.execute("UPDATE queue_items SET state = 'running' WHERE id = ?", (item_id,))
-        with self.assertRaisesRegex(QueueError, "only pending"):
+            connection.execute(
+                "UPDATE queue_items SET state = 'succeeded' WHERE id = ?", (item_id,)
+            )
+        with self.assertRaisesRegex(QueueError, "priority can change only"):
             set_priority(self.repo.store, item_id, 1)
+
+    def test_resume_front_applies_only_within_the_same_priority_band(self) -> None:
+        high = add_experiment(self.repo.store, "TST-001", priority=20)
+        ordinary = add_experiment(self.repo.store, "TST-002", priority=10)
+        resumed = add_experiment(self.repo.store, "TST-003", priority=10)
+        with self.repo.store.connect() as connection:
+            connection.execute(
+                "UPDATE queue_items SET resume_front = 1 WHERE id = ?", (resumed,)
+            )
+        scheduler = Scheduler(
+            self.repo.store,
+            min_free_disk_gib=0,
+            gpu_provider=lambda: [],
+        )
+
+        self.assertEqual(scheduler._next_item()["id"], high)  # noqa: SLF001
+        with self.repo.store.connect() as connection:
+            connection.execute(
+                "UPDATE queue_items SET state = 'held' WHERE id = ?", (high,)
+            )
+        self.assertEqual(scheduler._next_item()["id"], resumed)  # noqa: SLF001
+        self.assertNotEqual(resumed, ordinary)
 
     def test_gpu_set_drains_removed_running_gpu(self) -> None:
         gpu0 = self.gpu("0", "GPU-test-0000")
@@ -918,6 +953,63 @@ class ExperimentQueueTests(unittest.TestCase):
         self.assertEqual(item["state_detail"], "admin requested termination")
         self.assertEqual(list_reservations(self.repo.store)[0]["status"], "failed")
 
+    def test_manual_preemption_requires_a_capable_stably_running_gpu_item(self) -> None:
+        gpu = self.gpu()
+        item_id = add_experiment(self.repo.store, "TST-007")
+        with self.assertRaisesRegex(QueueError, "stably running"):
+            request_preemption(self.repo.store, item_id)
+
+        with self.repo.store.connect() as connection:
+            connection.execute(
+                "UPDATE queue_items SET state = 'running', assigned_gpu_uuid = ?, "
+                "assigned_gpu_index = ? WHERE id = ?",
+                (gpu.uuid, gpu.index, item_id),
+            )
+        with self.assertRaisesRegex(QueueError, "not marked"):
+            request_preemption(self.repo.store, item_id)
+
+        with self.repo.store.connect() as connection:
+            connection.execute(
+                "UPDATE queue_items SET preemptible = 1, assigned_gpu_uuid = NULL "
+                "WHERE id = ?",
+                (item_id,),
+            )
+        with self.assertRaisesRegex(QueueError, "no assigned GPU"):
+            request_preemption(self.repo.store, item_id)
+
+    def test_failed_manual_preemption_delivery_preserves_concurrent_termination(self) -> None:
+        gpu = self.gpu()
+        item_id = add_experiment(self.repo.store, "TST-007", preemptible=True)
+        with self.repo.store.connect() as connection:
+            connection.execute(
+                "UPDATE queue_items SET state = 'running', assigned_gpu_uuid = ?, "
+                "assigned_gpu_index = ? WHERE id = ?",
+                (gpu.uuid, gpu.index, item_id),
+            )
+
+        def fail_after_termination(_path, _payload) -> None:
+            with self.repo.store.connect() as connection:
+                connection.execute(
+                    "UPDATE queue_items SET state = 'terminating', state_detail = ? "
+                    "WHERE id = ?",
+                    ("admin requested termination", item_id),
+                )
+            raise OSError("simulated request write failure")
+
+        with mock.patch(
+            "helmholtz_shared.experiment_queue._atomic_write_json",
+            side_effect=fail_after_termination,
+        ):
+            with self.assertRaisesRegex(
+                QueueError, "could not deliver manual preemption request"
+            ):
+                request_preemption(self.repo.store, item_id)
+
+        item = self.repo.store.item(item_id)
+        self.assertEqual(item["state"], "terminating")
+        self.assertEqual(item["state_detail"], "admin requested termination")
+        self.assertEqual(list_reservations(self.repo.store), [])
+
     def test_terminal_continuation_preserves_original_runner_receipt_paths(self) -> None:
         item_id = add_experiment(self.repo.store, "TST-001")
         run_dir = self.repo.root / "outputs" / "experiments" / "original-run"
@@ -1243,7 +1335,87 @@ class ExperimentQueueTests(unittest.TestCase):
         self.assertEqual(current["state_detail"], "operator force kill")
 
     @unittest.skipIf(os.name != "posix", "cooperative subprocess yield is POSIX-specific")
-    def test_yield_checkpoints_reserves_old_gpu_and_resumes_at_queue_front(self) -> None:
+    def test_manual_preemption_requeues_without_a_reservation_and_obeys_priority(self) -> None:
+        gpu = self.gpu()
+        update_gpu_allowlist(
+            self.repo.store,
+            "set",
+            ["0"],
+            snapshots=[gpu],
+        )
+        low = add_experiment(
+            self.repo.store,
+            "TST-007",
+            priority=10,
+            preemptible=True,
+        )
+        scheduler = Scheduler(
+            self.repo.store,
+            poll_seconds=100,
+            min_free_disk_gib=0,
+            gpu_provider=lambda: [gpu],
+        )
+        scheduler.run_iteration(force_gpu_poll=True)
+        self.assertEqual(self.repo.store.item(low)["state"], "running")
+        high = add_experiment(self.repo.store, "TST-002", priority=20)
+
+        request_id = request_preemption(
+            self.repo.store,
+            low,
+            reason="stakeholder overnight run",
+            actor="test:operator",
+        )
+
+        yielding = self.repo.store.item(low)
+        self.assertEqual(yielding["state"], "yielding")
+        request_path = (
+            self.repo.state_dir
+            / "attempts"
+            / str(low)
+            / "segments"
+            / "1"
+            / "yield"
+            / "request.json"
+        )
+        request = json.loads(request_path.read_text(encoding="utf-8"))
+        self.assertEqual(request["request_id"], request_id)
+        self.assertEqual(request["request_kind"], "manual_preemption")
+        self.assertEqual(request["note"], "stakeholder overnight run")
+        self.assertEqual(list_reservations(self.repo.store), [])
+
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            scheduler.run_iteration(force_gpu_poll=True)
+            if (
+                self.repo.store.item(high)["state"] == "succeeded"
+                and self.repo.store.item(low)["state"] == "succeeded"
+            ):
+                break
+            time.sleep(0.03)
+
+        self.assertEqual(self.repo.store.item(high)["state"], "succeeded")
+        self.assertEqual(self.repo.store.item(low)["state"], "succeeded")
+        self.assertEqual(self.repo.store.item(low)["segment"], 2)
+        with self.repo.store.connect() as connection:
+            starts = [
+                int(row["queue_item_id"])
+                for row in connection.execute(
+                    "SELECT queue_item_id FROM events "
+                    "WHERE event_type = 'EXPERIMENT_STARTING' ORDER BY id"
+                )
+            ]
+            events = {
+                str(row["event_type"])
+                for row in connection.execute(
+                    "SELECT event_type FROM events WHERE queue_item_id = ?", (low,)
+                )
+            }
+        self.assertEqual(starts, [low, high, low])
+        self.assertIn("MANUAL_PREEMPTION_REQUESTED", events)
+        self.assertIn("EXPERIMENT_YIELDED_AND_REQUEUED", events)
+
+    @unittest.skipIf(os.name != "posix", "cooperative subprocess yield is POSIX-specific")
+    def test_yield_checkpoints_reserves_old_gpu_and_resumes_at_priority_front(self) -> None:
         gpu0 = self.gpu("0", "GPU-test-0000")
         gpu1 = self.gpu("1", "GPU-test-1111")
         update_gpu_allowlist(
@@ -1375,7 +1547,7 @@ class ExperimentQueueTests(unittest.TestCase):
         self.assertEqual(item["continuation_step"], 0)
         self.assertEqual(item["state_detail"], "resume from verified 0/12 settled_rows")
         self.assertIn(
-            "yielded at 0/12 settled_rows and returned to the queue front",
+            "yielded at 0/12 settled_rows and returned to the front of its priority band",
             console.getvalue(),
         )
         with self.repo.store.connect() as connection:

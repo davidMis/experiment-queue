@@ -65,6 +65,10 @@ Useful admission controls are:
 from card or ledger status. Use it only for workflows that implement the queue
 yield contract. The frozen WCG wrapper and Flowers trainer do so; data
 workflows may implement the same contract around a durable work-unit boundary.
+Do not mark a tightly coupled multi-GPU or distributed-data-parallel job
+preemptible unless its complete gang has a separately implemented coordinated
+checkpoint-and-exit contract. The current queue preempts one single-GPU item or
+one independently elastic worker at a time.
 
 An experiment can have only one active queue item. Removing a never-launched
 item and adding it again creates a new recorded membership. After any launched
@@ -212,9 +216,10 @@ dispatch order. **Reset** returns to the unfiltered decreasing-ID order. Job
 state badges use a consistent, theme-aware color palette while retaining their
 text labels, including during live table and run-detail updates.
 
-The coworker password cannot authorize queue admission, priority, allowlist,
-dispatch, termination, or force-kill operations. The required reservation note
-is the self-reported identity because coworkers share one credential. Sessions
+The coworker password cannot authorize queue admission, priority, manual
+preemption, allowlist, dispatch, termination, or force-kill operations. The
+required reservation note is the self-reported identity because coworkers
+share one credential. Sessions
 are signed, secure, HTTP-only, same-site cookies; every mutation also requires
 a session-specific CSRF token. Login failures are rate limited. HTTPS is
 required except for an explicit loopback-only local-test flag.
@@ -245,11 +250,15 @@ These controls may be used while `serve` is running:
 # Inspect all explicit membership and runtime state.
 .venv/bin/python scripts/run_experiment_queue.py status
 
-# Remove, hold, release, or reprioritize a pending item by exact queue ID.
+# Remove, hold, release, or reprioritize an item by exact queue ID.
 .venv/bin/python scripts/run_experiment_queue.py remove 3 --reason "superseded operational order"
 .venv/bin/python scripts/run_experiment_queue.py hold 4 --reason "awaiting operator review"
 .venv/bin/python scripts/run_experiment_queue.py release 4
 .venv/bin/python scripts/run_experiment_queue.py priority 4 200
+
+# Safely checkpoint and requeue one running preemptible item.
+.venv/bin/python scripts/run_experiment_queue.py preempt 7 \
+  --reason "make room for stakeholder overnight run"
 
 # Pause or resume only new dispatch. Running jobs are unchanged.
 .venv/bin/python scripts/run_experiment_queue.py pause --reason "maintenance window"
@@ -257,14 +266,34 @@ These controls may be used while `serve` is running:
 ```
 
 `remove` applies only to pending or held work. A running item must be
-terminated explicitly.
+preempted cooperatively or terminated explicitly. Priority may be changed for
+pending, starting, running, or yielding work; it never preempts another item
+automatically.
 
-## Yield And Resume A Running Job
+## Manually Preempt A Running Job
 
-The coworker page can reserve an idle eligible GPU or yield a running queue job
-that was explicitly admitted with `--preemptible`. Reservations accept only
-whole-hour durations from 1 through 24 and require a note identifying who the
-window is for.
+The CLI command above and the administrator dashboard's **Checkpoint &
+requeue** action target one exact queue item. The item must be stably `running`
+and must have been explicitly admitted with `--preemptible`. Manual preemption
+uses no signal and creates no timed GPU reservation: it asks the workflow to
+settle its current safe work unit, publish a complete continuation checkpoint,
+and exit with the cooperative-yield status. Once the scheduler verifies the
+checkpoint and observes process exit, the GPU is immediately eligible for
+normal dispatch.
+
+Dispatch order is `priority DESC, resume_front DESC, id ASC`. A yielded item
+therefore returns to the front of its current priority band. Every higher-
+priority dispatchable item runs first, while the continuation precedes newly
+added work at the same priority. The queue never initiates preemption merely
+because an item's priority changed or a higher-priority item arrived.
+
+## Cooperative Yield And Resume Contract
+
+Both manual preemption and the coworker reservation page use the same workflow-
+facing checkpoint protocol. The coworker page can reserve an idle eligible GPU
+or yield a running queue job that was explicitly admitted with
+`--preemptible`. Reservations accept only whole-hour durations from 1 through
+24 and require a note identifying who the window is for.
 
 For a running job, the queue first creates a pending reservation so dispatch
 cannot refill the device. The Flowers loop observes the durable request only
@@ -275,12 +304,15 @@ training batch and dropout randomness are step-derived, so the recorded global
 step restores their exact progression without an extra sampler cursor.
 
 The scheduler verifies the checkpoint path, size, digest, queue/request
-identity, metadata, and continuation `step` before it does either of the
-following. Legacy training receipts still require a positive optimizer step;
-generic progress receipts may use a nonnegative cursor:
+identity, metadata, and continuation `step` before it starts a pending
+reservation clock or requeues any yielded item. Legacy training receipts still
+require a positive optimizer step; generic progress receipts may use a
+nonnegative cursor:
 
-1. starts the reservation clock after the GPU-owning process has exited; and
-2. returns the same queue item to the front with a new execution segment.
+1. a reservation yield starts its clock only after the GPU-owning process has
+   exited; and
+2. every successful yield returns the same queue item to the front of its
+   priority band with a new execution segment.
 
 Both checkpoint and metadata paths and SHA-256 digests are stored in the queue
 and revalidated immediately before every continuation launch. Missing, linked,
@@ -344,8 +376,10 @@ recorded new-attempt workflow for the terminal queue item and verify child
 termination before cleaning its partial work or admitting a replacement for
 that worker.
 
-The yielded GPU is excluded while the reservation is pending or active. The
-front item may therefore resume on another eligible idle GPU. The experiment
+For a reservation yield, the old GPU is excluded while the reservation is
+pending or active, so the continuation may resume on another eligible idle
+GPU. Manual preemption creates no exclusion; the scheduler assigns the released
+device according to current queue priority. In either case, the experiment
 runner reopens the original run directory, appends a segment to its manifest
 and logs, and preserves the original pull command. The WCG wrapper reuses the
 same training directory, restores the preemption checkpoint, retains earlier
@@ -353,10 +387,10 @@ best/milestone checkpoints, and resumes an enabled W&B run using its exact ID
 with `resume=must`. A missing W&B identity blocks a W&B-enabled continuation
 rather than silently creating another run.
 
-If checkpoint creation fails, the trainer publishes a failure receipt and
-continues running. The reservation fails and its timer never starts. The
-coworker action never force-kills. David may still use the distinct terminate
-or force-kill controls.
+If checkpoint creation fails, the workflow publishes a failure receipt and
+continues running. A reservation fails and its timer never starts; a manually
+preempted item returns to `running`. Neither path force-kills. David may still
+use the distinct terminate or force-kill controls.
 
 An active reservation expires at its exact 1--24 hour deadline or can be
 released early. Expiry removes only the temporary exclusion: it does not

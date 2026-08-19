@@ -65,6 +65,7 @@ ACTIVE_STATES = {
 }
 PENDING_STATES = {"queued", "held", "blocked"}
 RUNNING_STATES = {"starting", "running", "yielding", "terminating", "force_killing"}
+PRIORITY_MUTABLE_STATES = PENDING_STATES | {"starting", "running", "yielding"}
 TERMINAL_STATES = {"succeeded", "failed", "interrupted", "force_killed", "removed"}
 SUCCESS_STATE = "succeeded"
 CARD_COMMAND_HEADING = "## Exact Manual Command On Mutton2"
@@ -1593,13 +1594,16 @@ def set_priority(
     *,
     actor: str | None = None,
 ) -> None:
-    """Change the dispatch priority of a pending item."""
+    """Change the priority of queued work or a resumable active attempt."""
 
     with store.connect() as connection:
         connection.execute("BEGIN IMMEDIATE")
         item = store.item(item_id, connection=connection)
-        if item["state"] not in PENDING_STATES:
-            raise QueueError(f"queue item {item_id} is {item['state']}; only pending priority can change")
+        if item["state"] not in PRIORITY_MUTABLE_STATES:
+            raise QueueError(
+                f"queue item {item_id} is {item['state']}; priority can change only "
+                "for pending, starting, running, or yielding work"
+            )
         connection.execute("UPDATE queue_items SET priority = ? WHERE id = ?", (priority, item_id))
         store._event(
             connection,
@@ -2119,6 +2123,114 @@ def request_gpu_reservation(
                 )
             raise QueueError(f"could not deliver yield request: {exc}") from exc
     return reservation_id
+
+
+def request_preemption(
+    store: QueueStore,
+    item_id: int,
+    *,
+    reason: str | None = None,
+    actor: str | None = None,
+) -> str:
+    """Ask one capable running item to checkpoint, exit, and rejoin its priority band."""
+
+    cleaned_reason = " ".join((reason or "manual operator preemption").split()).strip()
+    if not cleaned_reason:
+        cleaned_reason = "manual operator preemption"
+    if len(cleaned_reason) > 200:
+        raise QueueError("preemption reason must be 200 characters or fewer")
+    requested_by = actor or _actor()
+    requested_at = utc_now_iso()
+    request_id = uuid_module.uuid4().hex
+    with store.connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        item = store.item(item_id, connection=connection)
+        if item["state"] != "running":
+            raise QueueError(
+                f"queue item {item_id} is {item['state']}; cooperative preemption "
+                "requires a stably running item"
+            )
+        if not item["preemptible"]:
+            raise QueueError(
+                f"queue item {item_id} is not marked checkpoint-and-requeue capable"
+            )
+        gpu_uuid = str(item["assigned_gpu_uuid"] or "").strip()
+        if not gpu_uuid:
+            raise QueueError(
+                f"queue item {item_id} has no assigned GPU; cannot request preemption"
+            )
+        segment = int(item["segment"])
+        connection.execute(
+            """
+            UPDATE queue_items SET state = 'yielding', yield_requested_at = ?,
+                yield_requested_by = ?, yield_request_id = ?, yield_note = ?,
+                yield_duration_hours = NULL, state_detail = ?
+            WHERE id = ? AND state = 'running'
+            """,
+            (
+                requested_at,
+                requested_by,
+                request_id,
+                cleaned_reason,
+                f"checkpointing for manual preemption: {cleaned_reason}",
+                item_id,
+            ),
+        )
+        store._event(
+            connection,
+            "MANUAL_PREEMPTION_REQUESTED",
+            queue_item_id=item_id,
+            payload={
+                "request_id": request_id,
+                "gpu_uuid": gpu_uuid,
+                "segment": segment,
+                "reason": cleaned_reason,
+            },
+            actor=actor,
+        )
+
+    request_path = _yield_request_path(store, item_id, segment)
+    try:
+        _atomic_write_json(
+            request_path,
+            {
+                "schema_version": 1,
+                "request_kind": "manual_preemption",
+                "request_id": request_id,
+                "queue_item_id": item_id,
+                "segment": segment,
+                "gpu_uuid": gpu_uuid,
+                "requested_at": requested_at,
+                "requested_by": requested_by,
+                "note": cleaned_reason,
+            },
+        )
+    except OSError as exc:
+        with store.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            restored = connection.execute(
+                """
+                UPDATE queue_items SET state = 'running', state_detail = ?,
+                    yield_requested_at = NULL, yield_requested_by = NULL,
+                    yield_request_id = NULL, yield_note = NULL,
+                    yield_duration_hours = NULL
+                WHERE id = ? AND state = 'yielding' AND yield_request_id = ?
+                """,
+                (f"manual preemption request could not be written: {exc}", item_id, request_id),
+            )
+            store._event(
+                connection,
+                "MANUAL_PREEMPTION_REQUEST_FAILED",
+                queue_item_id=item_id,
+                payload={
+                    "request_id": request_id,
+                    "error": str(exc),
+                    "item_state_restored": restored.rowcount == 1,
+                },
+                actor=actor,
+            )
+        raise QueueError(f"could not deliver manual preemption request: {exc}") from exc
+    return request_id
 
 
 def release_gpu_reservation(
@@ -2645,7 +2757,7 @@ class Scheduler:
         self._release_gpu_lock(item["assigned_gpu_uuid"])
         print(
             f"[{utc_now_iso()}] queue item {item['id']} yielded at {progress_text} "
-            "and returned to the queue front",
+            "and returned to the front of its priority band",
             flush=True,
         )
         return True
@@ -2900,7 +3012,13 @@ class Scheduler:
                 if current["state"] != "yielding":
                     continue
                 connection.execute(
-                    "UPDATE queue_items SET state = 'running', state_detail = ? WHERE id = ?",
+                    """
+                    UPDATE queue_items SET state = 'running', state_detail = ?,
+                        yield_requested_at = NULL, yield_requested_by = NULL,
+                        yield_request_id = NULL, yield_note = NULL,
+                        yield_duration_hours = NULL
+                    WHERE id = ?
+                    """,
                     (detail, item["id"]),
                 )
                 reservation = connection.execute(
@@ -2993,7 +3111,7 @@ class Scheduler:
             candidates = list(
                 connection.execute(
                     "SELECT * FROM queue_items WHERE state = 'queued' "
-                    "ORDER BY resume_front DESC, priority DESC, id ASC"
+                    "ORDER BY priority DESC, resume_front DESC, id ASC"
                 )
             )
             for item in candidates:
@@ -3757,9 +3875,25 @@ def build_arg_parser() -> argparse.ArgumentParser:
         command.add_argument("--reason", help="Reason recorded in the event history.")
     release = subparsers.add_parser("release", help="Release a held or blocked item.")
     release.add_argument("item_id", type=int, help="Exact numeric queue item ID from status.")
-    priority = subparsers.add_parser("priority", help="Change a pending item's dispatch priority.")
+    priority = subparsers.add_parser(
+        "priority",
+        help="Change a pending or resumable active item's dispatch priority.",
+    )
     priority.add_argument("item_id", type=int, help="Exact numeric queue item ID from status.")
     priority.add_argument("value", type=int, help="New integer priority; larger values dispatch first.")
+
+    preempt = subparsers.add_parser(
+        "preempt",
+        help="Cooperatively checkpoint and requeue one preemptible running item.",
+    )
+    preempt.add_argument("item_id", type=int, help="Exact numeric running queue item ID.")
+    preempt.add_argument(
+        "--reason",
+        help=(
+            "Operator reason preserved in queue history. The request does not reserve "
+            "the released GPU."
+        ),
+    )
 
     pause = subparsers.add_parser("pause", help="Pause new dispatch without stopping running work.")
     pause.add_argument("--reason", help="Reason recorded in queue state.")
@@ -3909,6 +4043,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.action == "priority":
             set_priority(store, args.item_id, args.value)
             print(f"queue item {args.item_id} priority is now {args.value}")
+        elif args.action == "preempt":
+            request_id = request_preemption(
+                store,
+                args.item_id,
+                reason=args.reason,
+            )
+            print(
+                f"manual preemption {request_id} recorded for queue item {args.item_id}; "
+                "the job will checkpoint, exit, and rejoin the front of its priority band"
+            )
         elif args.action == "pause":
             set_dispatch_paused(store, True, args.reason)
             print("new dispatch paused; running jobs were not changed")
