@@ -1,7 +1,8 @@
 # Project onboarding target
 
-First-class project commands described here are the next milestone and are not
-implemented in the extracted baseline yet.
+First-class project commands described here are target behavior and are not
+implemented in the extracted baseline yet. Current implementation state lives
+in `../llm/status.md`; task dependencies are in `../llm/todo.md`.
 
 A new scientific project should ultimately need only:
 

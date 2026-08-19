@@ -1,5 +1,12 @@
 # Explicit Experiment Queue For Unmanaged GPUs
 
+> **Legacy snapshot:** This guide documents the deprecated in-repository
+> Flowers queue retained for current SPECFEM generation and migration
+> compatibility. Do not use it as the target integration contract for new
+> projects. Future product development and the cutover plan live in the
+> standalone `experiment-queue` repository. Never run legacy and standalone
+> schedulers concurrently against the same GPU pool or state.
+
 This document defines the operator workflow for the repository's durable GPU
 queue. The queue is intentionally explicit: it never discovers experiments
 from `STATUS.md`, scans cards for work, or interprets `prepared_locally` as

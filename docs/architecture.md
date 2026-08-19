@@ -1,5 +1,8 @@
 # Architecture and migration target
 
+Current implementation state lives only in `../llm/status.md`. The durable
+delivery sequence, gates, and rollback model are in `implementation-plan.md`.
+
 ## Current baseline
 
 The first standalone release preserves the existing single-project queue so its
