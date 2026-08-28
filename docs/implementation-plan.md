@@ -357,7 +357,9 @@ Deliverables:
   job conversions;
 - classification of active/future versus historical cards and YAML sidecars
   only where appropriate;
-- copied-state migration rehearsal and full CLI/web/preemption/recovery smoke;
+- exhaustive fixture-based importer validation and a fresh two-project
+  CLI/web/preemption/recovery smoke; no separate production-state dress
+  rehearsal is required;
 - compatibility wrappers prepared but not activated.
 
 Verification:
@@ -374,8 +376,8 @@ is authorized merely by passing this phase.
 
 ## Phase 8: Production Cutover
 
-Objective: replace the deprecated Flowers queue without losing state or
-interrupting SPECFEM generation.
+Objective: replace the deprecated Flowers queue while preserving state,
+history, and an untouched rollback source.
 
 Hard entry gate:
 
@@ -407,8 +409,9 @@ Exit gate:
 - rollback remains possible through untouched schema-v4 state.
 
 Failure/rollback: stop the standalone writers, retain failed migration receipts,
-and resume only the untouched old code/state after David's decision. Never
-repair the source in place or attempt a v5-to-v4 downgrade.
+fix the standalone importer or runtime against fixtures/a new source copy, and
+retry only from the untouched v4 source after David's decision. Never repair
+the source in place or attempt a v5-to-v4 downgrade.
 
 ## Phase 9: Observation, Deprecation, And Flowers Cleanup
 

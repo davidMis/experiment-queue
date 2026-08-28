@@ -6,26 +6,29 @@ architecture belongs in `docs/`, accepted decisions in `docs/adr/`,
 forward-looking work in `llm/todo.md`, and chronological evidence in
 `llm/log.md`.
 
-Last updated: 2026-08-19 by Codex from David's decisions and local repository
+Last updated: 2026-08-27 by Codex from David's decisions and local repository
 evidence.
 
 ## Current Phase
 
 The project is in the standalone-foundation phase. The history-preserving
 extraction from `flowers-3d-helmholtz` is complete at commit `09dbe41`. The
-package installs in its own Python 3.14 environment, and the extracted baseline
-passes `82` tests plus `22` subtests.
+original extracted baseline passed `82` tests plus `22` subtests. The protocol,
+structured-receipt, strict-serialization, bundled-schema, and generic
+cooperative-yield foundations are now implemented and independently versioned.
 
 The executable implementation is intentionally still schema-v4,
 single-project compatibility code. It accepts an explicit operator-selected
 state directory but still binds one database to one `--repo-root`, parses
-legacy Flowers Markdown commands, uses Flowers-specific shared-worktree paths,
-and discovers runner paths from human log lines. It is not ready to replace the
-operational Flowers queue.
+legacy Flowers Markdown commands, and uses Flowers-specific shared-worktree
+paths. New runner segments emit and ingest atomic typed receipts; a narrowly
+bounded human-log parser remains only for legacy jobs. The typed yield protocol
+is not yet wired into scheduler admission/failure isolation. The executable is
+not ready to replace the operational Flowers queue.
 
-The current objective is to establish protocol/schema foundations, then add
-first-class projects and an explicit database-v5 migration without changing or
-operating live Flowers state.
+The current objective is to implement typed Project/ExperimentCard models and
+admission snapshots, then add first-class projects and an explicit database-v5
+migration without changing or operating live Flowers state.
 
 ## Verified Baseline
 
@@ -39,7 +42,10 @@ operating live Flowers state.
   `run-experiment`.
 - State selection: absolute `--state-dir` takes precedence over
   `EXPERIMENT_QUEUE_STATE_DIR`; missing/relative state fails safely.
-- Generic suite: `82` tests and `22` subtests pass in the standalone `.venv`.
+- Current generic suite: `277` tests and `26` subtests pass in the standalone
+  `.venv`.
+- The current wheel builds successfully and its isolated import authenticates
+  both bundled schema resources, pinned canonical digests, and editor exports.
 
 ## Accepted Product Decisions
 
@@ -47,7 +53,13 @@ operating live Flowers state.
   `experiment_queue`; primary CLI: `experiment-queue`.
 - Project keys are immutable lowercase hyphenated slugs, at most 63 characters.
 - Portable manifests/cards will use a strict YAML 1.2 subset validated by
-  bundled JSON Schema and stored as canonical JSON at admission.
+  bundled JSON Schema plus version-owned semantic checks, with a maximum tree
+  depth of 64, and will be stored as canonical JSON at admission.
+- New RunnerManifest/v1 and RunnerReceipt/v1 documents carry independent typed
+  identities; exact RunnerReceipt/v0 stdout parsing is legacy-only.
+- CooperativeYieldRequest/v1 and CooperativeYieldReceipt/v1 use hashed regular
+  files, typed progress, opaque resume bytes, and immutable continuation
+  evidence. Schema-v4 yield shapes remain explicitly named v0 compatibility.
 - Priority is global across projects and mutable, but never causes automatic
   preemption. Manual cooperative preemption remains explicit.
 - Initial scheduling supports one NVIDIA GPU per independent job. Gang/DDP
@@ -61,7 +73,7 @@ operating live Flowers state.
 - This repository owns all future generic queue, runner, web, schema,
   migration, compatibility, and onboarding development.
 - `flowers-3d-helmholtz` owns its scientific cards, checkpoint behavior,
-  experiment evidence, and current SPECFEM production operation.
+  experiment evidence, and the legacy queue operation until cutover.
 - David owns remote execution, GPU allowlists, credentials, live-state backup,
   publication-remote selection, and production cutover authorization.
 - Codex implements and verifies locally and does not access `mutton2`.
@@ -70,12 +82,17 @@ operating live Flowers state.
 
 - There is no blocker to local protocol, schema, database, scheduler, UX, test,
   or documentation development.
-- Production migration from the Flowers schema-v4 queue is intentionally
-  blocked until the SPECFEM dataset has been generated, its synchronized
-  evidence has been closed out, active legacy queue work has drained, and David
-  explicitly authorizes cutover.
-- No real production state copy has been supplied for migration rehearsal.
-  Synthetic fixtures and migration tooling can proceed meanwhile.
+- On 2026-08-27, David explicitly confirmed that SPECFEM dataset generation and
+  synchronized evidence closeout are complete and authorized work toward
+  cutover. The scientific gate is satisfied.
+- Production migration from the Flowers schema-v4 queue remains blocked on the
+  standalone implementation, copied-state importer verification, an idle
+  legacy queue with both database writers stopped, and a consistent backup plus
+  external-path inventory.
+- David waived a distinct production-state dress rehearsal because this is a
+  single-operator queue. Comprehensive copied fixtures and a fresh two-project
+  smoke remain required; the cutover itself still requires a consistent
+  backup and offline copy-only, dry-run/receipt-verified migration.
 - The repository has no configured publication remote. Local development can
   proceed; remote CI/publication waits for David's choice.
 
@@ -96,14 +113,14 @@ operating live Flowers state.
 
 ## Next Authorized Actions
 
-1. Establish the independent protocol-version registry and structured runner
-   receipt while retaining tested legacy fallback.
-2. Select and record exact strict-YAML, JSON Schema, and canonical-JSON behavior;
-   implement Project and ExperimentCard schema/model foundations.
-3. Design and implement schema-v5 project/enrollment/revision storage and an
-   explicit offline migration with synthetic v1-v4 fixtures.
-4. Prove multi-project isolation with two temporary repositories before any
-   Flowers state migration.
+1. Implement typed Project and ExperimentCard models, namespaced extension
+   validation, immutable Submission separation, and admission snapshots.
+2. Accept the Project/Enrollment/ProjectRevision lifecycle ADR, then implement
+   schema-v5 project-aware storage.
+3. Wire typed cooperative-yield continuation validation into scheduler
+   admission and project-scoped holds without blocking unrelated work.
+4. Implement the explicit offline v1-v4 importer and exhaustive fixtures, then
+   prove isolation with two temporary repositories before Flowers cutover.
 
 Detailed dependencies and completion gates are in `llm/todo.md`; the durable
 phase plan is `docs/implementation-plan.md`.

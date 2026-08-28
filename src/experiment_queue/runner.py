@@ -27,13 +27,22 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import IO, Any, Iterable, Sequence
 
+from experiment_queue.protocols import (
+    RUNNER_MANIFEST_V1,
+    RUNNER_RECEIPT_V1,
+    ProtocolIdentityError,
+    ProtocolVersion,
+)
+
 
 DEFAULT_OUTPUT_ROOT = Path("outputs/experiments")
 MANIFEST_NAME = "manifest.json"
+RUNNER_RECEIPT_NAME = "runner-receipt.json"
 DEFAULT_USE_PTY = True
 YIELD_EXIT_CODE = 75
 CONTINUATION_RUN_DIR_ENV = "EXPERIMENT_QUEUE_CONTINUATION_RUN_DIR"
 YIELD_RECEIPT_ENV = "EXPERIMENT_QUEUE_YIELD_RECEIPT_PATH"
+RUNNER_RECEIPT_ENV = "EXPERIMENT_QUEUE_RUNNER_RECEIPT_PATH"
 
 
 class ExperimentError(RuntimeError):
@@ -63,6 +72,7 @@ class ExperimentResult:
     run_id: str
     run_dir: Path
     manifest_path: Path
+    receipt_path: Path
     return_code: int
     rsync_pull_command: str | None
 
@@ -221,7 +231,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"inspect logs in {result.run_dir}",
             file=sys.stderr,
         )
-    return result.return_code
+    return _runner_process_return_code(result.return_code)
+
+
+def _runner_process_return_code(command_return_code: int) -> int:
+    """Map a signal-terminated child to the runner CLI's observable exit code."""
+
+    if command_return_code < 0:
+        return 128 + abs(command_return_code)
+    return command_return_code
 
 
 def _load_continuation_manifest(
@@ -241,12 +259,74 @@ def _load_continuation_manifest(
             f"continuation runner directory is missing or not a regular directory: {run_dir}"
         )
     manifest_path = run_dir / MANIFEST_NAME
+    def reject_duplicate_keys(
+        pairs: list[tuple[str, Any]],
+    ) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ExperimentError(
+                    f"continuation manifest {manifest_path} repeats JSON key {key!r}"
+                )
+            result[key] = value
+        return result
+
+    def reject_nonfinite_constant(value: str) -> None:
+        raise ExperimentError(
+            f"continuation manifest {manifest_path} contains unsupported "
+            f"JSON constant {value!r}"
+        )
+
     try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        manifest = json.loads(
+            manifest_path.read_text(encoding="utf-8"),
+            object_pairs_hook=reject_duplicate_keys,
+            parse_constant=reject_nonfinite_constant,
+        )
+    except ExperimentError:
+        raise
+    except (
+        OSError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        RecursionError,
+        ValueError,
+    ) as exc:
         raise ExperimentError(
             f"could not read continuation manifest {manifest_path}: {exc}"
         ) from exc
+    if not isinstance(manifest, dict):
+        raise ExperimentError(
+            f"continuation manifest {manifest_path} must contain a JSON object"
+        )
+    if "apiVersion" in manifest or "kind" in manifest:
+        try:
+            manifest_version = ProtocolVersion.from_document(manifest)
+        except ProtocolIdentityError as exc:
+            raise ExperimentError(
+                f"continuation manifest {manifest_path} has invalid protocol identity: {exc}"
+            ) from exc
+        if manifest_version != RUNNER_MANIFEST_V1:
+            raise ExperimentError(
+                f"continuation manifest {manifest_path} uses unsupported "
+                f"{manifest_version.kind.value}/v{manifest_version.major}"
+            )
+        if "schema_version" in manifest and (
+            type(manifest["schema_version"]) is not int
+            or manifest["schema_version"] != 1
+        ):
+            raise ExperimentError(
+                f"continuation manifest {manifest_path} has invalid retained "
+                f"schema_version {manifest['schema_version']!r}; expected integer 1"
+            )
+    elif (
+        type(manifest.get("schema_version")) is not int
+        or manifest["schema_version"] != 1
+    ):
+        raise ExperimentError(
+            f"continuation manifest {manifest_path} has no supported RunnerManifest/v1 "
+            "identity or legacy schema_version 1"
+        )
     run = manifest.get("run", {})
     command = manifest.get("command", {})
     paths = manifest.get("paths", {})
@@ -353,6 +433,12 @@ def run_experiment(request: ExperimentRequest) -> ExperimentResult:
         rsync_pull_command = manifest.get("sync", {}).get("rsync_pull_command")
 
     segment_number = len(manifest.setdefault("segments", [])) + 1
+    receipt_path_value = os.environ.get(RUNNER_RECEIPT_ENV)
+    receipt_path = (
+        _resolve_from_cwd(Path(receipt_path_value), cwd)
+        if receipt_path_value
+        else run_dir / RUNNER_RECEIPT_NAME
+    )
     segment = {
         "segment": segment_number,
         "status": "running",
@@ -371,19 +457,50 @@ def run_experiment(request: ExperimentRequest) -> ExperimentResult:
     manifest["run"]["return_code"] = None
     started = time.monotonic()
 
-    def finish_manifest(status: str, return_code: int) -> None:
-        """Record one terminal segment while the runner owns signal handling."""
+    def publish_receipt(status: str, return_code: int | None) -> None:
+        """Publish the machine contract only after its referenced manifest is current."""
+
+        receipt = build_runner_receipt(
+            run_id=run_id,
+            segment=segment_number,
+            status=status,
+            return_code=return_code,
+            run_dir=run_dir,
+            manifest_path=manifest_path,
+            rsync_pull_command=rsync_pull_command,
+        )
+        try:
+            write_runner_receipt(receipt_path, receipt)
+        except OSError as exc:
+            raise ExperimentError(
+                f"could not publish runner receipt {receipt_path}: {exc}"
+            ) from exc
+
+    def finish_manifest(
+        status: str,
+        command_return_code: int,
+        *,
+        runner_return_code: int | None = None,
+    ) -> None:
+        """Record child outcome and the runner process's observable exit code.
+
+        The manifest describes the attempted child command.  RunnerReceipt's
+        ``return_code`` describes the runner CLI process observed by its
+        scheduler.  They differ when child launch fails: the manifest records
+        the conventional 127 launch sentinel while the CLI preserves its
+        established setup-error exit code 2.
+        """
 
         duration = round(time.monotonic() - started, 3)
         segment.update(
             status=status,
-            return_code=return_code,
+            return_code=command_return_code,
             finished_at=utc_now_iso(),
             duration_seconds=duration,
         )
         manifest["run"].update(
             status=status,
-            return_code=return_code,
+            return_code=command_return_code,
             finished_at=segment["finished_at"],
             duration_seconds=round(
                 sum(float(row.get("duration_seconds") or 0.0) for row in manifest["segments"]),
@@ -391,12 +508,21 @@ def run_experiment(request: ExperimentRequest) -> ExperimentResult:
             ),
         )
         write_manifest(manifest_path, manifest)
+        publish_receipt(
+            status,
+            (
+                _runner_process_return_code(command_return_code)
+                if runner_return_code is None
+                else runner_return_code
+            ),
+        )
 
     with _translate_termination_signals_to_interrupt():
         try:
             # Publish only after termination signals have a cleanup handler;
             # monitoring code treats manifest visibility as launch readiness.
             write_manifest(manifest_path, manifest)
+            publish_receipt("running", None)
             try:
                 return_code = launch_and_stream(
                     request.command,
@@ -408,7 +534,7 @@ def run_experiment(request: ExperimentRequest) -> ExperimentResult:
                 )
             except OSError as exc:
                 return_code = 127
-                finish_manifest("launch_failed", return_code)
+                finish_manifest("launch_failed", return_code, runner_return_code=2)
                 raise ExperimentError(
                     f"could not start command {request.command[0]!r}: "
                     f"{exc.strerror or exc}"
@@ -433,6 +559,7 @@ def run_experiment(request: ExperimentRequest) -> ExperimentResult:
         run_id=run_id,
         run_dir=run_dir,
         manifest_path=manifest_path,
+        receipt_path=receipt_path,
         return_code=return_code,
         rsync_pull_command=rsync_pull_command,
     )
@@ -485,6 +612,9 @@ def build_manifest(
     """Create the manifest structure that records run provenance."""
 
     return {
+        **RUNNER_MANIFEST_V1.document_identity(),
+        # Retained additively for readers of the extracted v1 manifest. New
+        # readers use the independent apiVersion/kind identity above.
         "schema_version": 1,
         "run": {
             "id": run_id,
@@ -525,6 +655,67 @@ def build_manifest(
         "sync": {
             "rsync_pull_command": rsync_pull_command,
         },
+    }
+
+
+def build_runner_receipt(
+    *,
+    run_id: str,
+    segment: int,
+    status: str,
+    return_code: int | None,
+    run_dir: Path,
+    manifest_path: Path,
+    rsync_pull_command: str | None,
+) -> dict[str, Any]:
+    """Build the strict RunnerReceipt/v1 envelope consumed by the scheduler.
+
+    Paths are absolute so scheduler recovery never depends on the launcher's
+    working directory.  The optional queue item identity is observational;
+    the scheduler independently validates it when the runner was queue-launched.
+    ``return_code`` is the runner process exit code, while child-command details
+    remain authoritative in the referenced manifest.
+    """
+
+    queue_item_value = os.environ.get("EXPERIMENT_QUEUE_ITEM_ID")
+    queue_item_id: int | None = None
+    if queue_item_value:
+        try:
+            queue_item_id = int(queue_item_value)
+        except ValueError as exc:
+            raise ExperimentError(
+                "EXPERIMENT_QUEUE_ITEM_ID must be an integer when publishing "
+                f"a runner receipt, got {queue_item_value!r}"
+            ) from exc
+        if queue_item_id < 1:
+            raise ExperimentError(
+                "EXPERIMENT_QUEUE_ITEM_ID must be positive when publishing "
+                f"a runner receipt, got {queue_item_id}"
+            )
+    resolved_run_dir = run_dir.resolve()
+    sync = (
+        {
+            "type": "rsync-pull",
+            "command": rsync_pull_command,
+        }
+        if rsync_pull_command
+        else None
+    )
+    return {
+        **RUNNER_RECEIPT_V1.document_identity(),
+        "run_id": run_id,
+        "queue_item_id": queue_item_id,
+        "segment": segment,
+        "status": status,
+        "return_code": return_code,
+        "run_directory": str(resolved_run_dir),
+        "manifest": str(manifest_path.resolve()),
+        "logs": {
+            "stdout": str((resolved_run_dir / "stdout.log").resolve()),
+            "stderr": str((resolved_run_dir / "stderr.log").resolve()),
+        },
+        "sync": sync,
+        "written_at": utc_now_iso(),
     }
 
 
@@ -848,6 +1039,16 @@ def write_manifest(path: Path, manifest: dict[str, Any]) -> None:
                 temporary.unlink()
             except OSError:
                 pass
+
+
+def write_runner_receipt(path: Path, receipt: dict[str, Any]) -> None:
+    """Atomically replace the scheduler-facing runner receipt.
+
+    The manifest and receipt share the same adjacent-temporary-file primitive,
+    so readers observe either the previous complete document or the next one.
+    """
+
+    write_manifest(path, receipt)
 
 
 def slugify(value: str) -> str:

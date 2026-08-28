@@ -9,7 +9,12 @@ description = "A durable, operator-controlled queue for scientific GPU experimen
 readme = "README.md"
 requires-python = ">=3.14"
 license = { file = "LICENSE" }
-dependencies = []
+dependencies = [
+  "jsonschema>=4.26.0,<5",
+  "referencing>=0.37.0,<0.38",
+  "rfc8785>=0.1.4,<0.2",
+  "ruamel.yaml>=0.19.1,<0.20",
+]
 
 [project.optional-dependencies]
 dev = ["pytest"]
@@ -24,6 +29,9 @@ package-dir = { "" = "src" }
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+"experiment_queue.schema_resources" = ["*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -15,17 +15,22 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 from experiment_queue.runner import (  # noqa: E402
     DEFAULT_USE_PTY,
+    RUNNER_RECEIPT_ENV,
     ExperimentError,
     ExperimentRequest,
     _create_run_dir,
+    _load_continuation_manifest,
+    build_manifest,
     build_rsync_pull_command,
     build_arg_parser,
+    collect_git_context,
     run_experiment,
     slugify,
     write_manifest,
@@ -169,6 +174,108 @@ class ExperimentRunnerTests(unittest.TestCase):
             self.assertFalse(manifest["git"]["available"])
             self.assertIn("mutton2:", manifest["sync"]["rsync_pull_command"])
             self.assertEqual(result.rsync_pull_command, manifest["sync"]["rsync_pull_command"])
+
+    def test_runner_publishes_complete_running_and_terminal_receipts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            receipt_path = root / "queue-state" / "runner-receipt.json"
+            receipt_path.parent.mkdir()
+            captured_running = root / "captured-running.json"
+            request = ExperimentRequest(
+                name="Structured Receipt",
+                command=[
+                    sys.executable,
+                    "-c",
+                    (
+                        "import os, pathlib; "
+                        "source = pathlib.Path(os.environ["
+                        "'EXPERIMENT_QUEUE_RUNNER_RECEIPT_PATH']); "
+                        "pathlib.Path(__import__('sys').argv[1]).write_bytes(source.read_bytes())"
+                    ),
+                    str(captured_running),
+                ],
+                output_root=root / "outputs",
+                remote="mutton2",
+                cwd=root,
+                use_pty=False,
+            )
+
+            with mock.patch.dict(
+                os.environ,
+                {
+                    RUNNER_RECEIPT_ENV: str(receipt_path),
+                    "EXPERIMENT_QUEUE_ITEM_ID": "41",
+                },
+            ), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(
+                io.StringIO()
+            ):
+                result = run_experiment(request)
+
+            running = json.loads(captured_running.read_text(encoding="utf-8"))
+            terminal = json.loads(receipt_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                (running["apiVersion"], running["kind"]),
+                ("experiment-queue/v1", "RunnerReceipt"),
+            )
+            self.assertEqual(running["status"], "running")
+            self.assertIsNone(running["return_code"])
+            self.assertEqual(running["queue_item_id"], 41)
+            self.assertEqual(running["segment"], 1)
+            self.assertEqual(terminal["status"], "succeeded")
+            self.assertEqual(terminal["return_code"], 0)
+            self.assertEqual(terminal["run_id"], result.run_id)
+            self.assertEqual(Path(terminal["run_directory"]), result.run_dir.resolve())
+            self.assertEqual(Path(terminal["manifest"]), result.manifest_path.resolve())
+            self.assertEqual(
+                Path(terminal["logs"]["stdout"]),
+                (result.run_dir / "stdout.log").resolve(),
+            )
+            self.assertEqual(terminal["sync"]["type"], "rsync-pull")
+            self.assertIn("mutton2:", terminal["sync"]["command"])
+            self.assertEqual(result.receipt_path, receipt_path)
+            self.assertEqual(list(receipt_path.parent.glob(".runner-receipt.json.*.tmp")), [])
+
+            manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                (manifest["apiVersion"], manifest["kind"]),
+                ("experiment-queue/v1", "RunnerManifest"),
+            )
+            self.assertEqual(manifest["schema_version"], 1)
+
+    @unittest.skipIf(os.name != "posix", "signal exit codes are POSIX-specific")
+    def test_cli_receipt_matches_signal_terminated_child_exit_code(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            receipt_path = root / "runner-receipt.json"
+            environment = os.environ.copy()
+            environment[RUNNER_RECEIPT_ENV] = str(receipt_path)
+            environment.pop("EXPERIMENT_QUEUE_ITEM_ID", None)
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(REPO_ROOT / "scripts" / "run_experiment.py"),
+                    "--output-root",
+                    str(root / "outputs"),
+                    "--no-pty",
+                    "--",
+                    sys.executable,
+                    "-c",
+                    "import os, signal; os.kill(os.getpid(), signal.SIGTERM)",
+                ],
+                cwd=root,
+                env=environment,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=15,
+            )
+
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            manifest = json.loads(Path(receipt["manifest"]).read_text(encoding="utf-8"))
+            self.assertEqual(completed.returncode, 128 + signal.SIGTERM)
+            self.assertEqual(receipt["return_code"], completed.returncode)
+            self.assertEqual(receipt["status"], "failed")
+            self.assertEqual(manifest["run"]["return_code"], -signal.SIGTERM)
 
     def test_missing_config_path_raises_helpful_error(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -362,6 +469,168 @@ class ExperimentRunnerTests(unittest.TestCase):
             self.assertEqual(manifest["run"]["status"], "succeeded")
             self.assertEqual([row["status"] for row in manifest["segments"]], ["yielded", "succeeded"])
             self.assertIn("continuation started", (first.run_dir / "stdout.log").read_text())
+
+    def test_continuation_accepts_legacy_v1_manifest_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir).resolve()
+            run_dir = root / "legacy-run"
+            run_dir.mkdir()
+            request = ExperimentRequest(
+                name="Legacy Continuation",
+                command=[sys.executable, "-c", "print('continued')"],
+                cwd=root,
+                use_pty=False,
+            )
+            git_context = collect_git_context(root)
+            manifest = build_manifest(
+                request=request,
+                cwd=root,
+                run_id=run_dir.name,
+                run_dir=run_dir,
+                git_context=git_context,
+                copied_configs=[],
+                rsync_pull_command=None,
+            )
+            manifest.pop("apiVersion")
+            manifest.pop("kind")
+            manifest["run"]["status"] = "yielded"
+            write_manifest(run_dir / "manifest.json", manifest)
+
+            with mock.patch.dict(
+                os.environ,
+                {"EXPERIMENT_QUEUE_CONTINUATION_RUN_DIR": str(run_dir)},
+            ):
+                loaded = _load_continuation_manifest(
+                    request,
+                    cwd=root,
+                    git_context=git_context,
+                )
+
+            self.assertIsNotNone(loaded)
+            self.assertEqual(loaded[0], run_dir.name)
+
+    def test_continuation_rejects_undeclared_manifest_major(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir).resolve()
+            run_dir = root / "future-run"
+            run_dir.mkdir()
+            request = ExperimentRequest(
+                name="Future Continuation",
+                command=[sys.executable, "-c", "print('must not run')"],
+                cwd=root,
+                use_pty=False,
+            )
+            git_context = collect_git_context(root)
+            manifest = build_manifest(
+                request=request,
+                cwd=root,
+                run_id=run_dir.name,
+                run_dir=run_dir,
+                git_context=git_context,
+                copied_configs=[],
+                rsync_pull_command=None,
+            )
+            manifest["apiVersion"] = "experiment-queue/v999"
+            manifest["run"]["status"] = "yielded"
+            write_manifest(run_dir / "manifest.json", manifest)
+
+            with mock.patch.dict(
+                os.environ,
+                {"EXPERIMENT_QUEUE_CONTINUATION_RUN_DIR": str(run_dir)},
+            ), self.assertRaisesRegex(
+                ExperimentError,
+                "invalid protocol identity",
+            ):
+                _load_continuation_manifest(
+                    request,
+                    cwd=root,
+                    git_context=git_context,
+                )
+
+    def test_continuation_manifest_identity_is_unambiguous(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir).resolve()
+            request = ExperimentRequest(
+                name="Strict Continuation",
+                command=[sys.executable, "-c", "print('must not run')"],
+                cwd=root,
+                use_pty=False,
+            )
+            git_context = collect_git_context(root)
+            for typed in (True, False):
+                with self.subTest(typed=typed):
+                    run_dir = root / ("typed-run" if typed else "legacy-run")
+                    run_dir.mkdir()
+                    manifest = build_manifest(
+                        request=request,
+                        cwd=root,
+                        run_id=run_dir.name,
+                        run_dir=run_dir,
+                        git_context=git_context,
+                        copied_configs=[],
+                        rsync_pull_command=None,
+                    )
+                    if not typed:
+                        manifest.pop("apiVersion")
+                        manifest.pop("kind")
+                    manifest["schema_version"] = True
+                    manifest["run"]["status"] = "yielded"
+                    write_manifest(run_dir / "manifest.json", manifest)
+
+                    with mock.patch.dict(
+                        os.environ,
+                        {"EXPERIMENT_QUEUE_CONTINUATION_RUN_DIR": str(run_dir)},
+                    ), self.assertRaisesRegex(ExperimentError, "schema_version"):
+                        _load_continuation_manifest(
+                            request,
+                            cwd=root,
+                            git_context=git_context,
+                        )
+
+            duplicate_dir = root / "duplicate-run"
+            duplicate_dir.mkdir()
+            (duplicate_dir / "manifest.json").write_text(
+                '{"apiVersion":"experiment-queue/v1",'
+                '"kind":"RunnerManifest","kind":"RunnerManifest"}',
+                encoding="utf-8",
+            )
+            with mock.patch.dict(
+                os.environ,
+                {"EXPERIMENT_QUEUE_CONTINUATION_RUN_DIR": str(duplicate_dir)},
+            ), self.assertRaisesRegex(ExperimentError, "repeats JSON key 'kind'"):
+                _load_continuation_manifest(
+                    request,
+                    cwd=root,
+                    git_context=git_context,
+                )
+
+            (duplicate_dir / "manifest.json").write_text(
+                "[" * 100_000 + "0" + "]" * 100_000,
+                encoding="utf-8",
+            )
+            with mock.patch.dict(
+                os.environ,
+                {"EXPERIMENT_QUEUE_CONTINUATION_RUN_DIR": str(duplicate_dir)},
+            ), self.assertRaisesRegex(ExperimentError, "could not read continuation"):
+                _load_continuation_manifest(
+                    request,
+                    cwd=root,
+                    git_context=git_context,
+                )
+
+            (duplicate_dir / "manifest.json").write_text(
+                '{"schema_version":' + ("9" * 5000) + "}",
+                encoding="utf-8",
+            )
+            with mock.patch.dict(
+                os.environ,
+                {"EXPERIMENT_QUEUE_CONTINUATION_RUN_DIR": str(duplicate_dir)},
+            ), self.assertRaisesRegex(ExperimentError, "could not read continuation"):
+                _load_continuation_manifest(
+                    request,
+                    cwd=root,
+                    git_context=git_context,
+                )
 
     def test_cli_pty_defaults_can_be_disabled(self) -> None:
         parser = build_arg_parser()

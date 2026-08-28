@@ -68,3 +68,65 @@ Open:
 - Protocol/schema foundations and database v5 are the next code milestones.
 - A real production state copy and publication remote have not been supplied;
   neither blocks local implementation.
+
+## 2026-08-27 - Begin Cutover Foundation Implementation
+
+Goal: begin the recorded standalone cutover work after David confirmed the
+Flowers scientific gate was complete, without touching live Flowers state or
+`mutton2`.
+
+Decisions:
+
+- David explicitly confirmed SPECFEM dataset generation and synchronized
+  evidence closeout are complete and authorized work toward cutover.
+- David waived a separate production-state dress rehearsal for this
+  single-operator queue. Fixture/importer verification and a fresh two-project
+  smoke remain mandatory; cutover still migrates only an offline copy with a
+  dry run, machine receipt, verification, and untouched v4 rollback source.
+- Accepted ADR 0006 for strict YAML/Draft 2020-12/RFC 8785 behavior and ADR
+  0007 for bounded trees, direct `referencing` ownership, semantic validation,
+  and precise YAML presentation semantics.
+- Named the extracted schema-v4 yield request/receipt shapes v0 compatibility;
+  typed cooperative-yield v1 remains a distinct wire protocol.
+
+Result:
+
+- Completed `EQ-GOV-003`, `EQ-PROTO-001` through `EQ-PROTO-005`, and
+  `EQ-SCHEMA-001` through `EQ-SCHEMA-003`; removed them from the live TODO.
+- Added the independent protocol registry, identity fixtures, ADR index, and
+  compatibility/ownership matrix.
+- Added atomic RunnerManifest/v1 and RunnerReceipt/v1 emission/ingestion,
+  restart recovery, signal-exit normalization, strict path authorization, and
+  an exact RunnerReceipt/v0 stdout fallback for legacy jobs.
+- Added bounded strict YAML, RFC 8785 canonical JSON, digest-authenticated
+  Project/v1 and ExperimentCard/v1 schemas, version-owned semantic checks,
+  editor export, and installed-wheel schema verification. Runtime dependencies
+  are explicitly bounded in `pyproject.toml`.
+- Added the dependency-light CooperativeYield/v1 request, receipt, helper, and
+  conformance APIs with strict interoperable JSON, typed progress, opaque
+  resume bytes, exact admitted checkpoint-name checks, path-bound stable file
+  hashing, and continuation identity over spec/revision/Git/run/prior receipt.
+- Updated the runner guide, README, implementation plan, migration guide,
+  status, and TODO for the completed scientific gate and the no-separate-dress-
+  rehearsal decision.
+
+Verification:
+
+- Full Python 3.14.4 suite: `277 passed, 26 subtests passed` in `10.77 s`.
+- Final wheel build succeeded; isolated wheel import authenticated both schema
+  resources, pinned canonical digests, and editor exports.
+- Independent adversarial review reported no remaining actionable code or
+  documentation findings; `git diff --check` passed.
+- No Flowers source/card/wrapper/live-state file changed, no GPU allowlist or
+  production state was used, and no connection to `mutton2` was attempted.
+
+Open:
+
+- The executable remains schema-v4/single-project. `EQ-PROTO-006` stays open
+  until typed continuation evidence is wired into scheduler holds and failure
+  isolation.
+- Typed Project/ExperimentCard models, extensions, Submission/admission
+  snapshots, the Project lifecycle ADR, schema v5, offline importer, and
+  two-project isolation are next.
+- The publication remote is unset. A non-blocking setuptools license-metadata
+  deprecation is tracked as `EQ-GOV-005` before its 2027 deadline.

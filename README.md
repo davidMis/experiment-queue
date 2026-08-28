@@ -15,9 +15,11 @@ implementation state and [`docs/implementation-plan.md`](docs/implementation-pla
 for the durable multi-project roadmap.
 
 Do not run the standalone scheduler concurrently with the legacy scheduler on
-the same GPU host. Production cutover is gated on completion and evidence
-closeout of the current Flowers SPECFEM generation, an idle legacy queue,
-David's explicit authorization, and an offline rehearsed state migration.
+the same GPU host. David confirmed the Flowers SPECFEM generation and evidence
+closeout are complete on 2026-08-27. Production cutover still requires the
+multi-project implementation, an idle writer-free legacy queue, a consistent
+backup and external-path inventory, and an offline copy-only, receipt-verified
+state migration.
 
 ## Development setup
 
@@ -76,5 +78,8 @@ migration reference in
 - [`llm/log.md`](llm/log.md): concise chronological session evidence;
 - [`docs/implementation-plan.md`](docs/implementation-plan.md): durable phases,
   gates, verification, rollback, and risk controls;
+- [`docs/adr/README.md`](docs/adr/README.md): accepted decision index;
+- [`docs/protocol-compatibility.md`](docs/protocol-compatibility.md): independent
+  protocol versions, owners, compatibility fallbacks, and fixtures;
 - [`AGENTS.md`](AGENTS.md): required Codex startup, maintenance, and closeout
   workflow for those records.

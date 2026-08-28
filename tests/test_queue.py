@@ -131,6 +131,7 @@ class TemporaryQueueRepository:
             generic_progress=True,
         )
         self.add_real_runner_card()
+        self.add_real_runner_launch_failure_card()
         self._git("init", "-q")
         self._git("config", "user.email", "queue-test@example.invalid")
         self._git("config", "user.name", "Queue Test")
@@ -193,6 +194,35 @@ class TemporaryQueueRepository:
         ]
         card.write_text(
             f"# {experiment_id}: Real Runner Integration\n\n"
+            "## Exact Manual Command On Mutton2\n\n"
+            "```bash\n"
+            + " ".join(shlex.quote(part) for part in command)
+            + "\n```\n",
+            encoding="utf-8",
+        )
+
+    def add_real_runner_launch_failure_card(self) -> None:
+        """Add a real runner whose requested child executable does not exist."""
+
+        experiment_id = "TST-010"
+        runner = REPO_ROOT / "scripts" / "run_experiment.py"
+        command = [
+            sys.executable,
+            str(runner),
+            "--name",
+            "tst-010-launch-failure",
+            "--output-root",
+            "outputs/experiments",
+            "--require-clean",
+            "--remote",
+            "mutton2",
+            "--no-pty",
+            "--",
+            str(self.root / "missing-child-executable"),
+        ]
+        card = self.root / "docs" / "experiments" / f"{experiment_id}.md"
+        card.write_text(
+            f"# {experiment_id}: Real Runner Launch Failure\n\n"
             "## Exact Manual Command On Mutton2\n\n"
             "```bash\n"
             + " ".join(shlex.quote(part) for part in command)
@@ -271,6 +301,296 @@ class ExperimentQueueTests(unittest.TestCase):
             utilization_percent=0,
             compute_pids=(),
         )
+
+    def _structured_receipt_payload(
+        self,
+        item_id: int,
+        run_dir: Path,
+        *,
+        status: str = "running",
+        return_code: int | None = None,
+    ) -> dict[str, object]:
+        """Build one scheduler-owned RunnerReceipt/v1 test document."""
+
+        return {
+            **queue_module.RUNNER_RECEIPT_V1.document_identity(),
+            "run_id": run_dir.name,
+            "queue_item_id": item_id,
+            "segment": 1,
+            "status": status,
+            "return_code": return_code,
+            "run_directory": str(run_dir.resolve()),
+            "manifest": str((run_dir / "manifest.json").resolve()),
+            "logs": {
+                "stdout": str((run_dir / "stdout.log").resolve()),
+                "stderr": str((run_dir / "stderr.log").resolve()),
+            },
+            "sync": None,
+            "written_at": queue_module.utc_now_iso(),
+        }
+
+    def test_legacy_stdout_runner_receipt_parser_is_exact_and_nonguessing(self) -> None:
+        log_path = self.repo.root / "legacy-launcher.log"
+        log_path.write_text(
+            "child output\n"
+            "\x1b[32mrun directory: outputs/experiments/legacy-run\x1b[0m\r"
+            "manifest: outputs/experiments/legacy-run/manifest.json\n"
+            "pull outputs with: rsync -av host:legacy-run local-output\n",
+            encoding="utf-8",
+        )
+
+        self.assertEqual(
+            queue_module._read_legacy_stdout_runner_receipt(log_path),  # noqa: SLF001
+            {
+                "run_directory": "outputs/experiments/legacy-run",
+                "manifest": "outputs/experiments/legacy-run/manifest.json",
+                "rsync_pull_command": "rsync -av host:legacy-run local-output",
+            },
+        )
+
+        malformed_values = (
+            "run directory: outputs/experiments/partial\n",
+            (
+                "run directory: outputs/experiments/one\n"
+                "run directory: outputs/experiments/two\n"
+                "manifest: outputs/experiments/two/manifest.json\n"
+            ),
+        )
+        for value in malformed_values:
+            with self.subTest(value=value):
+                log_path.write_text(value, encoding="utf-8")
+                with self.assertRaises(queue_module.RunnerReceiptError):
+                    queue_module._read_legacy_stdout_runner_receipt(  # noqa: SLF001
+                        log_path
+                    )
+
+    @unittest.skipIf(os.name != "posix", "receipt symlink checks are POSIX-specific")
+    def test_structured_runner_receipt_never_falls_back_when_present_but_invalid(
+        self,
+    ) -> None:
+        item_id = add_experiment(self.repo.store, "TST-001")
+        segment_dir = queue_module._segment_dir(self.repo.store, item_id, 1)  # noqa: SLF001
+        segment_dir.mkdir(parents=True)
+        (segment_dir / "launcher.log").write_text(
+            "run directory: outputs/experiments/legacy\n"
+            "manifest: outputs/experiments/legacy/manifest.json\n",
+            encoding="utf-8",
+        )
+        receipt_path = queue_module._runner_receipt_path(  # noqa: SLF001
+            self.repo.store,
+            item_id,
+            1,
+        )
+        receipt_path.write_text('{"status":', encoding="utf-8")
+        scheduler = Scheduler(self.repo.store, min_free_disk_gib=0, gpu_provider=lambda: [])
+
+        receipt, error, structured_present = scheduler._read_item_runner_receipt(  # noqa: SLF001
+            self.repo.store.item(item_id)
+        )
+
+        self.assertEqual(receipt, {})
+        self.assertIn("invalid JSON", str(error))
+        self.assertTrue(structured_present)
+
+        receipt_path.write_bytes(b"\xff")
+        receipt, error, structured_present = scheduler._read_item_runner_receipt(  # noqa: SLF001
+            self.repo.store.item(item_id)
+        )
+        self.assertEqual(receipt, {})
+        self.assertIn("invalid JSON", str(error))
+        self.assertTrue(structured_present)
+
+        receipt_path.write_text("[" * 100_000 + "0" + "]" * 100_000, encoding="utf-8")
+        receipt, error, structured_present = scheduler._read_item_runner_receipt(  # noqa: SLF001
+            self.repo.store.item(item_id)
+        )
+        self.assertEqual(receipt, {})
+        self.assertIn("invalid JSON", str(error))
+        self.assertTrue(structured_present)
+
+        receipt_path.write_text(
+            '{"queue_item_id":' + ("9" * 5000) + "}",
+            encoding="utf-8",
+        )
+        receipt, error, structured_present = scheduler._read_item_runner_receipt(  # noqa: SLF001
+            self.repo.store.item(item_id)
+        )
+        self.assertEqual(receipt, {})
+        self.assertIn("invalid JSON", str(error))
+        self.assertTrue(structured_present)
+
+        invalid_status = self._structured_receipt_payload(
+            item_id,
+            self.repo.root / "outputs" / "experiments" / "invalid-status",
+        )
+        invalid_status["status"] = []
+        queue_module._atomic_write_json(receipt_path, invalid_status)  # noqa: SLF001
+        receipt, error, structured_present = scheduler._read_item_runner_receipt(  # noqa: SLF001
+            self.repo.store.item(item_id)
+        )
+        self.assertEqual(receipt, {})
+        self.assertIn("invalid status", str(error))
+        self.assertTrue(structured_present)
+
+        valid = json.dumps(
+            self._structured_receipt_payload(
+                item_id,
+                self.repo.root / "outputs" / "experiments" / "duplicate-key",
+            )
+        )
+        receipt_path.write_text(
+            valid.replace(
+                '"status": "running"',
+                '"status": "failed", "status": "running"',
+                1,
+            ),
+            encoding="utf-8",
+        )
+        receipt, error, structured_present = scheduler._read_item_runner_receipt(  # noqa: SLF001
+            self.repo.store.item(item_id)
+        )
+        self.assertEqual(receipt, {})
+        self.assertIn("repeats JSON key 'status'", str(error))
+        self.assertTrue(structured_present)
+
+        outside_run_dir = self.repo.root.parent / "outside-run"
+        queue_module._atomic_write_json(  # noqa: SLF001
+            receipt_path,
+            self._structured_receipt_payload(item_id, outside_run_dir),
+        )
+        receipt, error, structured_present = scheduler._read_item_runner_receipt(  # noqa: SLF001
+            self.repo.store.item(item_id)
+        )
+        self.assertEqual(receipt, {})
+        self.assertIn("outside authorized roots", str(error))
+        self.assertTrue(structured_present)
+
+        receipt_path.unlink()
+        receipt_path.symlink_to(segment_dir / "missing-receipt-target.json")
+        receipt, error, structured_present = scheduler._read_item_runner_receipt(  # noqa: SLF001
+            self.repo.store.item(item_id)
+        )
+        self.assertEqual(receipt, {})
+        self.assertIn("not a regular file", str(error))
+        self.assertTrue(structured_present)
+
+        receipt_path.unlink()
+        unresolved_run_dir = (
+            self.repo.root / "outputs" / "experiments" / "unresolved"
+        )
+        payload = self._structured_receipt_payload(
+            item_id,
+            unresolved_run_dir,
+        )
+        failing_value = Path(str(payload["run_directory"]))
+        queue_module._atomic_write_json(receipt_path, payload)  # noqa: SLF001
+        original_resolve = Path.resolve
+
+        def fail_selected_resolve(path: Path, *args, **kwargs) -> Path:
+            if path == failing_value:
+                raise RuntimeError("simulated symlink loop")
+            return original_resolve(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "resolve", new=fail_selected_resolve):
+            receipt, error, structured_present = scheduler._read_item_runner_receipt(  # noqa: SLF001
+                self.repo.store.item(item_id)
+            )
+        self.assertEqual(receipt, {})
+        self.assertIn("cannot be resolved", str(error))
+        self.assertTrue(structured_present)
+
+    def test_incomplete_atomic_temp_receipt_leaves_legacy_fallback_available(self) -> None:
+        item_id = add_experiment(self.repo.store, "TST-001")
+        segment_dir = queue_module._segment_dir(self.repo.store, item_id, 1)  # noqa: SLF001
+        segment_dir.mkdir(parents=True)
+        (segment_dir / ".runner-receipt.json.partial.tmp").write_text(
+            '{"incomplete":',
+            encoding="utf-8",
+        )
+        (segment_dir / "launcher.log").write_text(
+            "run directory: outputs/experiments/legacy\n"
+            "manifest: outputs/experiments/legacy/manifest.json\n",
+            encoding="utf-8",
+        )
+        scheduler = Scheduler(self.repo.store, min_free_disk_gib=0, gpu_provider=lambda: [])
+
+        receipt, error, structured_present = scheduler._read_item_runner_receipt(  # noqa: SLF001
+            self.repo.store.item(item_id)
+        )
+
+        self.assertIsNone(error)
+        self.assertFalse(structured_present)
+        self.assertEqual(receipt["run_directory"], "outputs/experiments/legacy")
+
+    @unittest.skipIf(os.name != "posix", "shared artifact symlinks are POSIX-specific")
+    def test_structured_receipt_accepts_a_configured_shared_symlink_root(self) -> None:
+        item_id = add_experiment(self.repo.store, "TST-001")
+        external_directory = tempfile.TemporaryDirectory(
+            prefix="experiment-queue-external-runs-"
+        )
+        self.addCleanup(external_directory.cleanup)
+        external_root = Path(external_directory.name)
+        run_dir = external_root / "accepted-run"
+        run_dir.mkdir(parents=True)
+        (self.repo.root / "runs").symlink_to(external_root, target_is_directory=True)
+        receipt_path = queue_module._runner_receipt_path(  # noqa: SLF001
+            self.repo.store,
+            item_id,
+            1,
+        )
+        queue_module._atomic_write_json(  # noqa: SLF001
+            receipt_path,
+            self._structured_receipt_payload(item_id, run_dir),
+        )
+        scheduler = Scheduler(
+            self.repo.store,
+            min_free_disk_gib=0,
+            gpu_provider=lambda: [],
+        )
+
+        receipt, error, structured_present = scheduler._read_item_runner_receipt(  # noqa: SLF001
+            self.repo.store.item(item_id)
+        )
+
+        self.assertIsNone(error)
+        self.assertTrue(structured_present)
+        self.assertEqual(receipt["run_directory"], str(run_dir.resolve()))
+
+    def test_restarted_scheduler_ingests_initial_structured_runner_receipt(self) -> None:
+        item_id = add_experiment(self.repo.store, "TST-001")
+        run_dir = self.repo.root / "outputs" / "experiments" / "restart-run"
+        run_dir.mkdir(parents=True)
+        receipt_path = queue_module._runner_receipt_path(  # noqa: SLF001
+            self.repo.store,
+            item_id,
+            1,
+        )
+        queue_module._atomic_write_json(  # noqa: SLF001
+            receipt_path,
+            self._structured_receipt_payload(item_id, run_dir),
+        )
+        restarted = Scheduler(
+            self.repo.store,
+            min_free_disk_gib=0,
+            gpu_provider=lambda: [],
+        )
+
+        restarted._ingest_structured_runner_receipt(  # noqa: SLF001
+            self.repo.store.item(item_id)
+        )
+
+        item = self.repo.store.item(item_id)
+        self.assertEqual(item["runner_run_dir"], str(run_dir.resolve()))
+        self.assertEqual(
+            item["runner_manifest_path"],
+            str((run_dir / "manifest.json").resolve()),
+        )
+        with self.repo.store.connect() as connection:
+            latest_event = connection.execute(
+                "SELECT event_type FROM events WHERE queue_item_id = ? ORDER BY id DESC LIMIT 1",
+                (item_id,),
+            ).fetchone()
+        self.assertEqual(latest_event["event_type"], "RUNNER_RECEIPT_INGESTED")
 
     def test_card_command_is_read_only_after_explicit_selection(self) -> None:
         card = read_card_command(self.repo.root, "TST-001")
@@ -628,11 +948,17 @@ class ExperimentQueueTests(unittest.TestCase):
         )
 
         deadline = time.monotonic() + 10
-        while time.monotonic() < deadline:
-            scheduler.run_iteration(force_gpu_poll=True)
-            if self.repo.store.item(item_id)["state"] == "succeeded":
-                break
-            time.sleep(0.05)
+        with mock.patch(
+            "experiment_queue.queue._read_legacy_stdout_runner_receipt",
+            side_effect=AssertionError(
+                "new runner jobs must not depend on the legacy stdout parser"
+            ),
+        ):
+            while time.monotonic() < deadline:
+                scheduler.run_iteration(force_gpu_poll=True)
+                if self.repo.store.item(item_id)["state"] == "succeeded":
+                    break
+                time.sleep(0.05)
 
         item = self.repo.store.item(item_id)
         self.assertEqual(item["state"], "succeeded")
@@ -642,6 +968,48 @@ class ExperimentQueueTests(unittest.TestCase):
         stdout = (manifest_path.parent / "stdout.log").read_text(encoding="utf-8")
         self.assertIn(f"gpu={gpu.uuid}", stdout)
         self.assertIn("mutton2:", item["rsync_pull_command"])
+        receipt_path = queue_module._runner_receipt_path(  # noqa: SLF001
+            self.repo.store,
+            item_id,
+            1,
+        )
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        self.assertEqual(receipt["status"], "succeeded")
+        self.assertEqual(receipt["queue_item_id"], item_id)
+
+    def test_runner_launch_failure_receipt_matches_observed_cli_exit(self) -> None:
+        gpu = self.gpu()
+        update_gpu_allowlist(self.repo.store, "set", ["0"], snapshots=[gpu])
+        item_id = add_experiment(self.repo.store, "TST-010")
+        scheduler = Scheduler(
+            self.repo.store,
+            poll_seconds=0.01,
+            min_free_disk_gib=0,
+            gpu_provider=lambda: [gpu],
+        )
+
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            scheduler.run_iteration(force_gpu_poll=True)
+            if self.repo.store.item(item_id)["state"] == "failed":
+                break
+            time.sleep(0.05)
+
+        item = self.repo.store.item(item_id)
+        self.assertEqual(item["state"], "failed")
+        self.assertEqual(item["return_code"], 2)
+        self.assertIsNone(item["state_detail"])
+        receipt_path = queue_module._runner_receipt_path(  # noqa: SLF001
+            self.repo.store,
+            item_id,
+            1,
+        )
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        self.assertEqual(receipt["status"], "launch_failed")
+        self.assertEqual(receipt["return_code"], 2)
+        manifest = json.loads(Path(receipt["manifest"]).read_text(encoding="utf-8"))
+        self.assertEqual(manifest["run"]["status"], "launch_failed")
+        self.assertEqual(manifest["run"]["return_code"], 127)
 
     @unittest.skipIf(os.name != "posix", "process-group termination is POSIX-specific")
     def test_terminate_interrupts_entire_running_attempt(self) -> None:

@@ -14,66 +14,38 @@ Each item has a stable ID, owner, dependencies, and completion criterion.
 - [ ] **EQ-GOV-002 — Codex:** add Linux Python 3.14 CI after `EQ-GOV-001`.
   Complete when clean install, unit/integration tests, packaging, and CLI smoke
   run on every proposed change without accessing GPUs or operator state.
-- [ ] **EQ-GOV-003 — Codex:** create an ADR index and compatibility/version
-  matrix covering database, Project, ExperimentCard, runner manifest/receipt,
-  queue export, and yield protocols. Complete when every supported major
-  version and fallback has one discoverable owner and test fixture.
 - [ ] **EQ-GOV-004 — Codex with David approval:** define release, deprecation,
   support, and changelog policy. Depends on the first multi-project release
   shape. Complete when the policy names compatibility guarantees and the legacy
   removal threshold.
+- [ ] **EQ-GOV-005 — Codex:** migrate package license metadata to the supported
+  PEP 639 SPDX form before setuptools ends TOML-table support on 2027-02-18.
+  Depends on no product implementation. Complete when the wheel still contains
+  `LICENSE` and builds without the setuptools license deprecation warning.
 
 ## Protocol And Receipt Foundation
 
-- [ ] **EQ-PROTO-001 — Codex:** implement independent protocol version
-  constants/types instead of the current shared integer conventions. Depends on
-  `EQ-GOV-003`. Complete when every serialized document identifies its kind and
-  major version independently.
-- [ ] **EQ-PROTO-002 — Codex:** define and implement an atomic structured runner
-  receipt containing run directory, manifest, logs, sync instructions, status,
-  and segment identity. Depends on `EQ-PROTO-001`. Complete when scheduler tests
-  no longer require English stdout for new jobs.
-- [ ] **EQ-PROTO-003 — Codex:** retain a narrowly named legacy stdout-receipt
-  parser for imported jobs. Depends on `EQ-PROTO-002`. Complete when golden
-  legacy fixtures resolve identically and malformed logs fail without guessing.
-- [ ] **EQ-PROTO-004 — Codex:** define a generic cooperative-yield request and
-  receipt with hashed checkpoint artifacts, typed progress, and opaque
-  project-owned resume context. Depends on `EQ-PROTO-001`. Complete when no
-  W&B-specific field is required by the generic protocol.
-- [ ] **EQ-PROTO-005 — Codex:** provide a dependency-light optional yield helper
-  and conformance suite for atomic ready/failed receipts and continuation
-  validation. Depends on `EQ-PROTO-004`. Complete when a fixture project can
-  implement safe preemption without copying environment constants or hashing
-  logic.
 - [ ] **EQ-PROTO-006 — Codex:** bind continuation identity to resolved spec
-  digest, project revision, Git commit, run identity, and prior receipt. Depends
-  on `EQ-PROTO-002` and `EQ-PROTO-004`. Complete when changed inputs/configs or
-  corrupt resume payloads are held without blocking unrelated work.
+  digest, project revision, Git commit, run identity, and prior receipt in the
+  scheduler hold/failure-isolation path. Depends on the completed structured
+  receipt and typed cooperative-yield foundations. Complete when changed
+  inputs/configs or corrupt resume payloads are held without blocking unrelated
+  work.
 
 ## Versioned Schemas And Card Compiler
 
-- [ ] **EQ-SCHEMA-001 — Codex:** select the exact YAML 1.2 parser, JSON Schema
-  implementation, canonical-JSON algorithm, and dependency bounds in a new ADR.
-  Depends on no other implementation task. Complete when behavior for duplicate
-  keys, aliases, tags, merges, timestamps, floats, and Unicode is explicit and
-  testable.
-- [ ] **EQ-SCHEMA-002 — Codex:** implement the strict YAML loader and canonical
-  source/digest utilities. Depends on `EQ-SCHEMA-001`. Complete when rejected
-  YAML constructs and stable canonical hashes have golden tests.
-- [ ] **EQ-SCHEMA-003 — Codex:** bundle immutable Draft 2020-12 Project v1 and
-  ExperimentCard v1 JSON Schemas with schema digests. Depends on
-  `EQ-SCHEMA-001`. Complete when installed-package resource loading and editor
-  export are tested.
-- [ ] **EQ-SCHEMA-004 — Codex:** model the portable Project contract: immutable
-  key, display name, card roots, declared logical volumes, environment policy,
-  supported protocols, and optional extension schema. Depends on
-  `EQ-SCHEMA-002` and `EQ-SCHEMA-003`. Complete when no host absolute path or
-  credential can appear in portable core fields.
-- [ ] **EQ-SCHEMA-005 — Codex:** model ExperimentCard scientific identity and
-  one-or-more explicit jobs with argv/wrapper execution, parameters, resources,
-  artifacts, provenance, and declared capabilities. Depends on
-  `EQ-SCHEMA-002` and `EQ-SCHEMA-003`. Complete when a simple job and an
-  explicit coordinator/worker card validate without a template engine.
+- [ ] **EQ-SCHEMA-004 — Codex:** implement the typed portable Project model and
+  cross-field validation atop the completed strict loader/schema foundation:
+  immutable key, display name, card roots, declared logical volumes,
+  environment policy, supported protocols, and optional extension schema.
+  Complete when no host absolute path or credential can appear in portable core
+  fields and invalid logical references cannot construct a Project.
+- [ ] **EQ-SCHEMA-005 — Codex:** implement the typed ExperimentCard model and
+  remaining cross-contract validation atop the completed schema foundation:
+  scientific identity, one-or-more explicit jobs, argv/wrapper execution,
+  parameters, resources, artifacts, provenance, and declared capabilities.
+  Complete when a simple job and an explicit coordinator/worker card construct
+  without a template engine and invalid references fail before admission.
 - [ ] **EQ-SCHEMA-006 — Codex:** implement namespaced extension validation.
   Depends on `EQ-SCHEMA-004` and `EQ-SCHEMA-005`. Complete when unknown core
   fields fail, project extensions remain flexible, and a supplied extension
@@ -182,8 +154,9 @@ Each item has a stable ID, owner, dependencies, and completion criterion.
   policy and cards cannot select GPUs.
 - [ ] **EQ-EXEC-006 — Codex:** replace checkout-specific `cd` rewriting and
   nested project runner commands for structured jobs. Depends on
-  `EQ-SCHEMA-008` and `EQ-PROTO-002`. Complete when new jobs execute direct argv
-  in the pinned worktree without Flowers path knowledge.
+  `EQ-SCHEMA-008` and the completed structured-receipt foundation. Complete when
+  new jobs execute direct argv in the pinned worktree without Flowers path
+  knowledge.
 - [ ] **EQ-EXEC-007 — Codex:** scope repository/card/mount/artifact/child circuit
   failures to a project and keep host failures global. Depends on
   `EQ-PROJECT-006`. Complete when a broken high-priority project cannot
@@ -233,16 +206,17 @@ Each item has a stable ID, owner, dependencies, and completion criterion.
   Complete when each invariant has a regression test.
 - [ ] **EQ-TEST-003 — Codex:** add structured/legacy receipt, corrupt
   continuation, preemption/termination race, and package install/entry-point
-  tests. Depends on `EQ-PROTO-002` through `EQ-PROTO-006`. Complete when both
-  compatibility and new paths pass on Python 3.14.
+  tests. Depends on the completed receipt/yield-helper foundations and
+  `EQ-PROTO-006`. Complete when both compatibility and new paths pass on Python
+  3.14.
 - [ ] **EQ-ONBOARD-001 — Codex:** implement `project init`, `card new`, schema
   export, validation, doctor, and submit dry-run scaffolding. Depends on
   `EQ-PROJECT-008` and `EQ-SCHEMA-010`. Complete when generated files validate
   without manual repair.
 - [ ] **EQ-ONBOARD-002 — Codex:** provide minimal ordinary, Python-training,
   data-pipeline, and cooperative-preemption examples. Depends on
-  `EQ-ONBOARD-001` and `EQ-PROTO-005`. Complete when examples pass GPU-free CI
-  or conformance tests.
+  `EQ-ONBOARD-001` and the completed yield-helper foundation. Complete when
+  examples pass GPU-free CI or conformance tests.
 - [ ] **EQ-ONBOARD-003 — Codex:** write the ten-minute operator/project guides,
   mounts/artifacts/provenance/security reference, troubleshooting, and editor
   schema instructions. Depends on stable CLI/schema behavior. Complete when a
@@ -268,17 +242,16 @@ Each item has a stable ID, owner, dependencies, and completion criterion.
   compatibility wrappers and docs. Depends on `EQ-FLOWERS-003`. Complete when
   local dry-run commands target the installed package and legacy operation is
   unchanged.
-- [ ] **EQ-FLOWERS-005 — Codex:** rehearse the v4 importer against a copied
-  representative state and run a fresh-state two-project smoke. Depends on
-  `EQ-MIGRATE-004`, `EQ-TEST-001`, and `EQ-FLOWERS-003`. Complete when all
-  receipts/counts/refs/paths/continuations/CLI/web checks pass.
-- [ ] **EQ-CUTOVER-001 — David:** confirm SPECFEM dataset generation and
-  evidence closeout are complete and explicitly authorize migration. Depends on
-  the Flowers scientific project, not queue implementation. Complete when David
-  explicitly reports that gate; do not infer it.
+- [ ] **EQ-FLOWERS-005 — Codex:** validate the v4 importer against exhaustive
+  copied fixtures and run a fresh-state two-project smoke; David waived a
+  separate production-state dress rehearsal. Depends on `EQ-MIGRATE-004`,
+  `EQ-TEST-001`, and `EQ-FLOWERS-003`. Complete when all fixture
+  receipts/counts/refs/paths/continuations/CLI/web checks pass and cutover can
+  safely retry from an untouched source copy after any failure.
 - [ ] **EQ-CUTOVER-002 — David with Codex instructions:** drain all
   `starting/running/yielding/terminating/force_killing` legacy items and stop
-  both legacy database writers. Depends on `EQ-CUTOVER-001` and
+  both legacy database writers. Depends on the completed scientific cutover
+  authorization gate recorded in `llm/status.md` and `llm/log.md`, plus
   `EQ-FLOWERS-005`. Complete when David reports an idle writer-free state.
 - [ ] **EQ-CUTOVER-003 — David with Codex verification:** make a consistent
   SQLite backup, retain old code/state read-only, and supply the copied state

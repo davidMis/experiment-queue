@@ -1,0 +1,19 @@
+[
+  {"constant": "DATABASE_V1", "apiVersion": "experiment-queue/v1", "kind": "Database"},
+  {"constant": "DATABASE_V2", "apiVersion": "experiment-queue/v2", "kind": "Database"},
+  {"constant": "DATABASE_V3", "apiVersion": "experiment-queue/v3", "kind": "Database"},
+  {"constant": "DATABASE_V4", "apiVersion": "experiment-queue/v4", "kind": "Database"},
+  {"constant": "DATABASE_V5", "apiVersion": "experiment-queue/v5", "kind": "Database"},
+  {"constant": "PROJECT_V1", "apiVersion": "experiment-queue/v1", "kind": "Project"},
+  {"constant": "EXPERIMENT_CARD_V1", "apiVersion": "experiment-queue/v1", "kind": "ExperimentCard"},
+  {"constant": "LEGACY_MARKDOWN_CARD_V0", "apiVersion": "experiment-queue/v0", "kind": "LegacyMarkdownCard"},
+  {"constant": "RUNNER_MANIFEST_V1", "apiVersion": "experiment-queue/v1", "kind": "RunnerManifest"},
+  {"constant": "LEGACY_RUNNER_STDOUT_RECEIPT_V0", "apiVersion": "experiment-queue/v0", "kind": "RunnerReceipt"},
+  {"constant": "RUNNER_RECEIPT_V1", "apiVersion": "experiment-queue/v1", "kind": "RunnerReceipt"},
+  {"constant": "LEGACY_DATABASE_COUPLED_QUEUE_EXPORT_V0", "apiVersion": "experiment-queue/v0", "kind": "QueueExport"},
+  {"constant": "QUEUE_EXPORT_V1", "apiVersion": "experiment-queue/v1", "kind": "QueueExport"},
+  {"constant": "LEGACY_COOPERATIVE_YIELD_REQUEST_V0", "apiVersion": "experiment-queue/v0", "kind": "CooperativeYieldRequest"},
+  {"constant": "COOPERATIVE_YIELD_REQUEST_V1", "apiVersion": "experiment-queue/v1", "kind": "CooperativeYieldRequest"},
+  {"constant": "LEGACY_COOPERATIVE_YIELD_RECEIPT_V0", "apiVersion": "experiment-queue/v0", "kind": "CooperativeYieldReceipt"},
+  {"constant": "COOPERATIVE_YIELD_RECEIPT_V1", "apiVersion": "experiment-queue/v1", "kind": "CooperativeYieldReceipt"}
+]

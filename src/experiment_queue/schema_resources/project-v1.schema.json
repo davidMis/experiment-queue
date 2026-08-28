@@ -1,0 +1,174 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:experiment-queue:schema:project:v1",
+  "$comment": "Portable Project/v1 authoring contract; host paths and credentials are intentionally absent.",
+  "title": "experiment-queue Project v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["apiVersion", "kind", "metadata", "spec"],
+  "properties": {
+    "apiVersion": {"const": "experiment-queue/v1"},
+    "kind": {"const": "Project"},
+    "metadata": {"$ref": "#/$defs/projectMetadata"},
+    "spec": {"$ref": "#/$defs/projectSpec"},
+    "extensions": {"$ref": "#/$defs/extensions"}
+  },
+  "$defs": {
+    "projectKey": {
+      "type": "string",
+      "maxLength": 63,
+      "pattern": "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*(?![\\s\\S])"
+    },
+    "logicalName": {
+      "type": "string",
+      "maxLength": 63,
+      "pattern": "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*(?![\\s\\S])"
+    },
+    "portableRelativePath": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?![A-Za-z]:)(?!~(?:/|$))(?!.*\\\\)(?!.*(?:^|/)\\.\\.?(?:/|$))(?!.*//)[^\\u0000-\\u001F\\u007F\\u0085\\u2028\\u2029]+(?![\\s\\S])"
+    },
+    "protocolIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["apiVersion", "kind"],
+      "properties": {
+        "apiVersion": {"type": "string"},
+        "kind": {"type": "string"}
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "apiVersion": {"const": "experiment-queue/v1"},
+            "kind": {"const": "RunnerManifest"}
+          }
+        },
+        {
+          "properties": {
+            "apiVersion": {"enum": ["experiment-queue/v0", "experiment-queue/v1"]},
+            "kind": {"const": "RunnerReceipt"}
+          }
+        },
+        {
+          "properties": {
+            "apiVersion": {"enum": ["experiment-queue/v0", "experiment-queue/v1"]},
+            "kind": {"const": "CooperativeYieldRequest"}
+          }
+        },
+        {
+          "properties": {
+            "apiVersion": {"enum": ["experiment-queue/v0", "experiment-queue/v1"]},
+            "kind": {"const": "CooperativeYieldReceipt"}
+          }
+        }
+      ]
+    },
+    "extensions": {
+      "type": "object",
+      "propertyNames": {"$ref": "#/$defs/projectKey"},
+      "additionalProperties": {"type": "object"}
+    },
+    "projectMetadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["key", "displayName"],
+      "properties": {
+        "key": {"$ref": "#/$defs/projectKey"},
+        "displayName": {"type": "string", "minLength": 1, "maxLength": 200},
+        "description": {"type": "string", "maxLength": 4000}
+      }
+    },
+    "volume": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "access"],
+      "properties": {
+        "name": {"$ref": "#/$defs/logicalName"},
+        "access": {"enum": ["readOnly", "readWrite"]},
+        "required": {"type": "boolean"},
+        "description": {"type": "string", "maxLength": 1000}
+      }
+    },
+    "environment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name"],
+      "properties": {
+        "name": {"$ref": "#/$defs/logicalName"},
+        "description": {"type": "string", "maxLength": 1000}
+      }
+    },
+    "environmentPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["inherit", "allowVariables"],
+      "properties": {
+        "inherit": {"enum": ["none", "allowlist"]},
+        "allowVariables": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Z_][A-Z0-9_]*(?![\\s\\S])"
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"inherit": {"const": "none"}}},
+          "then": {"properties": {"allowVariables": {"maxItems": 0}}}
+        }
+      ]
+    },
+    "extensionSchema": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path"],
+      "properties": {
+        "path": {"$ref": "#/$defs/portableRelativePath"},
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}(?![\\s\\S])"
+        }
+      }
+    },
+    "projectSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "cardRoots",
+        "volumes",
+        "environments",
+        "environmentPolicy",
+        "supportedProtocols"
+      ],
+      "properties": {
+        "cardRoots": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/portableRelativePath"}
+        },
+        "volumes": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/volume"}
+        },
+        "environments": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/environment"}
+        },
+        "environmentPolicy": {"$ref": "#/$defs/environmentPolicy"},
+        "supportedProtocols": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/protocolIdentity"}
+        },
+        "extensionSchema": {"$ref": "#/$defs/extensionSchema"}
+      }
+    }
+  }
+}

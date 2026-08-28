@@ -34,7 +34,8 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from experiment_queue.config import StateDirectoryError, resolve_state_dir
-from experiment_queue.runner import collect_git_context
+from experiment_queue.protocols import RUNNER_RECEIPT_V1
+from experiment_queue.runner import RUNNER_RECEIPT_ENV, collect_git_context
 
 
 SCHEMA_VERSION = 4
@@ -138,6 +139,10 @@ class QueueError(RuntimeError):
 
 class ContinuationIntegrityError(QueueError):
     """Raised when a queued continuation no longer matches its sealed files."""
+
+
+class RunnerReceiptError(QueueError):
+    """Raised when a present runner receipt violates its declared protocol."""
 
 
 class _ClosingConnection(sqlite3.Connection):
@@ -1235,6 +1240,9 @@ def _item_execution_context(
     child_environment["EXPERIMENT_QUEUE_SEGMENT"] = str(segment)
     child_environment["EXPERIMENT_QUEUE_WORKTREE"] = str(execution_root)
     child_environment["EXPERIMENT_QUEUE_PRIMARY_REPO"] = str(store.repo_root)
+    child_environment[RUNNER_RECEIPT_ENV] = str(
+        _runner_receipt_path(store, int(item["id"]), segment)
+    )
     if item["preemptible"]:
         child_environment["EXPERIMENT_QUEUE_YIELD_REQUEST_PATH"] = str(
             _yield_request_path(store, int(item["id"]), segment)
@@ -1871,6 +1879,10 @@ def _yield_receipt_path(store: QueueStore, item_id: int, segment: int) -> Path:
     return _segment_dir(store, item_id, segment) / "yield" / "receipt.json"
 
 
+def _runner_receipt_path(store: QueueStore, item_id: int, segment: int) -> Path:
+    return _segment_dir(store, item_id, segment) / "runner-receipt.json"
+
+
 def _parse_timestamp(value: str) -> datetime:
     parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     if parsed.tzinfo is None:
@@ -2376,24 +2388,317 @@ def request_termination(
     return signaled
 
 
-def _read_runner_receipt(log_path: Path) -> dict[str, str]:
-    """Extract the existing runner's final paths and pull command from its tee log."""
+def _read_structured_runner_receipt(
+    receipt_path: Path,
+    *,
+    expected_queue_item_id: int,
+    expected_segment: int,
+    allowed_run_roots: Sequence[Path],
+) -> dict[str, Any] | None:
+    """Read and strictly validate RunnerReceipt/v1, or report that it is absent.
+
+    Absence is the only condition that permits the legacy stdout fallback.  A
+    present but partial, corrupt, or unsupported document is a protocol error;
+    silently scraping human output in that case could combine unrelated data.
+    """
+
+    if receipt_path.is_symlink():
+        raise RunnerReceiptError(
+            f"runner receipt is not a regular file: {receipt_path}"
+        )
+    if not receipt_path.exists():
+        return None
+    if not receipt_path.is_file():
+        raise RunnerReceiptError(
+            f"runner receipt is not a regular file: {receipt_path}"
+        )
+    def reject_duplicate_keys(
+        pairs: list[tuple[str, Any]],
+    ) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise RunnerReceiptError(
+                    f"runner receipt {receipt_path} repeats JSON key {key!r}"
+                )
+            result[key] = value
+        return result
+
+    def reject_nonfinite_constant(value: str) -> None:
+        raise RunnerReceiptError(
+            f"runner receipt {receipt_path} contains unsupported JSON constant {value!r}"
+        )
+
+    try:
+        payload = json.loads(
+            receipt_path.read_text(encoding="utf-8"),
+            object_pairs_hook=reject_duplicate_keys,
+            parse_constant=reject_nonfinite_constant,
+        )
+    except RunnerReceiptError:
+        raise
+    except (
+        OSError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        RecursionError,
+        ValueError,
+    ) as exc:
+        raise RunnerReceiptError(
+            f"runner receipt {receipt_path} is unreadable or invalid JSON: {exc}"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise RunnerReceiptError(
+            f"runner receipt {receipt_path} must contain a JSON object"
+        )
+
+    expected_identity = RUNNER_RECEIPT_V1.document_identity()
+    for field, expected in expected_identity.items():
+        if payload.get(field) != expected:
+            raise RunnerReceiptError(
+                f"runner receipt {receipt_path} has unsupported {field} "
+                f"{payload.get(field)!r}; expected {expected!r}"
+            )
+    allowed_fields = {
+        *expected_identity,
+        "run_id",
+        "queue_item_id",
+        "segment",
+        "status",
+        "return_code",
+        "run_directory",
+        "manifest",
+        "logs",
+        "sync",
+        "written_at",
+    }
+    unknown_fields = sorted(set(payload) - allowed_fields)
+    missing_fields = sorted(allowed_fields - set(payload))
+    if unknown_fields or missing_fields:
+        details: list[str] = []
+        if missing_fields:
+            details.append(f"missing fields {missing_fields}")
+        if unknown_fields:
+            details.append(f"unknown fields {unknown_fields}")
+        raise RunnerReceiptError(
+            f"runner receipt {receipt_path} has invalid fields: " + "; ".join(details)
+        )
+
+    run_id = payload["run_id"]
+    if not isinstance(run_id, str) or not run_id.strip():
+        raise RunnerReceiptError(
+            f"runner receipt {receipt_path} has invalid run_id {run_id!r}"
+        )
+    queue_item_id = payload["queue_item_id"]
+    if (
+        isinstance(queue_item_id, bool)
+        or not isinstance(queue_item_id, int)
+        or queue_item_id != expected_queue_item_id
+    ):
+        raise RunnerReceiptError(
+            f"runner receipt {receipt_path} identifies queue item {queue_item_id!r}; "
+            f"expected {expected_queue_item_id}"
+        )
+    segment = payload["segment"]
+    if (
+        isinstance(segment, bool)
+        or not isinstance(segment, int)
+        or segment != expected_segment
+    ):
+        raise RunnerReceiptError(
+            f"runner receipt {receipt_path} identifies segment {segment!r}; "
+            f"expected {expected_segment}"
+        )
+    status = payload["status"]
+    statuses = {
+        "running",
+        "succeeded",
+        "failed",
+        "yielded",
+        "interrupted",
+        "launch_failed",
+    }
+    if not isinstance(status, str) or status not in statuses:
+        raise RunnerReceiptError(
+            f"runner receipt {receipt_path} has invalid status {status!r}"
+        )
+    return_code = payload["return_code"]
+    if status == "running":
+        if return_code is not None:
+            raise RunnerReceiptError(
+                f"running runner receipt {receipt_path} must have a null return_code"
+            )
+    elif isinstance(return_code, bool) or not isinstance(return_code, int):
+        raise RunnerReceiptError(
+            f"terminal runner receipt {receipt_path} has invalid return_code "
+            f"{return_code!r}"
+        )
+    expected_codes = {
+        "succeeded": 0,
+        "yielded": YIELD_EXIT_CODE,
+        "interrupted": 130,
+        # RunnerReceipt records the runner CLI process code.  The referenced
+        # manifest separately records the child-launch sentinel 127.
+        "launch_failed": 2,
+    }
+    expected_code = expected_codes.get(str(status))
+    if expected_code is not None and return_code != expected_code:
+        raise RunnerReceiptError(
+            f"runner receipt {receipt_path} status {status!r} requires "
+            f"return_code {expected_code}, got {return_code!r}"
+        )
+    if status == "failed" and return_code == 0:
+        raise RunnerReceiptError(
+            f"failed runner receipt {receipt_path} cannot have return_code 0"
+        )
+
+    path_values: dict[str, Path] = {}
+    for field in ("run_directory", "manifest"):
+        value = payload[field]
+        if not isinstance(value, str) or not value.strip() or not Path(value).is_absolute():
+            raise RunnerReceiptError(
+                f"runner receipt {receipt_path} field {field} must be an absolute path, "
+                f"got {value!r}"
+            )
+        try:
+            path_values[field] = Path(value).resolve()
+        except (OSError, RuntimeError) as exc:
+            raise RunnerReceiptError(
+                f"runner receipt {receipt_path} field {field} cannot be resolved: "
+                f"{value!r}: {exc}"
+            ) from exc
+    logs = payload["logs"]
+    if not isinstance(logs, dict) or set(logs) != {"stdout", "stderr"}:
+        raise RunnerReceiptError(
+            f"runner receipt {receipt_path} logs must contain exactly stdout and stderr"
+        )
+    for name, value in logs.items():
+        if not isinstance(value, str) or not value.strip() or not Path(value).is_absolute():
+            raise RunnerReceiptError(
+                f"runner receipt {receipt_path} log {name} must be an absolute path, "
+                f"got {value!r}"
+            )
+        try:
+            path_values[f"logs.{name}"] = Path(value).resolve()
+        except (OSError, RuntimeError) as exc:
+            raise RunnerReceiptError(
+                f"runner receipt {receipt_path} log {name} cannot be resolved: "
+                f"{value!r}: {exc}"
+            ) from exc
+    run_directory = path_values["run_directory"]
+    resolved_roots: list[Path] = []
+    for root in allowed_run_roots:
+        try:
+            resolved_roots.append(Path(root).resolve())
+        except (OSError, RuntimeError) as exc:
+            raise RunnerReceiptError(
+                f"runner receipt authorization root cannot be resolved: {root}: {exc}"
+            ) from exc
+    if not resolved_roots or not any(
+        run_directory != root and _path_inside(run_directory, root)
+        for root in resolved_roots
+    ):
+        raise RunnerReceiptError(
+            f"runner receipt {receipt_path} run directory {run_directory} is outside "
+            f"authorized roots {[str(root) for root in resolved_roots]}"
+        )
+    for field, value in path_values.items():
+        if field != "run_directory" and not _path_inside(value, run_directory):
+            raise RunnerReceiptError(
+                f"runner receipt {receipt_path} field {field} escapes run directory "
+                f"{run_directory}: {value}"
+            )
+
+    sync = payload["sync"]
+    if sync is not None:
+        if not isinstance(sync, dict) or set(sync) != {"type", "command"}:
+            raise RunnerReceiptError(
+                f"runner receipt {receipt_path} sync must be null or contain type and command"
+            )
+        if sync.get("type") != "rsync-pull":
+            raise RunnerReceiptError(
+                f"runner receipt {receipt_path} has unsupported sync type "
+                f"{sync.get('type')!r}"
+            )
+        command = sync.get("command")
+        if not isinstance(command, str) or not command.strip():
+            raise RunnerReceiptError(
+                f"runner receipt {receipt_path} has invalid sync command {command!r}"
+            )
+    written_at = payload["written_at"]
+    if not isinstance(written_at, str):
+        raise RunnerReceiptError(
+            f"runner receipt {receipt_path} has invalid written_at {written_at!r}"
+        )
+    try:
+        _parse_timestamp(written_at)
+    except ValueError as exc:
+        raise RunnerReceiptError(
+            f"runner receipt {receipt_path} has invalid written_at {written_at!r}"
+        ) from exc
+    return payload
+
+
+def _read_legacy_stdout_runner_receipt(log_path: Path) -> dict[str, str]:
+    """Parse only the frozen legacy runner's exact human-readable footer.
+
+    Duplicate or partial footers are rejected rather than choosing the last
+    plausible-looking value.  This parser is a compatibility adapter for
+    imported jobs, not a discovery mechanism for new runner output.
+    """
 
     if not log_path.is_file():
         return {}
     text = log_path.read_text(encoding="utf-8", errors="replace")
     text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text).replace("\r", "\n")
-    patterns = {
-        "run_directory": r"^run directory:\s*(.+?)\s*$",
-        "manifest": r"^manifest:\s*(.+?)\s*$",
-        "rsync_pull_command": r"^pull outputs with:\s*(.+?)\s*$",
+    prefixes = {
+        "run_directory": "run directory:",
+        "manifest": "manifest:",
+        "rsync_pull_command": "pull outputs with:",
     }
-    result: dict[str, str] = {}
-    for key, pattern in patterns.items():
-        matches = re.findall(pattern, text, flags=re.MULTILINE)
-        if matches:
-            result[key] = matches[-1]
-    return result
+    matches: dict[str, list[str]] = {key: [] for key in prefixes}
+    for line in text.splitlines():
+        for key, prefix in prefixes.items():
+            if line.startswith(prefix):
+                value = line[len(prefix) :].strip()
+                if not value:
+                    raise RunnerReceiptError(
+                        f"legacy runner footer {log_path} has an empty {key} value"
+                    )
+                matches[key].append(value)
+    present = {key for key, values in matches.items() if values}
+    if not present:
+        return {}
+    required = {"run_directory", "manifest"}
+    missing = sorted(required - present)
+    duplicates = sorted(key for key, values in matches.items() if len(values) > 1)
+    if missing or duplicates:
+        details: list[str] = []
+        if missing:
+            details.append(f"missing fields {missing}")
+        if duplicates:
+            details.append(f"duplicate fields {duplicates}")
+        raise RunnerReceiptError(
+            f"legacy runner footer {log_path} is malformed: " + "; ".join(details)
+        )
+    return {key: values[0] for key, values in matches.items() if values}
+
+
+def _runner_receipt_column_values(
+    receipt: Mapping[str, Any],
+) -> tuple[str | None, str | None, str | None]:
+    """Return the three schema-v4 compatibility columns from either receipt form."""
+
+    sync = receipt.get("sync")
+    if isinstance(sync, Mapping):
+        rsync_pull_command = sync.get("command")
+    else:
+        rsync_pull_command = receipt.get("rsync_pull_command")
+    return (
+        str(receipt["run_directory"]) if receipt.get("run_directory") else None,
+        str(receipt["manifest"]) if receipt.get("manifest") else None,
+        str(rsync_pull_command) if rsync_pull_command else None,
+    )
 
 
 class Scheduler:
@@ -2679,11 +2984,143 @@ class Scheduler:
             "SELECT * FROM gpu_reservations WHERE id = ?", (reservation["id"],)
         ).fetchone()
 
+    def _record_runner_receipt_error(self, item: sqlite3.Row, error: str) -> None:
+        """Record one actionable protocol failure without stopping the child process."""
+
+        detail = f"runner receipt rejected: {error}"
+        with self.store.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            latest = connection.execute(
+                "SELECT payload_json FROM events WHERE queue_item_id = ? "
+                "AND event_type = 'RUNNER_RECEIPT_REJECTED' ORDER BY id DESC LIMIT 1",
+                (item["id"],),
+            ).fetchone()
+            if latest is not None:
+                try:
+                    if json.loads(latest["payload_json"]).get("reason") == error:
+                        return
+                except (AttributeError, json.JSONDecodeError, TypeError):
+                    pass
+            current = self.store.item(int(item["id"]), connection=connection)
+            if current["state"] in {"starting", "running"} and not current["state_detail"]:
+                connection.execute(
+                    "UPDATE queue_items SET state_detail = ? WHERE id = ?",
+                    (detail, item["id"]),
+                )
+            self.store._event(
+                connection,
+                "RUNNER_RECEIPT_REJECTED",
+                queue_item_id=int(item["id"]),
+                payload={"reason": error, "segment": int(item["segment"])},
+            )
+
+    def _read_item_runner_receipt(
+        self,
+        item: sqlite3.Row,
+    ) -> tuple[dict[str, Any], str | None, bool]:
+        """Prefer the structured receipt and use stdout only when it is absent.
+
+        The boolean identifies whether a structured receipt was present.  It is
+        deliberately true even for a malformed document, preventing fallback.
+        """
+
+        item_id = int(item["id"])
+        segment = int(item["segment"])
+        receipt_path = _runner_receipt_path(self.store, item_id, segment)
+        allowed_run_roots = self._runner_receipt_roots(item)
+        try:
+            structured = _read_structured_runner_receipt(
+                receipt_path,
+                expected_queue_item_id=item_id,
+                expected_segment=segment,
+                allowed_run_roots=allowed_run_roots,
+            )
+        except RunnerReceiptError as exc:
+            return {}, str(exc), True
+        if structured is not None:
+            return structured, None, True
+        try:
+            legacy = _read_legacy_stdout_runner_receipt(
+                _segment_dir(self.store, item_id, segment) / "launcher.log"
+            )
+        except RunnerReceiptError as exc:
+            return {}, str(exc), False
+        return legacy, None, False
+
+    def _ingest_structured_runner_receipt(self, item: sqlite3.Row) -> None:
+        """Persist paths from an initial receipt so restart monitoring can find logs."""
+
+        item_id = int(item["id"])
+        segment = int(item["segment"])
+        try:
+            receipt = _read_structured_runner_receipt(
+                _runner_receipt_path(self.store, item_id, segment),
+                expected_queue_item_id=item_id,
+                expected_segment=segment,
+                allowed_run_roots=self._runner_receipt_roots(item),
+            )
+        except RunnerReceiptError as exc:
+            self._record_runner_receipt_error(item, str(exc))
+            return
+        if receipt is None:
+            return
+        run_directory, manifest, rsync_pull_command = _runner_receipt_column_values(
+            receipt
+        )
+        with self.store.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            current = self.store.item(item_id, connection=connection)
+            changed = (
+                current["runner_run_dir"] != run_directory
+                or current["runner_manifest_path"] != manifest
+                or current["rsync_pull_command"] != rsync_pull_command
+            )
+            if not changed:
+                return
+            connection.execute(
+                """
+                UPDATE queue_items SET runner_run_dir = ?, runner_manifest_path = ?,
+                    rsync_pull_command = ? WHERE id = ?
+                """,
+                (run_directory, manifest, rsync_pull_command, item_id),
+            )
+            self.store._event(
+                connection,
+                "RUNNER_RECEIPT_INGESTED",
+                queue_item_id=item_id,
+                payload={
+                    "path": str(_runner_receipt_path(self.store, item_id, segment)),
+                    "run_id": receipt["run_id"],
+                    "segment": segment,
+                    "status": receipt["status"],
+                    "logs": receipt["logs"],
+                },
+            )
+
+    def _runner_receipt_roots(self, item: sqlite3.Row) -> tuple[Path, ...]:
+        """Return schema-v4 roots authorized to contain one runner directory.
+
+        New project revisions will replace this compatibility rule with their
+        declared artifact roots. The extracted queue allows the primary
+        repository, the exact isolated worktree, and resolved directory roots
+        linked through the scheduler's configured shared-worktree paths.
+        """
+
+        roots = [self.store.repo_root]
+        worktree_value = item["worktree_path"]
+        if worktree_value:
+            roots.append(Path(str(worktree_value)))
+        for name in SHARED_WORKTREE_PATHS:
+            source = self.store.repo_root / name
+            if source.is_dir():
+                roots.append(source)
+        return tuple(roots)
+
     def _finalize_yield(
         self,
         item: sqlite3.Row,
         executor_receipt: dict[str, Any],
-        runner_receipt: dict[str, str],
+        runner_receipt: Mapping[str, Any],
         yield_receipt: dict[str, Any],
     ) -> bool:
         """Requeue a still-current yield without clobbering a later termination."""
@@ -2700,6 +3137,7 @@ class Scheduler:
             "reservation_id": None,
             "reservation_expires_at": None,
             "executor_receipt": executor_receipt,
+            "runner_receipt": dict(runner_receipt),
         }
         if yield_receipt.get("progress") is not None:
             event_payload.update(
@@ -2721,6 +3159,9 @@ class Scheduler:
             if reservation is not None:
                 event_payload["reservation_id"] = int(reservation["id"])
                 event_payload["reservation_expires_at"] = reservation["expires_at"]
+            run_directory, manifest, rsync_pull_command = _runner_receipt_column_values(
+                runner_receipt
+            )
             connection.execute(
                 """
                 UPDATE queue_items SET state = 'queued', state_detail = ?, segment = segment + 1,
@@ -2741,9 +3182,9 @@ class Scheduler:
                     str(yield_receipt["checkpoint_metadata_sha256"]),
                     int(yield_receipt["step"]),
                     wandb.get("id"),
-                    runner_receipt.get("run_directory") or item["runner_run_dir"],
-                    runner_receipt.get("manifest") or item["runner_manifest_path"],
-                    runner_receipt.get("rsync_pull_command") or item["rsync_pull_command"],
+                    run_directory or item["runner_run_dir"],
+                    manifest or item["runner_manifest_path"],
+                    rsync_pull_command or item["rsync_pull_command"],
                     item["id"],
                 ),
             )
@@ -2765,13 +3206,32 @@ class Scheduler:
     def _finalize_item(self, item: sqlite3.Row, receipt: dict[str, Any] | None) -> None:
         prior_state = str(item["state"])
         return_code = receipt.get("return_code") if receipt is not None else None
-        segment_dir = _segment_dir(
-            self.store,
-            int(item["id"]),
-            int(item["segment"]),
+        runner_receipt, runner_error, structured_present = (
+            self._read_item_runner_receipt(item)
         )
-        runner_receipt = _read_runner_receipt(segment_dir / "launcher.log")
-        if prior_state == "yielding" and receipt is not None:
+        if (
+            structured_present
+            and runner_error is None
+            and receipt is not None
+            and runner_receipt
+            and prior_state != "force_killing"
+        ):
+            runner_status = runner_receipt["status"]
+            runner_return_code = runner_receipt["return_code"]
+            if runner_status == "running":
+                runner_error = (
+                    "structured runner receipt remained in running state after "
+                    f"executor exit for queue item {item['id']} segment {item['segment']}"
+                )
+            elif runner_return_code != return_code:
+                runner_error = (
+                    "structured runner receipt return_code "
+                    f"{runner_return_code!r} does not match executor return_code "
+                    f"{return_code!r} for queue item {item['id']} segment {item['segment']}"
+                )
+        if runner_error is not None:
+            self._record_runner_receipt_error(item, runner_error)
+        if prior_state == "yielding" and receipt is not None and runner_error is None:
             run_dir = runner_receipt.get("run_directory") or item["runner_run_dir"]
             yield_receipt, yield_error = self._validated_yield_receipt(
                 item,
@@ -2783,11 +3243,13 @@ class Scheduler:
                 item = self.store.item(int(item["id"]))
                 prior_state = str(item["state"])
         else:
-            yield_error = None
+            yield_error = runner_error
         if prior_state == "force_killing":
             final_state = "force_killed"
         elif prior_state == "terminating" or return_code == 130:
             final_state = "interrupted"
+        elif runner_error is not None:
+            final_state = "failed"
         elif return_code == 0:
             final_state = "succeeded"
         else:
@@ -2796,6 +3258,9 @@ class Scheduler:
             yield_error
             if yield_error
             else None if receipt is not None else "process disappeared without an exit receipt"
+        )
+        run_directory, manifest, rsync_pull_command = _runner_receipt_column_values(
+            runner_receipt
         )
         with self.store.connect() as connection:
             connection.execute(
@@ -2810,10 +3275,9 @@ class Scheduler:
                     utc_now_iso(),
                     return_code,
                     detail,
-                    runner_receipt.get("run_directory") or item["runner_run_dir"],
-                    runner_receipt.get("manifest") or item["runner_manifest_path"],
-                    runner_receipt.get("rsync_pull_command")
-                    or item["rsync_pull_command"],
+                    run_directory or item["runner_run_dir"],
+                    manifest or item["runner_manifest_path"],
+                    rsync_pull_command or item["rsync_pull_command"],
                     item["id"],
                 ),
             )
@@ -2827,7 +3291,18 @@ class Scheduler:
                 connection,
                 "EXPERIMENT_FINISHED",
                 queue_item_id=int(item["id"]),
-                payload={"state": final_state, "return_code": return_code, "receipt": receipt},
+                payload={
+                    "state": final_state,
+                    "return_code": return_code,
+                    "receipt": receipt,
+                    "runner_receipt": runner_receipt or None,
+                    "runner_receipt_source": (
+                        "structured-v1"
+                        if structured_present
+                        else "legacy-stdout-v0" if runner_receipt else None
+                    ),
+                    "runner_receipt_error": runner_error,
+                },
             )
             pending_reservation = connection.execute(
                 "SELECT * FROM gpu_reservations WHERE queue_item_id = ? AND status = 'pending'",
@@ -2926,6 +3401,10 @@ class Scheduler:
             process = self.processes.get(item_id)
             if process is not None:
                 process.poll()
+            # The runner publishes a complete initial receipt before launching
+            # its child.  Ingest it on every reconciliation pass so a restarted
+            # scheduler can discover logs without waiting for process exit.
+            self._ingest_structured_runner_receipt(item)
             receipt_path = self._receipt_path(item_id, int(item["segment"]))
             if int(item["segment"]) == 1 and not receipt_path.exists():
                 legacy = self.store.state_dir / "attempts" / str(item_id) / "exit.json"
