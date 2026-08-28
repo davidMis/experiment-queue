@@ -34,50 +34,27 @@ Each item has a stable ID, owner, dependencies, and completion criterion.
 
 ## Versioned Schemas And Card Compiler
 
-- [ ] **EQ-SCHEMA-004 — Codex:** implement the typed portable Project model and
-  cross-field validation atop the completed strict loader/schema foundation:
-  immutable key, display name, card roots, declared logical volumes,
-  environment policy, supported protocols, and optional extension schema.
-  Complete when no host absolute path or credential can appear in portable core
-  fields and invalid logical references cannot construct a Project.
-- [ ] **EQ-SCHEMA-005 — Codex:** implement the typed ExperimentCard model and
-  remaining cross-contract validation atop the completed schema foundation:
-  scientific identity, one-or-more explicit jobs, argv/wrapper execution,
-  parameters, resources, artifacts, provenance, and declared capabilities.
-  Complete when a simple job and an explicit coordinator/worker card construct
-  without a template engine and invalid references fail before admission.
-- [ ] **EQ-SCHEMA-006 — Codex:** implement namespaced extension validation.
-  Depends on `EQ-SCHEMA-004` and `EQ-SCHEMA-005`. Complete when unknown core
-  fields fail, project extensions remain flexible, and a supplied extension
-  schema can add project-specific requirements.
-- [ ] **EQ-SCHEMA-007 — Codex:** separate immutable cards from mutable
-  Submission bindings, priority, holds, dependencies, operator, and preemption
-  authorization. Depends on `EQ-SCHEMA-005`. Complete when no runtime scheduling
-  state is serialized into a committed card.
-- [ ] **EQ-SCHEMA-008 — Codex:** implement admission compilation/snapshots of
-  raw bytes/hash, normalized and resolved JSON/hash, schema identity/hash,
-  project revision, Git commit, command, and package version. Depends on
-  `EQ-SCHEMA-004` through `EQ-SCHEMA-007`. Complete when a later file/config
-  edit cannot change admitted execution.
 - [ ] **EQ-SCHEMA-009 — Codex:** implement `LegacyMarkdownCard/v0` with exactly
-  the current parser contract and no broadened heuristics. Depends on
-  `EQ-SCHEMA-008`. Complete when byte-for-byte legacy command fixtures pass and
-  alternate/unresolved cards remain explicitly unimportable.
+  the current parser contract and no broadened heuristics. Depends on the
+  completed typed admission foundation. Complete when byte-for-byte legacy
+  command fixtures pass and alternate/unresolved cards remain explicitly
+  unimportable.
 - [ ] **EQ-SCHEMA-010 — Codex:** add card/project `validate`, `explain`, and
-  submission `--dry-run` output. Depends on `EQ-SCHEMA-008`. Complete when an
-  operator can inspect all resolved bindings, paths, resources, digests, and
-  preemption policy without mutating state.
+  submission `--dry-run` output. Depends on the completed typed admission
+  foundation. Complete when an operator can inspect all resolved bindings,
+  paths, resources, digests, and preemption policy without mutating state.
 
 ## Project Model And Database V5
 
 - [ ] **EQ-PROJECT-001 — Codex:** write an ADR for Project, host Enrollment,
   immutable ProjectRevision, lifecycle, checkout repointing, archive rules,
-  state/artifact overlap, and cross-project dependencies. Depends on
-  `EQ-SCHEMA-004`. Complete when ownership and mutation semantics are
-  unambiguous before schema migration code begins.
-- [ ] **EQ-PROJECT-002 — Codex:** implement typed Project, Enrollment,
-  ProjectRevision, logical mount, artifact root, and project runtime-state
-  models. Depends on `EQ-PROJECT-001`. Complete when invalid lifecycle or
+  state/artifact overlap, and cross-project dependencies. Depends on the
+  completed typed Project foundation. Complete when ownership and mutation
+  semantics are unambiguous before schema migration code begins.
+- [ ] **EQ-PROJECT-002 — Codex:** implement typed registered-project lifecycle,
+  host Enrollment, ProjectRevision, logical mount, artifact root, and project
+  runtime-state models around the completed portable Project/v1 authoring
+  model. Depends on `EQ-PROJECT-001`. Complete when invalid lifecycle or
   project/revision combinations cannot be constructed through public APIs.
 - [ ] **EQ-PROJECT-003 — Codex:** add schema-v5 project, revision, mount,
   artifact-root, runtime-state, and job-artifact tables. Depends on
@@ -85,8 +62,9 @@ Each item has a stable ID, owner, dependencies, and completion criterion.
   cascades history or artifact deletion.
 - [ ] **EQ-PROJECT-004 — Codex:** add non-null queue-item project/revision
   identity with a composite foreign key proving revision ownership. Depends on
-  `EQ-PROJECT-003`. Complete when every new queue item has one immutable project
-  revision.
+  `EQ-PROJECT-003` and `EQ-PROJECT-009`. Complete when every new queue item has
+  one immutable project revision and only resolver-authenticated admission
+  evidence can be persisted.
 - [ ] **EQ-PROJECT-005 — Codex:** replace global experiment-attempt uniqueness
   with `(project_id, experiment_id, attempt)` while keeping queue item IDs
   global. Depends on `EQ-PROJECT-004`. Complete when two projects can admit the
@@ -102,6 +80,13 @@ Each item has a stable ID, owner, dependencies, and completion criterion.
   validate/doctor/pause/resume/archive`. Depends on `EQ-PROJECT-007` and
   `EQ-SCHEMA-010`. Complete when every command has JSON output and actionable
   path/lifecycle errors.
+- [ ] **EQ-PROJECT-009 — Codex:** implement the trusted Git-tree admission
+  source resolver that reads Project, card, and optional extension-schema bytes
+  from their named paths in the pinned ProjectRevision commit before database
+  mutation. Depends on `EQ-PROJECT-002` and the completed typed admission
+  compiler. Complete when missing or mismatched paths, project/revision/commit
+  identities, and byte claims fail closed, and snapshot names/hashes match Git
+  object evidence.
 
 ## Offline Migration Infrastructure
 
@@ -150,13 +135,12 @@ Each item has a stable ID, owner, dependencies, and completion criterion.
   project and central-state pressure pauses all.
 - [ ] **EQ-EXEC-005 — Codex:** construct child environments from a declared
   policy and protect reserved variables and GPU assignment. Depends on
-  `EQ-SCHEMA-008`. Complete when inherited secrets/overrides follow explicit
-  policy and cards cannot select GPUs.
+  the completed typed admission foundation. Complete when inherited
+  secrets/overrides follow explicit policy and cards cannot select GPUs.
 - [ ] **EQ-EXEC-006 — Codex:** replace checkout-specific `cd` rewriting and
-  nested project runner commands for structured jobs. Depends on
-  `EQ-SCHEMA-008` and the completed structured-receipt foundation. Complete when
-  new jobs execute direct argv in the pinned worktree without Flowers path
-  knowledge.
+  nested project runner commands for structured jobs. Depends on the completed
+  typed admission and structured-receipt foundations. Complete when new jobs
+  execute direct argv in the pinned worktree without Flowers path knowledge.
 - [ ] **EQ-EXEC-007 — Codex:** scope repository/card/mount/artifact/child circuit
   failures to a project and keep host failures global. Depends on
   `EQ-PROJECT-006`. Complete when a broken high-priority project cannot
@@ -226,9 +210,9 @@ Each item has a stable ID, owner, dependencies, and completion criterion.
 
 - [ ] **EQ-FLOWERS-001 — Codex:** create the portable Flowers Project manifest,
   extension schema, host enrollment fixture, mounts, external scratch roots,
-  and runtime policy without changing live Flowers state. Depends on
-  `EQ-SCHEMA-004`, `EQ-PROJECT-008`, and `EQ-EXEC-003`. Complete when local
-  validation/doctor passes.
+  and runtime policy without changing live Flowers state. Depends on the
+  completed typed Project foundation, `EQ-PROJECT-008`, and `EQ-EXEC-003`.
+  Complete when local validation/doctor passes.
 - [ ] **EQ-FLOWERS-002 — Codex:** inventory active/future versus historical
   Flowers cards and classify parser-compatible, alternate-heading, local,
   unresolved-template, coordinator, worker, and non-runnable records. Depends
@@ -236,8 +220,9 @@ Each item has a stable ID, owner, dependencies, and completion criterion.
   disposition without editing historical Markdown.
 - [ ] **EQ-FLOWERS-003 — Codex:** convert representative simple,
   W&B/preemptible, and independently elastic SPECFEM jobs. Depends on
-  `EQ-FLOWERS-001`, `EQ-PROTO-006`, and `EQ-SCHEMA-008`. Complete when exact
-  commit/command/artifact/checkpoint/tracker/continuation identity is proven.
+  `EQ-FLOWERS-001`, `EQ-PROTO-006`, and the completed typed admission
+  foundation. Complete when exact commit/command/artifact/checkpoint/tracker/
+  continuation identity is proven.
 - [ ] **EQ-FLOWERS-004 — Codex:** prepare but do not activate Flowers
   compatibility wrappers and docs. Depends on `EQ-FLOWERS-003`. Complete when
   local dry-run commands target the installed package and legacy operation is

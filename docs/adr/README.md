@@ -15,6 +15,7 @@ and compatibility evidence are indexed separately in the
 | [0005](0005-platform-and-trust-boundary.md) | Accepted, 2026-08-19 | Linux/NVIDIA production scope and trusted-code boundary |
 | [0006](0006-strict-yaml-schema-and-canonical-json.md) | Accepted, 2026-08-27 | Strict YAML subset, Draft 2020-12 schemas, and canonical JSON |
 | [0007](0007-bounded-schema-processing-and-referencing.md) | Accepted, 2026-08-27 | Bounded schema processing, semantic validation, and direct `referencing` ownership |
+| [0008](0008-typed-authoring-extensions-and-admission-snapshots.md) | Accepted, 2026-08-28 | Typed immutable authoring, project extensions, mutable Submission, and admission evidence |
 
 New records use the next four-digit number. Their title, status, and supersedes
 relationship must be added here when the record is accepted.

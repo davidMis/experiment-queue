@@ -21,6 +21,10 @@ parameters, job definitions, resources, artifacts, provenance, and declared
 preemption capability. Project-specific structure belongs under namespaced
 extensions. Most projects will not need a Python plugin.
 
+The implemented typed library contract, extension envelope, bounded Submission
+bindings, and immutable evidence fields are documented in
+[`authoring-and-admission.md`](authoring-and-admission.md).
+
 The project environment remains independent of the queue service. Domain code
 creates and validates its checkpoints; an optional dependency-light protocol
 helper will handle yield requests, atomic receipts, hashes, and failures.

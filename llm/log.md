@@ -130,3 +130,56 @@ Open:
   two-project isolation are next.
 - The publication remote is unset. A non-blocking setuptools license-metadata
   deprecation is tracked as `EQ-GOV-005` before its 2027 deadline.
+
+## 2026-08-28 - Implement Typed Authoring And Admission Evidence
+
+Goal: complete the storage-neutral Project/v1, ExperimentCard/v1, extension,
+Submission, and admission-snapshot foundation before database-v5 work, without
+touching live Flowers state.
+
+Decisions:
+
+- Accepted ADR 0008: validated authoring models are deeply immutable; mutable
+  scheduling policy lives in Submission; bindings replace only complete
+  declared parameter values; and one offline project-owned schema validates the
+  `extensions.<project-key>` envelope.
+- Admission compilation is pure. A future trusted ProjectRevision/Git resolver
+  must supply exact named blobs from the pinned full commit before persistence.
+  Compiler provenance is always read from installed package metadata.
+
+Result:
+
+- Completed `EQ-SCHEMA-004` through `EQ-SCHEMA-008` and removed them from the
+  live TODO.
+- Added typed Project/card/nested command-resource-artifact models, strict
+  cross-document references, service-owned environment protection, placeholder
+  rejection, and exact JSON-native round trips.
+- Added strict offline Draft 2020-12 extension-schema validation with canonical
+  digest authentication, dormant-reference preflight, recursion handling, and
+  exact source/canonical evidence.
+- Added mutable Submission input and factory-only immutable policy/schema/
+  snapshot evidence with detached inputs, selected-job resolution, bounded
+  whole-value bindings, full Git identity, and stable resolved execution
+  digests. Later caller mutations cannot alter snapshots.
+- Hardened wheel verification to require the new authoring modules and recorded
+  `EQ-PROJECT-009` as the Git-tree resolver gate before database admission.
+
+Verification:
+
+- Full Python 3.14 suite: `409 passed, 26 subtests passed` in `15.26 s`.
+- Focused authoring/extension/admission suite: `132 passed` in `3.72 s`;
+  `py_compile` and `git diff --check` passed.
+- A fresh wheel built successfully and isolated verification confirmed the
+  authoring/admission modules, compiler provenance against wheel metadata, both
+  bundled schemas, pinned canonical digests, and editor exports. The known
+  setuptools license warning remains tracked as `EQ-GOV-005`.
+- No Flowers source/card/wrapper/live-state file changed, no GPU allowlist or
+  production state was used, and no connection to `mutton2` was attempted.
+
+Open:
+
+- The executable remains schema-v4/single-project; typed snapshots are not yet
+  persisted or executed.
+- The Project lifecycle ADR/models, trusted Git resolver, schema-v5 storage,
+  typed-yield scheduler integration, offline importer, and two-project
+  isolation remain next.

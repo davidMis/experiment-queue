@@ -1,4 +1,4 @@
-"""Verify that a built wheel exposes authenticated bundled schema resources."""
+"""Verify that a built wheel exposes the authoring API and schema resources."""
 
 from __future__ import annotations
 
@@ -10,6 +10,9 @@ import zipfile
 
 
 REQUIRED_RESOURCES = (
+    "experiment_queue/admission.py",
+    "experiment_queue/authoring.py",
+    "experiment_queue/extensions.py",
     "experiment_queue/schema_resources/__init__.py",
     "experiment_queue/schema_resources/project-v1.schema.json",
     "experiment_queue/schema_resources/experiment-card-v1.schema.json",
@@ -17,7 +20,7 @@ REQUIRED_RESOURCES = (
 
 
 def verify_wheel(wheel: Path) -> None:
-    """Fail unless an isolated import from ``wheel`` authenticates both schemas."""
+    """Fail unless ``wheel`` contains the API and authenticates both schemas."""
 
     if not wheel.is_absolute():
         raise ValueError(f"wheel path must be absolute, got {wheel}")
@@ -30,16 +33,18 @@ def verify_wheel(wheel: Path) -> None:
         raise ValueError(f"could not read wheel archive {wheel}: {exc}") from exc
     missing = sorted(set(REQUIRED_RESOURCES) - members)
     if missing:
-        raise ValueError(f"wheel {wheel} is missing schema resources: {missing}")
+        raise ValueError(f"wheel {wheel} is missing required package files: {missing}")
 
     probe = """
 import json
+from importlib.metadata import distributions
 from pathlib import Path
 import sys
 
 wheel = Path(sys.argv[1]).resolve()
 sys.path.insert(0, str(wheel))
 import experiment_queue
+from experiment_queue import admission, authoring, extensions
 from experiment_queue.protocols import EXPERIMENT_CARD_V1, PROJECT_V1
 from experiment_queue.schema_registry import (
     editor_schema_bytes,
@@ -49,6 +54,26 @@ from experiment_queue.schema_registry import (
 )
 if not str(experiment_queue.__file__).startswith(str(wheel)):
     raise SystemExit(f"import did not come from wheel: {experiment_queue.__file__}")
+for module in (admission, authoring, extensions):
+    if not str(module.__file__).startswith(str(wheel)):
+        raise SystemExit(f"authoring module import did not come from wheel: {module.__file__}")
+wheel_distributions = [
+    distribution
+    for distribution in distributions(path=[str(wheel)])
+    if distribution.metadata["Name"] == "experiment-queue"
+]
+if len(wheel_distributions) != 1:
+    raise SystemExit(
+        f"expected one experiment-queue distribution in wheel, got {len(wheel_distributions)}"
+    )
+wheel_version = wheel_distributions[0].version
+if experiment_queue.__version__ != wheel_version:
+    raise SystemExit(
+        f"package version {experiment_queue.__version__!r} differs from wheel metadata "
+        f"{wheel_version!r}"
+    )
+if admission._package_version() != wheel_version:
+    raise SystemExit("admission compiler provenance differs from wheel metadata")
 for protocol in (PROJECT_V1, EXPERIMENT_CARD_V1):
     document = load_bundled_schema(protocol)
     if json.loads(editor_schema_bytes(protocol)) != document:
@@ -71,8 +96,9 @@ for protocol in (PROJECT_V1, EXPERIMENT_CARD_V1):
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Verify schema package data, authenticated loading, canonical digests, "
-            "and editor export from one already-built experiment-queue wheel."
+            "Verify typed authoring modules, compiler metadata, schema package data, "
+            "authenticated loading, canonical digests, and editor export from one "
+            "already-built experiment-queue wheel."
         )
     )
     parser.add_argument(
@@ -92,7 +118,7 @@ def main() -> int:
     except ValueError as exc:
         print(f"wheel verification failed: {exc}", file=sys.stderr)
         return 1
-    print(f"verified wheel schema resources: {arguments.wheel}")
+    print(f"verified wheel authoring API and schema resources: {arguments.wheel}")
     return 0
 
 

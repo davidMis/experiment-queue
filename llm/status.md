@@ -6,7 +6,7 @@ architecture belongs in `docs/`, accepted decisions in `docs/adr/`,
 forward-looking work in `llm/todo.md`, and chronological evidence in
 `llm/log.md`.
 
-Last updated: 2026-08-27 by Codex from David's decisions and local repository
+Last updated: 2026-08-28 by Codex from David's decisions and local repository
 evidence.
 
 ## Current Phase
@@ -16,6 +16,9 @@ extraction from `flowers-3d-helmholtz` is complete at commit `09dbe41`. The
 original extracted baseline passed `82` tests plus `22` subtests. The protocol,
 structured-receipt, strict-serialization, bundled-schema, and generic
 cooperative-yield foundations are now implemented and independently versioned.
+Typed immutable Project/v1 and ExperimentCard/v1 models, offline project-owned
+extension validation, mutable Submission separation, and immutable admission
+snapshot compilation are also implemented as storage-neutral library APIs.
 
 The executable implementation is intentionally still schema-v4,
 single-project compatibility code. It accepts an explicit operator-selected
@@ -26,9 +29,10 @@ bounded human-log parser remains only for legacy jobs. The typed yield protocol
 is not yet wired into scheduler admission/failure isolation. The executable is
 not ready to replace the operational Flowers queue.
 
-The current objective is to implement typed Project/ExperimentCard models and
-admission snapshots, then add first-class projects and an explicit database-v5
-migration without changing or operating live Flowers state.
+The current objective is to accept the Project/Enrollment/ProjectRevision
+lifecycle contract, add first-class projects and explicit database-v5 storage,
+and bind the pure admission compiler to exact blobs read from a pinned Git tree
+before any snapshot can become persistent queue state.
 
 ## Verified Baseline
 
@@ -42,10 +46,12 @@ migration without changing or operating live Flowers state.
   `run-experiment`.
 - State selection: absolute `--state-dir` takes precedence over
   `EXPERIMENT_QUEUE_STATE_DIR`; missing/relative state fails safely.
-- Current generic suite: `277` tests and `26` subtests pass in the standalone
+- Current generic suite: `409` tests and `26` subtests pass in the standalone
   `.venv`.
-- The current wheel builds successfully and its isolated import authenticates
-  both bundled schema resources, pinned canonical digests, and editor exports.
+- The current wheel builds successfully; its isolated import includes the typed
+  authoring/admission modules, authenticates compiler provenance against wheel
+  metadata, and authenticates both bundled schema resources, pinned canonical
+  digests, and editor exports.
 
 ## Accepted Product Decisions
 
@@ -67,6 +73,10 @@ migration without changing or operating live Flowers state.
 - The service stays dependency-light and never imports scientific project code.
 - Database, Project, ExperimentCard, runner manifest/receipt, export, and yield
   protocols have independent version lineages.
+- ADR 0008 fixes validated-only immutable authoring models, one project-owned
+  extension namespace/schema, mutable Submission separation, whole-value
+  bindings without interpolation, and frozen admission evidence. Compiler
+  provenance comes only from installed package metadata.
 
 ## Ownership And Operational Boundary
 
@@ -106,6 +116,9 @@ migration without changing or operating live Flowers state.
   another project's files without strict resolved-path authorization.
 - Mutable project configuration could change admitted execution unless every
   job pins an immutable revision and normalized specification.
+- The storage-neutral admission compiler cannot prove its input bytes came from
+  the claimed commit; the trusted ProjectRevision/Git resolver must satisfy that
+  contract before database-v5 persistence accepts a snapshot.
 - Flowers-specific W&B and checkpoint assumptions could leak into the generic
   core unless continuation context becomes opaque and versioned.
 - A broken highest-priority project could head-of-line block healthy work unless
@@ -113,10 +126,10 @@ migration without changing or operating live Flowers state.
 
 ## Next Authorized Actions
 
-1. Implement typed Project and ExperimentCard models, namespaced extension
-   validation, immutable Submission separation, and admission snapshots.
-2. Accept the Project/Enrollment/ProjectRevision lifecycle ADR, then implement
-   schema-v5 project-aware storage.
+1. Accept the Project/Enrollment/ProjectRevision lifecycle ADR, then implement
+   its typed lifecycle models and schema-v5 project-aware storage.
+2. Implement the trusted pinned-Git source resolver and require its evidence at
+   the database admission boundary.
 3. Wire typed cooperative-yield continuation validation into scheduler
    admission and project-scoped holds without blocking unrelated work.
 4. Implement the explicit offline v1-v4 importer and exhaustive fixtures, then
