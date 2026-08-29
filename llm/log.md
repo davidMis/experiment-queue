@@ -283,3 +283,47 @@ Open:
   source idle and writer-free, stop and disable legacy automatic restarts,
   create the consistent backup/copy, review exact migration receipts, and
   explicitly authorize cutover.
+
+## 2026-08-29 - Repair Linux CI Portability
+
+Goal: diagnose and correct the first pushed Linux CI failure without weakening
+the production executor or migration-readiness invariants.
+
+Decisions:
+
+- Retain the executor's fail-closed requirement that its process group equal
+  its PID. Production creates that boundary with `start_new_session=True`.
+- Treat a bounded, syntactically valid deep JSON array as the same safe
+  rejection whether a Python patch release reports a decoder error or parses
+  it before the protocol's required-object check.
+
+Result:
+
+- Inspected GitHub Actions run `33255737427`, which ran Ubuntu 24.04 with
+  Python 3.14.7 and failed `12` of `1005` tests.
+- Updated direct in-process executor unit tests to model the scheduler's real
+  private process-group launch without changing the runner's actual group, and
+  added an explicit regression proving a mismatched group is still refused.
+- Made the two deep-JSON tests accept either decoder rejection or the exact
+  protocol-level non-object rejection across Python 3.14 patch releases.
+- No production source, schema, protocol, workflow, or migration behavior
+  changed.
+
+Verification:
+
+- Shared-process-group reproduction: `97 passed, 1 skipped, 32 subtests passed`
+  in `11.72 s`.
+- Full Python 3.14.4 suite: `1005 passed, 1 skipped, 32 subtests passed` in
+  `205.28 s`; exit code `0`.
+- Fresh `experiment_queue-0.2.0-py3-none-any.whl` verification authenticated
+  all runtime modules, six entry-point help surfaces, metadata/license identity,
+  and bundled schemas; SHA-256
+  `a1b84a981e152934943ac99b6b3fa4c263404b35833b352471e6b53b964e2264`.
+- Full compilation and `git diff --check` pass.
+
+Open:
+
+- Commit and push this test/documentation correction and require a clean Linux
+  CI rerun before creating the release tag.
+- The operator-controlled inventory, writer-free copy, receipt review, and
+  explicit production cutover authorization remain unchanged.

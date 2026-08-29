@@ -405,7 +405,10 @@ class ExperimentQueueTests(unittest.TestCase):
             self.repo.store.item(item_id)
         )
         self.assertEqual(receipt, {})
-        self.assertIn("invalid JSON", str(error))
+        self.assertRegex(
+            str(error),
+            r"invalid JSON|must contain a JSON object",
+        )
         self.assertTrue(structured_present)
 
         receipt_path.write_text(

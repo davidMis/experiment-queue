@@ -612,7 +612,10 @@ class ExperimentRunnerTests(unittest.TestCase):
             with mock.patch.dict(
                 os.environ,
                 {"EXPERIMENT_QUEUE_CONTINUATION_RUN_DIR": str(duplicate_dir)},
-            ), self.assertRaisesRegex(ExperimentError, "could not read continuation"):
+            ), self.assertRaisesRegex(
+                ExperimentError,
+                r"could not read continuation|must contain a JSON object",
+            ):
                 _load_continuation_manifest(
                     request,
                     cwd=root,

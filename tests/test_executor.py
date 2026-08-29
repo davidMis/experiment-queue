@@ -27,6 +27,22 @@ from experiment_queue.executor import (
 from experiment_queue.serialization import canonical_json_bytes
 
 
+@pytest.fixture(autouse=True)
+def _model_scheduler_started_executor_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Model ``start_new_session=True`` for in-process executor unit tests.
+
+    Production and subprocess integration paths exercise the real process-group
+    boundary. Direct calls run inside pytest, whose Linux CI parent may place it
+    in a shared runner group, so they supply the scheduler-guaranteed identity
+    without changing or signaling the runner's actual group.
+    """
+
+    executor_pid = os.getpid()
+    monkeypatch.setattr(executor_module.os, "getpgrp", lambda: executor_pid)
+
+
 def _payload(tmp_path: Path, **changes: object) -> tuple[Path, dict[str, object]]:
     worktree = tmp_path / "worktree"
     control = tmp_path / "state" / "attempts" / "1" / "segment-1"
@@ -124,6 +140,27 @@ def test_launch_failure_is_a_durable_terminal_receipt(tmp_path: Path) -> None:
     receipt = json.loads(Path(document["receipt_path"]).read_text())
     assert receipt["return_code"] == 127
     assert receipt["signals_received"][0].startswith("launch_error:")
+
+
+def test_executor_refuses_a_nonleader_process_group(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The real executor boundary still fails closed without a private group."""
+
+    path, document = _payload(tmp_path)
+    executor_pid = os.getpid()
+    monkeypatch.setattr(
+        executor_module.os,
+        "getpgrp",
+        lambda: executor_pid + 1,
+    )
+
+    with pytest.raises(ExecutorError, match="process group.*differs from its PID"):
+        execute_payload(path)
+
+    assert not path.with_name("launch.json").exists()
+    assert not Path(document["receipt_path"]).exists()
 
 
 def test_scientific_command_never_starts_before_launch_receipt_publication(

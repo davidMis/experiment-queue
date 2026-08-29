@@ -6,7 +6,7 @@ architecture belongs in `docs/`, accepted decisions in `docs/adr/`,
 forward-looking work in `llm/todo.md`, and chronological evidence in
 `llm/log.md`.
 
-Last updated: 2026-08-28 by Codex from David's decisions and local repository
+Last updated: 2026-08-29 by Codex from David's decisions and local repository
 evidence.
 
 ## Current Phase
@@ -21,10 +21,12 @@ implemented locally. Schema v5 is the primary standalone entrypoint;
 schema-v4 and `LegacyMarkdownCard/v0` are explicitly bounded compatibility
 surfaces.
 
-No production migration has occurred. Local release-candidate verification is
-complete. Publication and Linux CI plus the remaining operator-supplied
-offline cutover evidence are still required. The cutover procedure is copy-only
-and receipt-driven; startup never upgrades a database in place.
+No production migration has occurred. The readiness candidate is committed and
+pushed, but its first Linux CI run exposed test-harness portability assumptions.
+The corrective test-only patch is locally verified and remains uncommitted;
+a clean rerun plus the remaining operator-supplied offline cutover evidence are
+still required. The cutover procedure is copy-only and receipt-driven; startup
+never upgrades a database in place.
 
 ## Verified Local Evidence
 
@@ -43,11 +45,13 @@ and receipt-driven; startup never upgrades a database in place.
 - Focused runner/executor/attempt/scheduler-service verification after
   process-group signal hardening: `120 passed, 1 skipped, 12 subtests passed`.
 - Focused legacy-v0 continuation verification: `7 passed`.
-- Final full Python 3.14.4 suite: `1004 passed, 1 skipped, 32 subtests passed`
-  in `183.93 s`; exit code `0`, with no warnings or failures.
+- Final full Python 3.14.4 suite after the Linux CI portability correction:
+  `1005 passed, 1 skipped, 32 subtests passed` in `205.28 s`; exit code `0`.
+- Explicit shared-process-group reproduction of the GitHub runner layout:
+  `97 passed, 1 skipped, 32 subtests passed` in `11.72 s`.
 - Final wheel:
   `experiment_queue-0.2.0-py3-none-any.whl`, SHA-256
-  `0b25ad880f25fea57ebf48d23a7c969dc072deb9f3c39249b590aad061b07683`;
+  `a1b84a981e152934943ac99b6b3fa4c263404b35833b352471e6b53b964e2264`;
   isolated verification authenticated all runtime modules, all six entry-point
   help surfaces, metadata/license identity, and bundled schema resources.
 - Final audit: independent code review found no remaining actionable issue;
@@ -55,13 +59,14 @@ and receipt-driven; startup never upgrades a database in place.
   Markdown targets and `5` local fragment anchors resolve (`9` external URLs
   were inventory-counted but not availability-checked); all `197` argparse
   options have actionable help; Python compilation and `git diff --check` pass.
-- `origin` is configured as
-  `https://github.com/davidMis/experiment-queue.git`; local `main` and
-  `origin/main` both resolve to
-  `353cbfeb2e264fcc83a87d9b8f8034d20a84fc30` before the uncommitted readiness
-  work.
-- The Linux CI workflow exists locally but is untracked and therefore has not
-  run remotely.
+- `origin` is `https://github.com/davidMis/experiment-queue.git`; local `main`
+  and `origin/main` both resolve to pushed readiness commit
+  `ad6e2d5c1edb757f2e8d5ef83818868b1c85e095`.
+- GitHub Actions run `33255737427` used Ubuntu 24.04 and Python 3.14.7. It
+  failed `12` tests: `10` direct
+  executor tests did not model the production `start_new_session=True`
+  process-group boundary, and `2` deep-JSON assertions overfit Python 3.14.4
+  parser behavior. No production source change was required.
 
 ## Accepted Product And Safety Decisions
 
@@ -120,8 +125,8 @@ and receipt-driven; startup never upgrades a database in place.
 
 ## Open Publication And Operator Gates
 
-- Commit and push the readiness work; publish the local Linux CI workflow and
-  obtain a clean remote run; then create the approved release commit/tag.
+- Commit and push the locally verified CI portability correction, obtain a
+  clean remote Linux run, then create the approved release commit/tag.
 - Obtain an operator-supplied offline Flowers database/card/external-path
   inventory. Do not infer live classification from this repository.
 - At cutover, prove the legacy queue is idle, stop and disable every legacy
@@ -133,9 +138,10 @@ and receipt-driven; startup never upgrades a database in place.
 
 ## Active Risks
 
-- The readiness implementation and CI workflow are uncommitted/unpublished;
-  local evidence is not a substitute for remote Linux CI or a published,
-  immutable release artifact.
+- The readiness candidate is published, but its first Linux CI run failed and
+  the locally verified correction is uncommitted. Local evidence is not a
+  substitute for a clean remote rerun or a published, immutable release
+  artifact.
 - Scheduler-owned GPU flocks are not continuous across a scheduler crash while
   a durable executor survives. Restart reconciliation fails closed if it cannot
   reacquire the lock, but cross-version exclusion still relies on stopping and
@@ -152,8 +158,8 @@ and receipt-driven; startup never upgrades a database in place.
 
 ## Next Authorized Actions
 
-1. Commit/push the candidate, publish/pass Linux CI, and create the approved
-   release commit/tag.
+1. Commit/push the CI portability correction, obtain a clean Linux CI rerun,
+   and create the approved release commit/tag.
 2. Collect the operator-supplied offline inventory and writer-free source copy,
    then execute the exact dry-run/build/verify checklist in
    `docs/migrations/flowers-v4.md`.
