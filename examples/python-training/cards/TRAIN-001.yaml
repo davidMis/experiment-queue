@@ -1,0 +1,27 @@
+# Training-shaped example; project code owns the scientific implementation.
+apiVersion: experiment-queue/v1
+kind: ExperimentCard
+metadata:
+  projectKey: python-training-example
+  experimentId: TRAIN-001
+  title: "Train a tiny model"
+spec:
+  parameters:
+    epochs: 3
+  jobs:
+    - id: train
+      role: independent
+      environment: training
+      command:
+        type: argv
+        argv: [python, train.py]
+      resources:
+        gpus: 1
+        cpus: 2
+        memoryBytes: 1073741824
+      artifacts:
+        - name: model
+          root: artifacts
+          path: runs/TRAIN-001/model.json
+          type: file
+          required: true

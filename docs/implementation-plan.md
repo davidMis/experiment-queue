@@ -24,6 +24,9 @@ policies on other projects.
    Runtime never reparses a later mutable Project manifest or ExperimentCard.
 4. GPU allowlists, reservations, priority, and the scheduler lease are
    host-global. Repository/configuration/child failures are project-scoped.
+   Historical GPU assignment is never an availability marker: each claim owns
+   a distinct durable runtime lease until cooperative requeue or fresh exact
+   idle telemetry commits its guarded release.
 5. Dispatch remains `priority DESC, resume_front DESC, id ASC`.
 6. Priority changes never trigger preemption. Preemption is a separate explicit
    operator action using a declared, admitted, versioned cooperative protocol.
@@ -66,7 +69,8 @@ Cross-project dependencies remain permitted through globally unique queue item
 IDs. Admission may depend only on already existing items, preserving the current
 acyclic construction rule. A committed ExperimentCard containing several jobs
 does not automatically create a workflow: each job is submitted explicitly,
-and operational dependencies remain Submission data.
+and operational dependencies remain Submission data canonicalized in ascending
+global-item ID order.
 
 ## Configuration And Secret Boundary
 
@@ -78,9 +82,11 @@ absolute scratch path, sync destination, credential, or secret.
 Host enrollment maps logical declarations to canonical absolute paths and a
 project runtime environment. Queue-reserved variables and
 `CUDA_VISIBLE_DEVICES` cannot be overridden. Cards may refer only to declared
-environment names; literal secrets are rejected from core fields. The precise
-inheritance/secret-reference mechanism must be fixed by ADR before the service
-claims a secure multi-project environment policy.
+environment names; literal secrets are rejected from core fields.
+EnvironmentBinding/v1 may only narrow the portable ambient-name allowlist and
+stores no values or credentials. Version 1 inherits only operator-provided
+ambient values named by both policies; a future stored secret-reference
+mechanism requires a separate accepted contract.
 
 ## Phase 0: Governance And Extracted-Baseline Parity
 
@@ -129,7 +135,9 @@ Deliverables:
 - narrow legacy stdout-receipt fallback;
 - generic cooperative-yield request/receipt and opaque project resume payload;
 - optional dependency-light project helper and conformance tests;
-- continuation identity based on resolved spec/revision/commit/run evidence.
+- continuation identity based on resolved spec/revision/commit/run evidence;
+- bounded canonical QueueExport/v1 with independently named package, database
+  instance, Project, actor, event-scope, artifact, and continuation provenance.
 
 Verification:
 
@@ -256,6 +264,8 @@ Deliverables:
   project-local generic runner;
 - project-scoped repository/card/mount/disk/child failure quarantine;
 - global GPU/lease/database/central-state failure handling;
+- terminal-before-release crash recovery, strict unique/finite GPU telemetry,
+  and cleanup/reservation exclusion while a runtime GPU lease remains held;
 - candidate selection that skips unhealthy projects without violating global
   priority ordering.
 
@@ -266,6 +276,8 @@ Verification:
   environment override, and cleanup safety;
 - project A failures while project B continues;
 - global pause on telemetry/database/lease/state-disk failure;
+- separate-session busy-GPU, duplicate/missing telemetry, force-kill without a
+  receipt, terminal-commit crash, and later idle-release regressions;
 - restart/recovery and revision pinning across configuration changes;
 - cross-project priority, same-priority continuation, dependencies, and manual
   preemption.
@@ -285,10 +297,11 @@ Entry conditions:
 
 Deliverables:
 
-- project-qualified submission, status, receipt, event, and artifact CLI;
+- project-qualified submission, status, canonical QueueExport/v1 receipt,
+  event, and artifact CLI;
 - unambiguous cwd inference only for one registered checkout;
 - web project overview/health, selector, filters, badges, revision identity,
-  admission, and run detail;
+  admission, run detail, and terminal-but-held runtime GPU lease status;
 - server-side filtering/pagination and live-update filter preservation;
 - project-aware authorization for all direct and mutation endpoints;
 - compatibility admin/reservation roles with minimal information disclosure;
@@ -379,6 +392,12 @@ is authorized merely by passing this phase.
 Objective: replace the deprecated Flowers queue while preserving state,
 history, and an untouched rollback source.
 
+The reproducible command-level procedure, inventory template, receipt review,
+and service-selection rollback are owned by
+[`migrations/flowers-v4.md`](migrations/flowers-v4.md). This phase retains the
+durable gates rather than tracking whether a particular cutover session has
+satisfied them.
+
 Hard entry gate:
 
 - David explicitly confirms the SPECFEM dataset is generated and its
@@ -424,6 +443,9 @@ Entry conditions:
   unresolved state/protocol regression;
 - at least one supported release has warned about legacy admission.
 
+The compatibility guarantees and exact removal threshold are defined in
+[`release-policy.md`](release-policy.md#legacy-removal-threshold).
+
 Deliverables:
 
 - redirect remaining Flowers wrappers/docs to the installed package;
@@ -450,6 +472,9 @@ queue-product TODO, and the standalone release owns all supported operation.
   checks, immutable rollback state, and no startup migration.
 - **Two schedulers sharing resources:** explicit drain/stop gate, instance
   lease, single-writer checks, and operator receipt.
+- **Detached GPU work after terminal state:** durable per-item runtime lease,
+  host lock, strict current-idle telemetry barrier, restart reconciliation, and
+  cleanup/reservation exclusion until release.
 - **Cross-project path disclosure or deletion:** canonical allowed roots,
   traversal/symlink tests, server-side authorization, and no artifact deletion
   in lifecycle operations.

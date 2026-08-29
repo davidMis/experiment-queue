@@ -668,6 +668,137 @@ class ExperimentQueueTests(unittest.TestCase):
             self.assertIn("worktree_path", columns)
             self.assertIn("gpu_reservations", tables)
 
+    def test_future_schema_is_rejected_before_database_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            state_dir = root / "state"
+            state_dir.mkdir()
+            database = state_dir / "queue.sqlite3"
+            with sqlite3.connect(database) as connection:
+                connection.executescript(
+                    """
+                    CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                    CREATE TABLE future_only (proof TEXT NOT NULL);
+                    INSERT INTO metadata(key, value) VALUES ('schema_version', '5');
+                    INSERT INTO future_only(proof) VALUES ('must survive');
+                    """
+                )
+            before = {
+                path.name: path.read_bytes()
+                for path in state_dir.glob("queue.sqlite3*")
+            }
+
+            with self.assertRaisesRegex(QueueError, "schema.*5.*not supported"):
+                QueueStore(state_dir, root)
+
+            after = {
+                path.name: path.read_bytes()
+                for path in state_dir.glob("queue.sqlite3*")
+            }
+            self.assertEqual(after, before)
+            database_uri = f"{database.as_uri()}?mode=ro&immutable=1"
+            with sqlite3.connect(database_uri, uri=True) as connection:
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT value FROM metadata WHERE key = 'schema_version'"
+                    ).fetchone()[0],
+                    "5",
+                )
+                self.assertEqual(
+                    connection.execute("SELECT proof FROM future_only").fetchone()[0],
+                    "must survive",
+                )
+                self.assertIsNone(
+                    connection.execute(
+                        "SELECT name FROM sqlite_schema WHERE name = 'queue_items'"
+                    ).fetchone()
+                )
+
+    def test_unknown_schema_is_rejected_before_database_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            state_dir = root / "state"
+            state_dir.mkdir()
+            database = state_dir / "queue.sqlite3"
+            with sqlite3.connect(database) as connection:
+                connection.execute(
+                    "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+                )
+                connection.execute(
+                    "INSERT INTO metadata(key, value) VALUES ('schema_version', 'unknown')"
+                )
+            before = {
+                path.name: path.read_bytes()
+                for path in state_dir.glob("queue.sqlite3*")
+            }
+
+            with self.assertRaisesRegex(QueueError, "schema version.*unknown.*supported"):
+                QueueStore(state_dir, root)
+
+            after = {
+                path.name: path.read_bytes()
+                for path in state_dir.glob("queue.sqlite3*")
+            }
+            self.assertEqual(after, before)
+            database_uri = f"{database.as_uri()}?mode=ro&immutable=1"
+            with sqlite3.connect(database_uri, uri=True) as connection:
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT value FROM metadata WHERE key = 'schema_version'"
+                    ).fetchone()[0],
+                    "unknown",
+                )
+                self.assertIsNone(
+                    connection.execute(
+                        "SELECT name FROM sqlite_schema WHERE name = 'queue_items'"
+                    ).fetchone()
+                )
+
+    def test_future_schema_in_wal_is_rejected_without_touching_sidecars(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            state_dir = root / "state"
+            state_dir.mkdir()
+            database = state_dir / "queue.sqlite3"
+            connection = sqlite3.connect(database)
+            try:
+                connection.executescript(
+                    """
+                    CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                    INSERT INTO metadata(key, value) VALUES ('schema_version', '4');
+                    """
+                )
+                connection.execute("PRAGMA journal_mode = WAL")
+                connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                connection.execute("PRAGMA wal_autocheckpoint = 0")
+                connection.execute(
+                    "UPDATE metadata SET value = '5' WHERE key = 'schema_version'"
+                )
+                connection.commit()
+                before = {
+                    path.name: path.read_bytes()
+                    for path in state_dir.glob("queue.sqlite3*")
+                }
+                self.assertIn("queue.sqlite3-wal", before)
+                self.assertIn("queue.sqlite3-shm", before)
+
+                with self.assertRaisesRegex(QueueError, "schema.*5.*not supported"):
+                    QueueStore(state_dir, root)
+
+                after = {
+                    path.name: path.read_bytes()
+                    for path in state_dir.glob("queue.sqlite3*")
+                }
+                self.assertEqual(after, before)
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT value FROM metadata WHERE key = 'schema_version'"
+                    ).fetchone()[0],
+                    "5",
+                )
+            finally:
+                connection.close()
+
     def test_add_does_not_scan_other_cards_or_status(self) -> None:
         item_id = add_experiment(self.repo.store, "TST-001", priority=7)
 

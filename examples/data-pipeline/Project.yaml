@@ -1,0 +1,21 @@
+# Portable manifest for a data-pipeline integration.
+apiVersion: experiment-queue/v1
+kind: Project
+metadata:
+  key: data-pipeline-example
+  displayName: "Data pipeline example"
+spec:
+  cardRoots: [cards]
+  volumes:
+    - name: inputs
+      access: readOnly
+      required: true
+    - name: artifacts
+      access: readWrite
+      required: true
+  environments:
+    - name: tools
+  environmentPolicy:
+    inherit: none
+    allowVariables: []
+  supportedProtocols: []

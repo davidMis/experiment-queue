@@ -34,6 +34,12 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from experiment_queue.config import StateDirectoryError, resolve_state_dir
+from experiment_queue.host_locks import HostGpuLockError, acquire_host_gpu_lock
+from experiment_queue.legacy import (
+    LEGACY_COMMAND_HEADING,
+    LegacyCardError,
+    LegacyMarkdownCard,
+)
 from experiment_queue.protocols import RUNNER_RECEIPT_V1
 from experiment_queue.runner import RUNNER_RECEIPT_ENV, collect_git_context
 
@@ -69,7 +75,7 @@ RUNNING_STATES = {"starting", "running", "yielding", "terminating", "force_killi
 PRIORITY_MUTABLE_STATES = PENDING_STATES | {"starting", "running", "yielding"}
 TERMINAL_STATES = {"succeeded", "failed", "interrupted", "force_killed", "removed"}
 SUCCESS_STATE = "succeeded"
-CARD_COMMAND_HEADING = "## Exact Manual Command On Mutton2"
+CARD_COMMAND_HEADING = LEGACY_COMMAND_HEADING
 YIELD_EXIT_CODE = 75
 YIELD_PROGRESS_UNIT_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,31}")
 MIN_RESERVATION_HOURS = 1
@@ -338,8 +344,104 @@ class QueueStore:
         connection.execute("PRAGMA busy_timeout = 30000")
         return connection
 
+    def _existing_schema_version(self) -> int | None:
+        """Read and validate an existing schema without modifying its files.
+
+        SQLite pragmas such as ``journal_mode = WAL`` and even idempotent DDL
+        can change database bytes or create sidecars.  A newer executable may
+        deliberately own an existing state directory. Inspect its protocol
+        version through an immutable connection, or through a temporary copy
+        when a journal must be replayed, before opening the original database
+        for normal initialization.
+        """
+
+        if not self.database_path.exists():
+            return None
+
+        def read_version(database: Path, *, immutable: bool) -> Any:
+            if immutable:
+                target: str | Path = f"{database.as_uri()}?mode=ro&immutable=1"
+                connection = sqlite3.connect(target, uri=True)
+            else:
+                connection = sqlite3.connect(database)
+            try:
+                row = connection.execute(
+                    "SELECT value FROM metadata WHERE key = 'schema_version'"
+                ).fetchone()
+            finally:
+                connection.close()
+            return None if row is None else row[0]
+
+        try:
+            sidecars = tuple(
+                path
+                for suffix in ("-wal", "-shm", "-journal")
+                if (path := Path(f"{self.database_path}{suffix}")).exists()
+            )
+            if sidecars:
+                with tempfile.TemporaryDirectory(
+                    prefix="experiment-queue-schema-inspection-"
+                ) as temporary:
+                    snapshot = Path(temporary) / self.database_path.name
+                    shutil.copyfile(self.database_path, snapshot)
+                    for source in sidecars:
+                        if source.name.endswith("-shm"):
+                            continue
+                        suffix = source.name.removeprefix(self.database_path.name)
+                        shutil.copyfile(source, Path(f"{snapshot}{suffix}"))
+                    raw_version = read_version(snapshot, immutable=False)
+            else:
+                raw_version = read_version(self.database_path, immutable=True)
+        except (OSError, sqlite3.Error) as exc:
+            raise QueueError(
+                f"could not inspect existing scheduler database {self.database_path} "
+                f"without modifying it: {exc}. Restore a readable queue backup or "
+                "move the incompatible database aside before initializing a new queue."
+            ) from exc
+        if raw_version is None:
+            raise QueueError(
+                f"existing scheduler database {self.database_path} is missing "
+                "metadata.schema_version. Restore or explicitly migrate that database; "
+                "initialization did not modify it."
+            )
+        try:
+            version = int(raw_version)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise QueueError(
+                f"queue schema version {raw_version!r} in {self.database_path} is not "
+                f"a supported integer; expected 1, 2, 3, or {SCHEMA_VERSION}. Use an "
+                "experiment-queue executable that supports this database or restore a "
+                "compatible backup; initialization did not modify it."
+            ) from exc
+        if version not in {1, 2, 3, SCHEMA_VERSION}:
+            raise QueueError(
+                f"queue schema {raw_version!r} in {self.database_path} is not supported "
+                f"by this executable; expected 1, 2, 3, or {SCHEMA_VERSION}. Use an "
+                "experiment-queue executable that supports this schema or restore a "
+                "compatible backup; initialization did not modify it."
+            )
+        return version
+
     def _initialize(self) -> None:
+        existing_version = self._existing_schema_version()
         with self.connect() as connection:
+            if existing_version is not None:
+                current_version = connection.execute(
+                    "SELECT value FROM metadata WHERE key = 'schema_version'"
+                ).fetchone()
+                try:
+                    current_schema = (
+                        None
+                        if current_version is None
+                        else int(current_version["value"])
+                    )
+                except (TypeError, ValueError, OverflowError):
+                    current_schema = None
+                if current_schema != existing_version:
+                    raise QueueError(
+                        f"queue schema changed while opening {self.database_path}; stop "
+                        "other queue processes and retry. No schema changes were attempted."
+                    )
             connection.execute("PRAGMA journal_mode = WAL")
             connection.executescript(
                 """
@@ -457,9 +559,6 @@ class QueueStore:
                     ON gpu_reservations(status, expires_at);
                 """
             )
-            existing_version = connection.execute(
-                "SELECT value FROM metadata WHERE key = 'schema_version'"
-            ).fetchone()
             if existing_version is None:
                 self._set_meta(connection, "schema_version", str(SCHEMA_VERSION))
                 self._set_meta(connection, "repo_root", str(self.repo_root))
@@ -468,12 +567,7 @@ class QueueStore:
                 self._set_meta(connection, "consecutive_failures", "0")
                 self._event(connection, "QUEUE_INITIALIZED", payload={"repo_root": str(self.repo_root)})
             else:
-                version = int(existing_version["value"])
-                if version not in {1, 2, 3, SCHEMA_VERSION}:
-                    raise QueueError(
-                        f"queue schema {existing_version['value']} is not supported; "
-                        f"expected 1, 2, 3, or {SCHEMA_VERSION}"
-                    )
+                version = existing_version
                 recorded_root = self.get_meta("repo_root", connection=connection)
                 if Path(recorded_root).resolve() != self.repo_root:
                     raise QueueError(
@@ -1313,48 +1407,20 @@ def read_card_command(repo_root: Path, experiment_id: str, card_path: Path | Non
         )
 
     raw = absolute.read_bytes()
-    text = raw.decode("utf-8")
-    first_heading = text.splitlines()[0] if text.splitlines() else ""
-    if not first_heading.startswith(f"# {normalized_id}:"):
-        raise QueueError(
-            f"experiment card heading must start with '# {normalized_id}:': {absolute}"
+    try:
+        legacy = LegacyMarkdownCard.from_source(
+            raw,
+            experiment_id=normalized_id,
+            source_name=str(absolute),
         )
-    heading_offset = text.find(CARD_COMMAND_HEADING)
-    if heading_offset < 0:
-        raise QueueError(
-            f"experiment card lacks the required {CARD_COMMAND_HEADING!r} section: {absolute}"
-        )
-    section_start = heading_offset + len(CARD_COMMAND_HEADING)
-    next_heading = text.find("\n## ", section_start)
-    section = text[section_start:] if next_heading < 0 else text[section_start:next_heading]
-    blocks = re.findall(r"^```(?:bash|sh)\s*\n(.*?)^```\s*$", section, flags=re.MULTILINE | re.DOTALL)
-    if len(blocks) != 1:
-        raise QueueError(
-            f"expected exactly one bash command block under {CARD_COMMAND_HEADING!r} in {absolute}; "
-            f"found {len(blocks)}"
-        )
-    command_text = blocks[0].strip()
-    if re.search(r"\\\\[ \t]*$", command_text, flags=re.MULTILINE):
-        raise QueueError(
-            "card command contains a doubled trailing backslash; use exactly "
-            "one backslash for each shell line continuation in "
-            f"{absolute}"
-        )
-    required_fragments = ("scripts/run_experiment.py", "--require-clean", "--remote mutton2")
-    missing = [fragment for fragment in required_fragments if fragment not in command_text]
-    if missing:
-        raise QueueError(
-            f"card command is not queue-compatible; missing {', '.join(missing)} in {absolute}"
-        )
-    name_match = re.search(r"--name\s+([A-Za-z0-9_.-]+)", command_text)
-    if name_match is None:
-        raise QueueError(f"card command does not contain a simple --name value: {absolute}")
+    except LegacyCardError as exc:
+        raise QueueError(str(exc)) from exc
     return CardCommand(
-        experiment_id=normalized_id,
+        experiment_id=legacy.experiment_id,
         card_path=absolute,
-        card_sha256=_sha256_bytes(raw),
-        command_text=command_text,
-        runner_name=name_match.group(1),
+        card_sha256=legacy.source_sha256,
+        command_text=legacy.command_text,
+        runner_name=legacy.runner_name,
     )
 
 
@@ -2799,14 +2865,13 @@ class Scheduler:
     def _global_gpu_lock(self, uuid: str) -> Any | None:
         if uuid in self.gpu_locks:
             return self.gpu_locks[uuid]
-        lock_root = Path(tempfile.gettempdir()) / f"helmholtz-experiment-queue-locks-{os.getuid()}"
-        lock_root.mkdir(mode=0o700, parents=True, exist_ok=True)
-        filename = hashlib.sha256(uuid.encode("utf-8")).hexdigest() + ".lock"
-        lock_file = (lock_root / filename).open("a+", encoding="utf-8")
         try:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            lock_file.close()
+            lock_file = acquire_host_gpu_lock(uuid)
+        except HostGpuLockError as exc:
+            raise QueueError(
+                f"cannot authenticate host-wide lock for GPU {uuid!r}: {exc}"
+            ) from exc
+        if lock_file is None:
             return None
         self.gpu_locks[uuid] = lock_file
         return lock_file
@@ -4479,7 +4544,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     internal = subparsers.add_parser(
         "_execute", help="Internal durable attempt executor; do not invoke manually."
     )
-    internal.add_argument("item_id", type=int)
+    internal.add_argument(
+        "item_id",
+        type=int,
+        help="Positive global queue item ID already claimed by this legacy scheduler.",
+    )
     return parser
 
 

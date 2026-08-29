@@ -15,9 +15,20 @@ from experiment_queue.cooperative_yield import (
 def main() -> int:
     """Respond to one queue request using only the optional public helper."""
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint-dir", type=Path, required=True)
-    parser.add_argument("--fail", action="store_true")
+    parser = argparse.ArgumentParser(
+        description="Exercise the cooperative-yield helper in a test project."
+    )
+    parser.add_argument(
+        "--checkpoint-dir",
+        type=Path,
+        required=True,
+        help="Writable directory in which to create fixture-state.json.",
+    )
+    parser.add_argument(
+        "--fail",
+        action="store_true",
+        help="Emit a failed yield receipt instead of creating a checkpoint.",
+    )
     arguments = parser.parse_args()
 
     helper = CooperativeYieldHelper.from_environment()

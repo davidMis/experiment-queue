@@ -32,6 +32,7 @@ class ProtocolKind(StrEnum):
     RUNNER_MANIFEST = "RunnerManifest"
     RUNNER_RECEIPT = "RunnerReceipt"
     QUEUE_EXPORT = "QueueExport"
+    QUEUE_MIGRATION_RECEIPT = "QueueMigrationReceipt"
     COOPERATIVE_YIELD_REQUEST = "CooperativeYieldRequest"
     COOPERATIVE_YIELD_RECEIPT = "CooperativeYieldReceipt"
 
@@ -139,6 +140,10 @@ LEGACY_RUNNER_STDOUT_RECEIPT_V0: Final = ProtocolVersion(
 )
 
 QUEUE_EXPORT_V1: Final = ProtocolVersion(ProtocolKind.QUEUE_EXPORT, 1)
+QUEUE_MIGRATION_RECEIPT_V1: Final = ProtocolVersion(
+    ProtocolKind.QUEUE_MIGRATION_RECEIPT,
+    1,
+)
 
 # The extracted queue export is coupled to the database schema integer.  Name
 # that compatibility representation v0 so new exports can evolve independently.
@@ -185,6 +190,7 @@ DECLARED_PROTOCOL_VERSIONS: Final[tuple[ProtocolVersion, ...]] = (
     RUNNER_RECEIPT_V1,
     LEGACY_DATABASE_COUPLED_QUEUE_EXPORT_V0,
     QUEUE_EXPORT_V1,
+    QUEUE_MIGRATION_RECEIPT_V1,
     LEGACY_COOPERATIVE_YIELD_REQUEST_V0,
     COOPERATIVE_YIELD_REQUEST_V1,
     LEGACY_COOPERATIVE_YIELD_RECEIPT_V0,
@@ -213,6 +219,7 @@ __all__ = [
     "ProtocolKind",
     "ProtocolVersion",
     "QUEUE_EXPORT_V1",
+    "QUEUE_MIGRATION_RECEIPT_V1",
     "RUNNER_MANIFEST_V1",
     "RUNNER_RECEIPT_V1",
 ]

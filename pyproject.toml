@@ -1,14 +1,15 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "experiment-queue"
-version = "0.1.0"
+version = "0.2.0"
 description = "A durable, operator-controlled queue for scientific GPU experiments."
 readme = "README.md"
 requires-python = ">=3.14"
-license = { file = "LICENSE" }
+license = "MIT"
+license-files = ["LICENSE"]
 dependencies = [
   "jsonschema>=4.26.0,<5",
   "referencing>=0.37.0,<0.38",
@@ -20,8 +21,11 @@ dependencies = [
 dev = ["pytest"]
 
 [project.scripts]
-experiment-queue = "experiment_queue.queue:main"
-experiment-queue-web = "experiment_queue.web:main"
+experiment-queue = "experiment_queue.cli_v5:main"
+experiment-queue-web = "experiment_queue.web_v5:main"
+experiment-queue-migrate-v5 = "experiment_queue.migrate_v5:main"
+experiment-queue-legacy-v4 = "experiment_queue.queue:main"
+experiment-queue-web-legacy-v4 = "experiment_queue.web:main"
 run-experiment = "experiment_queue.runner:main"
 
 [tool.setuptools]

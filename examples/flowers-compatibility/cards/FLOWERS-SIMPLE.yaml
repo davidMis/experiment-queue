@@ -1,0 +1,32 @@
+# Representative direct structured job; not a rewrite of historical Markdown.
+apiVersion: experiment-queue/v1
+kind: ExperimentCard
+metadata:
+  projectKey: flowers-3d-helmholtz
+  experimentId: FLOWERS-SIMPLE
+  title: "Flowers simple compatibility job"
+spec:
+  parameters: {}
+  jobs:
+    - id: run
+      role: independent
+      environment: scientific
+      command:
+        type: argv
+        argv: [python, scripts/simple_fixture.py]
+      resources:
+        gpus: 1
+      artifacts:
+        - name: result
+          root: outputs
+          path: compatibility/FLOWERS-SIMPLE/result.json
+          type: file
+          required: true
+      extensions:
+        flowers-3d-helmholtz:
+          tracker: none
+          solver: python
+          elastic: false
+extensions:
+  flowers-3d-helmholtz:
+    family: simple

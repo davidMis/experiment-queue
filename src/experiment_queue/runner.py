@@ -739,6 +739,7 @@ def launch_and_stream(
 
     stdout_log = run_dir / "stdout.log"
     stderr_log = run_dir / "stderr.log"
+    queue_group_at_launch = bool(os.environ.get(RUNNER_RECEIPT_ENV))
     with subprocess.Popen(
         list(command),
         cwd=cwd,
@@ -748,32 +749,34 @@ def launch_and_stream(
         text=True,
         bufsize=1,
     ) as process:
-        assert process.stdout is not None
-        assert process.stderr is not None
-        stdout_thread = threading.Thread(
-            target=_tee_stream,
-            args=(process.stdout, stdout_log, sys.stdout, append),
-            daemon=True,
-        )
-        stderr_thread = threading.Thread(
-            target=_tee_stream,
-            args=(process.stderr, stderr_log, sys.stderr, append),
-            daemon=True,
-        )
-        stdout_thread.start()
-        stderr_thread.start()
+        stdout_thread: threading.Thread | None = None
+        stderr_thread: threading.Thread | None = None
         try:
+            queue_group_at_launch = _child_uses_queue_signal_group(process)
+            assert process.stdout is not None
+            assert process.stderr is not None
+            stdout_thread = threading.Thread(
+                target=_tee_stream,
+                args=(process.stdout, stdout_log, sys.stdout, append),
+                daemon=True,
+            )
+            stderr_thread = threading.Thread(
+                target=_tee_stream,
+                args=(process.stderr, stderr_log, sys.stderr, append),
+                daemon=True,
+            )
+            stdout_thread.start()
+            stderr_thread.start()
             return_code = process.wait()
         except KeyboardInterrupt:
-            process.terminate()
-            try:
-                process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait()
-            return_code = 130
-        stdout_thread.join()
-        stderr_thread.join()
+            return_code = _wait_for_interrupted_child(
+                process,
+                queue_group_at_launch=queue_group_at_launch,
+            )
+        if stdout_thread is not None:
+            stdout_thread.join()
+        if stderr_thread is not None:
+            stderr_thread.join()
         return return_code
 
 
@@ -804,6 +807,7 @@ def _launch_and_stream_pty(
     master_fd, slave_fd = pty.openpty()
     _configure_pty_window_size(slave_fd)
     process = None
+    queue_group_at_launch = bool(os.environ.get(RUNNER_RECEIPT_ENV))
     try:
         process = subprocess.Popen(
             list(command),
@@ -814,6 +818,7 @@ def _launch_and_stream_pty(
             stderr=slave_fd,
             close_fds=True,
         )
+        queue_group_at_launch = _child_uses_queue_signal_group(process)
         os.close(slave_fd)
         slave_fd = -1
         decoder = codecs.getincrementaldecoder("utf-8")("replace")
@@ -855,17 +860,64 @@ def _launch_and_stream_pty(
         return return_code
     except KeyboardInterrupt:
         if process is not None:
-            process.terminate()
-            try:
-                process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait()
+            return _wait_for_interrupted_child(
+                process,
+                queue_group_at_launch=queue_group_at_launch,
+            )
         return 130
     finally:
         if slave_fd != -1:
             os.close(slave_fd)
         os.close(master_fd)
+
+
+def _child_uses_queue_signal_group(process: subprocess.Popen[Any]) -> bool:
+    """Record whether this child participates in queue group signaling."""
+
+    if not os.environ.get(RUNNER_RECEIPT_ENV):
+        return False
+    try:
+        return os.getpgid(process.pid) == os.getpgrp()
+    except (OSError, ProcessLookupError):
+        return False
+
+
+def _wait_for_interrupted_child(
+    process: subprocess.Popen[Any],
+    *,
+    queue_group_at_launch: bool,
+) -> int:
+    """Reap an interrupted child without duplicating queue group signals.
+
+    A queue executor gracefully signals its complete attempt process group, so
+    both this runner and its child receive the same SIGINT or SIGTERM.  The
+    queue-owned runner-receipt path identifies that launch contract, and equal
+    process groups prove that the broadcast already reached the child.  In
+    that case the runner only waits: scheduler-owned SIGTERM/SIGKILL escalation
+    remains authoritative.  A standalone runner signaled only by PID has no
+    such queue contract and retains the historical terminate/kill cleanup.
+    """
+
+    queue_group_delivery = queue_group_at_launch
+    if queue_group_delivery and process.poll() is None:
+        try:
+            queue_group_delivery = os.getpgid(process.pid) == os.getpgrp()
+        except (OSError, ProcessLookupError):
+            # The child may have exited and lost its /proc identity between
+            # poll and getpgid. Its launch-time membership still proves the
+            # executor broadcast reached it before that exit.
+            queue_group_delivery = process.poll() is not None
+    if queue_group_delivery:
+        return process.wait()
+    if process.poll() is not None:
+        return 130
+    process.terminate()
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
+    return 130
 
 
 def _configure_pty_window_size(slave_fd: int) -> None:

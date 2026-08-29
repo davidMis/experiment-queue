@@ -1,0 +1,32 @@
+# One-GPU independently schedulable SPECFEM-shaped worker fixture.
+apiVersion: experiment-queue/v1
+kind: ExperimentCard
+metadata:
+  projectKey: flowers-3d-helmholtz
+  experimentId: FLOWERS-SPECFEM-WORKER
+  title: "Flowers SPECFEM worker compatibility job"
+spec:
+  parameters: {}
+  jobs:
+    - id: worker
+      role: worker
+      environment: scientific
+      command:
+        type: argv
+        argv: [python, scripts/specfem_fixture.py]
+      resources:
+        gpus: 1
+      artifacts:
+        - name: result
+          root: outputs
+          path: compatibility/FLOWERS-SPECFEM-WORKER/result.json
+          type: file
+          required: true
+      extensions:
+        flowers-3d-helmholtz:
+          tracker: none
+          solver: specfem
+          elastic: true
+extensions:
+  flowers-3d-helmholtz:
+    family: specfem

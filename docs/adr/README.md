@@ -16,6 +16,9 @@ and compatibility evidence are indexed separately in the
 | [0006](0006-strict-yaml-schema-and-canonical-json.md) | Accepted, 2026-08-27 | Strict YAML subset, Draft 2020-12 schemas, and canonical JSON |
 | [0007](0007-bounded-schema-processing-and-referencing.md) | Accepted, 2026-08-27 | Bounded schema processing, semantic validation, and direct `referencing` ownership |
 | [0008](0008-typed-authoring-extensions-and-admission-snapshots.md) | Accepted, 2026-08-28 | Typed immutable authoring, project extensions, mutable Submission, and admission evidence |
+| [0009](0009-project-lifecycle-enrollment-and-revision-ownership.md) | Accepted, 2026-08-28 | Registered Project lifecycle, frozen Enrollment, immutable revisions, paths, environments, and dependency scope |
+| [0010](0010-database-v5-and-offline-import-boundary.md) | Accepted, 2026-08-28 | Separate schema-v5 store, exact legacy preservation, copy-only importer, and migration receipt |
+| [0011](0011-durable-runtime-gpu-lease-and-telemetry-release.md) | Accepted, 2026-08-28 | Historical GPU assignment, durable runtime lease, telemetry-gated release, and crash recovery |
 
 New records use the next four-digit number. Their title, status, and supersedes
 relationship must be added here when the record is accepted.

@@ -3,7 +3,9 @@
 Project/v1 and ExperimentCard/v1 are portable authoring documents. They contain
 no host checkout, mount, device, or credential values. The typed library turns
 their exact bytes into immutable models and compiles one explicitly selected
-job into deterministic execution evidence without mutating queue state.
+job into deterministic execution evidence. The production admission service
+first authenticates those bytes against a full Git commit and immutable
+ProjectRevision, then persists the complete snapshot in database v5.
 
 ## Validation pipeline
 
@@ -45,11 +47,20 @@ snapshot = compile_admission(
 )
 ```
 
-This pure function does not inspect a repository. Its caller must be the
-queue's trusted ProjectRevision/Git resolver and must supply the exact bytes
-read from the named full commit; a database or remote API must not pass through
-unverified client claims. The compiler requires the card source path to equal
-the detached Submission card path and binds all supplied evidence immutably.
+This pure function does not inspect a repository. Direct library callers must
+therefore supply trusted source evidence. Production registration and
+submission use `git_resolver`: it accepts only a full 40- or 64-character
+commit, proves the object is a commit, reads named blobs with structured Git
+plumbing, records each blob object ID/mode/size, and verifies the resulting
+ProjectRevision before persistence. A branch, tag, abbreviated object ID,
+working-tree file, symlink, submodule, non-regular mode, replacement object, or
+unverified API claim cannot become admitted evidence.
+
+The compiler requires the card source path to equal the detached Submission
+card path and binds all supplied evidence immutably. The database-v5 repository
+accepts only a resolver-created admission wrapper whose Project, revision,
+commit, and blob evidence match; it recomputes stored hashes on insertion and
+load.
 
 `Project.from_yaml()`, `ExperimentCard.from_yaml()`, and
 `validate_card_for_project()` are available when a caller needs validation
@@ -108,7 +119,14 @@ metadata; an admission caller cannot supply its own provenance label.
 Bindings and preemption authorization affect the resolved execution digest.
 Priority, hold reason, dependencies, and operator remain mutable scheduling or
 audit policy, so they are copied into `SubmissionPolicy` but excluded from that
-digest. Runtime and future database-v5 persistence must consume this stored
-evidence rather than reopening later authoring files. Database v5 must add the
-trusted Git-tree lookup that satisfies the compiler's source-resolver contract
-before treating a snapshot as admitted state.
+digest. Dependency IDs are a semantic set canonicalized once in ascending
+global-item order for snapshot, database edges, events, and export. Database v5
+decomposes and stores this evidence without
+reinterpretation. Runtime consumes the stored snapshot and pinned worktree; it
+does not reopen a later Project manifest, ExperimentCard, extension schema, or
+mutable Enrollment file.
+
+The CLI exposes these boundaries without queue mutation through `project
+validate`, `project explain`, `card validate`, `card explain`, `schema export`,
+and `submit --dry-run`. See the runnable examples and exact host-registration
+workflow in [`project-onboarding.md`](project-onboarding.md).

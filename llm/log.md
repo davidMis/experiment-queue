@@ -183,3 +183,103 @@ Open:
 - The Project lifecycle ADR/models, trusted Git resolver, schema-v5 storage,
   typed-yield scheduler integration, offline importer, and two-project
   isolation remain next.
+
+## 2026-08-28 - Assemble Schema-v5 Migration-readiness Candidate
+
+Goal: complete and adversarially harden the standalone schema-v5 queue through
+the point where only release verification/publication and operator-controlled
+offline Flowers cutover gates remain.
+
+Decisions:
+
+- David confirmed SPECFEM generation and synchronized evidence closeout are
+  complete. He waived a separate production-state dress rehearsal for this
+  single-operator queue, but did not waive the writer-free copy, offline
+  inventory, exact receipt, release, or explicit cutover-authorization gates.
+- Schema v5 is the primary standalone interface. Schema-v4 databases and
+  `LegacyMarkdownCard/v0` remain bounded import/execution compatibility
+  protocols rather than the target authoring API.
+- Durable control senders use an explicit at-least-once crash-recovery
+  contract. Each executor coalesces the scientific process-group broadcast to
+  at most one `SIGINT` and one `SIGTERM` per segment; manual yield and initial
+  termination therefore coalesce when both request `SIGINT`.
+- Ambiguous launches, exits, process identity, cleanup, and GPU telemetry fail
+  closed with assignments retained, host dispatch paused, and the Project
+  quarantined until authenticated recovery or the guarded operator command.
+- Production exclusion still requires the legacy writers and automatic
+  restarts disabled plus exactly one v5 service. Scheduler-owned flocks cannot
+  provide continuous cross-version exclusion across a scheduler crash.
+
+Result:
+
+- Implemented schema-v5 Project/Enrollment/Revision lifecycle, canonical Git
+  admission, database instance identity, project-aware queue/events, typed
+  reservations, manual preemption, termination/force-kill, logical mounts,
+  artifact roots, CLI/web operations, and offline v1-v4 migration with strict
+  receipts.
+- Added destination-owned legacy runtime reconstruction at the pinned old
+  commit without mutating historical resources. Cleanup refuses ignored,
+  untracked, shared-compatibility, or otherwise uncertain content.
+- Hardened durable execution: isolated executor bootstrap, authenticated launch
+  sidecars, immutable no-clobber launch/exit evidence, staging-residue recovery
+  confirmation, full-group graceful signaling, descendant drain, crash-safe
+  manual-yield replay, guarded abandoned-attempt reconciliation, and
+  telemetry-gated GPU lease release.
+- Made `serve --once` recovery-only, made termination refuse the pre-launch
+  `starting` state, secured web authentication file loading, made auth rotation
+  explicitly stop/setup/restart, and added actionable IPv4/IPv6 bind handling.
+- Prevented `run-experiment` from adding `SIGTERM` after an executor process-
+  group `SIGINT`, or duplicating a group `SIGTERM`, in both PTY and pipe modes;
+  queue-group cleanup preserves the child's actual outcome (including
+  cooperative exit `75`), while standalone PID-only cleanup retains its child
+  escalation and interruption result.
+- Added two-project CLI/web/preemption/restart integration, compatibility and
+  migration fixtures, typed onboarding examples, durable architecture and
+  operator guidance, exact Flowers cutover/rollback procedure, changelog, and
+  release/deprecation/support policy.
+- Closed the final adversarial findings around factory-authenticated execution
+  plans, exact Git blob authentication/materialization, partial-clone and
+  checkout-filter rejection, process-group launch uncertainty, private
+  worktree/attempt-directory boundaries, and byte-preserving POSIX worktree
+  registry parsing.
+- Confirmed `origin` is
+  `https://github.com/davidMis/experiment-queue.git`; local `main` and
+  `origin/main` both name
+  `353cbfeb2e264fcc83a87d9b8f8034d20a84fc30` before this uncommitted change
+  set. The Linux CI workflow exists locally but remains untracked/unpublished.
+- No Flowers source/state/card inventory was inspected or changed, and no
+  connection to `mutton2` was attempted. Live classification remains dependent
+  on David's operator-supplied offline inventory.
+
+Verification:
+
+- Focused executor suite: `29 passed, 1 skipped`.
+- Focused scheduler-service suite: `59 passed` within the final combined
+  process-control run.
+- Focused CLI/web suite: `35 passed`.
+- Focused controller/runtime suite: `39 passed`.
+- Combined focused controller/runtime/executor/CLI/web suite:
+  `103 passed, 1 skipped`.
+- Focused runner/executor/attempt/scheduler-service suite after process-group
+  signal hardening: `120 passed, 1 skipped, 12 subtests passed`.
+- Focused legacy-v0 continuation suite: `7 passed`.
+- Final full Python 3.14.4 suite: `1004 passed, 1 skipped, 32 subtests passed`
+  in `183.93 s`; exit code `0`, with no warnings or failures.
+- Final wheel: `experiment_queue-0.2.0-py3-none-any.whl`, SHA-256
+  `0b25ad880f25fea57ebf48d23a7c969dc072deb9f3c39249b590aad061b07683`;
+  isolated verification authenticated all runtime modules, six entry-point
+  help surfaces, metadata/license identity, and bundled schema resources.
+- Final audit: the independent code review and migration-procedure re-audit
+  reported no remaining actionable findings; all `85` local Markdown targets
+  and `5` local fragment anchors resolve (`9` external URLs were
+  inventory-counted but not availability-checked); all `197` argparse options
+  have actionable help; compilation and `git diff --check` pass.
+
+Open:
+
+- Commit/push the readiness change set, publish and pass Linux CI, and create
+  the approved release commit/tag.
+- David must supply the offline Flowers card/path/service inventory, prove the
+  source idle and writer-free, stop and disable legacy automatic restarts,
+  create the consistent backup/copy, review exact migration receipts, and
+  explicitly authorize cutover.

@@ -1,0 +1,22 @@
+# Portable manifest for typed manual checkpoint-and-requeue.
+apiVersion: experiment-queue/v1
+kind: Project
+metadata:
+  key: cooperative-example
+  displayName: "Cooperative preemption example"
+spec:
+  cardRoots: [cards]
+  volumes:
+    - name: artifacts
+      access: readWrite
+      required: true
+  environments:
+    - name: python
+  environmentPolicy:
+    inherit: none
+    allowVariables: []
+  supportedProtocols:
+    - apiVersion: experiment-queue/v1
+      kind: CooperativeYieldRequest
+    - apiVersion: experiment-queue/v1
+      kind: CooperativeYieldReceipt

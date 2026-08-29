@@ -1,0 +1,21 @@
+# Portable manifest for a small Python-training integration.
+apiVersion: experiment-queue/v1
+kind: Project
+metadata:
+  key: python-training-example
+  displayName: "Python training example"
+spec:
+  cardRoots: [cards]
+  volumes:
+    - name: dataset
+      access: readOnly
+      required: true
+    - name: artifacts
+      access: readWrite
+      required: true
+  environments:
+    - name: training
+  environmentPolicy:
+    inherit: none
+    allowVariables: []
+  supportedProtocols: []

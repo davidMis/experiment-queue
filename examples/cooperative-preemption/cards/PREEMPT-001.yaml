@@ -1,0 +1,38 @@
+# The checkpoint name is part of immutable admission evidence.
+apiVersion: experiment-queue/v1
+kind: ExperimentCard
+metadata:
+  projectKey: cooperative-example
+  experimentId: PREEMPT-001
+  title: "Checkpoint a resumable loop"
+spec:
+  parameters: {}
+  jobs:
+    - id: work
+      role: independent
+      environment: python
+      command:
+        type: argv
+        argv: [python, worker.py]
+      resources:
+        gpus: 1
+      artifacts:
+        - name: checkpoint
+          root: artifacts
+          path: runs/PREEMPT-001/checkpoint.json
+          type: file
+          required: false
+        - name: result
+          root: artifacts
+          path: runs/PREEMPT-001/result.json
+          type: file
+          required: true
+      capabilities:
+        cooperativeYield:
+          requestProtocol:
+            apiVersion: experiment-queue/v1
+            kind: CooperativeYieldRequest
+          receiptProtocol:
+            apiVersion: experiment-queue/v1
+            kind: CooperativeYieldReceipt
+          checkpointArtifacts: [checkpoint]

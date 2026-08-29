@@ -1,64 +1,69 @@
 # Protocol compatibility and version ownership
 
-This matrix is the discoverable ownership and compatibility record for durable
-`experiment-queue` protocols. Implementation progress remains in
-[`llm/status.md`](../llm/status.md); this document records stable protocol
-boundaries, not a task ledger.
+This is the discoverable ownership and compatibility record for durable
+`experiment-queue` protocols. Current implementation state remains in
+[`llm/status.md`](../llm/status.md); release support and removal policy are in
+[`release-policy.md`](release-policy.md).
 
 Protocol identity is the pair `apiVersion: experiment-queue/v<major>` and
-`kind: <ProtocolKind>`. A major belongs only to its kind: `RunnerManifest/v1`
-and `RunnerReceipt/v1` are unrelated versions. New machine-readable documents
-carry both fields. A reader fails closed on an unknown kind or major, except for
-the explicitly named legacy representations below.
+`kind: <ProtocolKind>`. A major belongs only to its kind:
+`RunnerManifest/v1` and `RunnerReceipt/v1` are unrelated versions. New
+machine-readable documents carry both fields. Readers fail closed on an unknown
+kind or major except for the explicitly bounded v0 representations below.
 
-The typed definitions live in
+The typed registry is
 [`experiment_queue.protocols`](../src/experiment_queue/protocols.py). The
 checked-in [identity fixture](../tests/fixtures/protocol-identities.json) and
-[`test_protocols.py`](../tests/test_protocols.py) ensure that every declared
-identity remains unique, immutable, and round-trippable.
+[`test_protocols.py`](../tests/test_protocols.py) keep every declared identity
+unique and round-trippable.
 
 ## Runtime compatibility matrix
 
-"Declared" reserves a stable identity for implementation; it does not claim
-that the current executable accepts or emits that document. "Legacy input"
-means read/migrate only. Compatibility readers must never broaden their
-heuristics implicitly.
+“Legacy input” means read/import only in the primary v5 product. “Declared”
+reserves an identity but does not claim that the primary executable emits it.
+Compatibility readers never broaden their heuristics implicitly.
 
-| Protocol identity | Runtime support | Writer / reader owner | Compatibility rule | Fixture or regression evidence |
-| --- | --- | --- | --- | --- |
-| `Database/v1` | Legacy input | `QueueStore._migrate_v1_to_v2` in [`queue.py`](../src/experiment_queue/queue.py) | Open only through the explicit v1→v4 compatibility chain; never emit | `ExperimentQueueTests.test_v1_database_migrates_in_place_for_reservations_and_segments` in [`test_queue.py`](../tests/test_queue.py) |
-| `Database/v2` | Legacy input | `QueueStore._migrate_v2_to_v3` in [`queue.py`](../src/experiment_queue/queue.py) | Open only through the explicit v2→v4 compatibility chain; never emit | `ExperimentQueueTests.test_v2_migration_pins_an_existing_pending_item` in [`test_queue.py`](../tests/test_queue.py) |
-| `Database/v3` | Legacy input | `QueueStore._migrate_v3_to_v4` in [`queue.py`](../src/experiment_queue/queue.py) | Open only through the explicit v3→v4 compatibility chain; never emit | `ExperimentQueueTests.test_v3_migration_binds_legacy_continuation_metadata_or_holds` in [`test_queue.py`](../tests/test_queue.py) |
-| `Database/v4` | Current read/write | `QueueStore` in [`queue.py`](../src/experiment_queue/queue.py) | Extracted single-project baseline; reject unknown versions | `TemporaryQueueRepository` plus the queue suite in [`test_queue.py`](../tests/test_queue.py) |
-| `Database/v5` | Declared; not yet accepted or emitted | Future offline importer and multi-project store | One-way, offline migration of a copy; v4 code must refuse it | Identity fixture only until the v5 migration fixtures land |
-| `Project/v1` | Current typed library input; database-v5 persistence pending | Strict loader/schema validation plus immutable models in [`authoring.py`](../src/experiment_queue/authoring.py); admission compiler in [`admission.py`](../src/experiment_queue/admission.py) | No compatibility fallback; unknown fields/majors, invalid environment policy, logical references, namespaces, and extension schemas fail closed | Golden parser/schema tests plus Project/card cross-contract, extension, snapshot, and packaged-wheel checks in [`test_authoring.py`](../tests/test_authoring.py), [`test_extensions.py`](../tests/test_extensions.py), [`test_admission.py`](../tests/test_admission.py), and [`verify_wheel.py`](../scripts/verify_wheel.py) |
-| `ExperimentCard/v1` | Current typed library input; database-v5 persistence pending | Strict loader/schema validation plus immutable models in [`authoring.py`](../src/experiment_queue/authoring.py); admission compiler in [`admission.py`](../src/experiment_queue/admission.py) | No implicit Markdown fallback or interpolation; mutable Submission policy stays outside the card; each admission selects one explicit job | Simple/coordinator/worker, logical-reference, placeholder, extension, mutable-policy, digest, and immutability checks in [`test_authoring.py`](../tests/test_authoring.py), [`test_extensions.py`](../tests/test_extensions.py), and [`test_admission.py`](../tests/test_admission.py) |
-| `LegacyMarkdownCard/v0` | Current compatibility input | `read_card_command` in [`queue.py`](../src/experiment_queue/queue.py) | Exact `## Exact Manual Command On Mutton2` parser only; never emit as a new card | `TemporaryQueueRepository.add_card` and `test_card_command_is_read_only_after_explicit_selection` in [`test_queue.py`](../tests/test_queue.py) |
-| `RunnerManifest/v1` | Current read/write | `build_manifest`, `write_manifest`, and continuation validation in [`runner.py`](../src/experiment_queue/runner.py) | Existing untagged `schema_version: 1` manifests remain readable; new manifests carry typed identity | `test_run_experiment_creates_manifest_logs_configs_and_rsync` and `test_yielded_runner_continues_in_same_directory_and_appends_segment` in [`test_runner.py`](../tests/test_runner.py) |
-| `RunnerReceipt/v1` | Current read/write | Runner writer in [`runner.py`](../src/experiment_queue/runner.py); scheduler reader in [`queue.py`](../src/experiment_queue/queue.py) | Atomic per-segment JSON is authoritative for new runs; a present malformed v1 receipt fails closed | `test_runner_publishes_complete_running_and_terminal_receipts`, `test_restarted_scheduler_ingests_initial_structured_runner_receipt`, `test_structured_runner_receipt_never_falls_back_when_present_but_invalid`, and the end-to-end runner test |
-| `RunnerReceipt/v0` | Current legacy fallback | Narrow legacy stdout parser in [`queue.py`](../src/experiment_queue/queue.py) | Read only for imported/legacy jobs when no v1 receipt exists; exact final labeled lines, no guessing | `test_legacy_stdout_runner_receipt_parser_is_exact_and_nonguessing` and `test_incomplete_atomic_temp_receipt_leaves_legacy_fallback_available` in [`test_queue.py`](../tests/test_queue.py) |
-| `QueueExport/v0` | Current compatibility output | `export_receipt` in [`queue.py`](../src/experiment_queue/queue.py) | Historical JSON couples `schema_version` to `Database/v4`; retain only as the named legacy representation | Queue-store fixture and export regression in [`test_queue.py`](../tests/test_queue.py) |
-| `QueueExport/v1` | Declared; not yet emitted | Future export writer/reader in [`queue.py`](../src/experiment_queue/queue.py) | Must carry its own identity; database version belongs in separate metadata | Identity fixture only until the v1 export fixture lands |
-| `CooperativeYieldRequest/v0` | Current legacy write | Reservation/preemption request writers in [`queue.py`](../src/experiment_queue/queue.py) | Extracted schema-v4 `schema_version: 1` shape; never treat it as typed v1 | Preemption/reservation end-to-end fixtures in [`test_queue.py`](../tests/test_queue.py) |
-| `CooperativeYieldRequest/v1` | Library implemented; schema-v5 wiring pending | Typed writer/parser in [`cooperative_yield.py`](../src/experiment_queue/cooperative_yield.py) | Emit only for structured admissions with complete immutable continuation evidence | Request round-trip and helper conformance tests in [`test_cooperative_yield.py`](../tests/test_cooperative_yield.py) |
-| `CooperativeYieldReceipt/v0` | Current legacy read | `Scheduler._validated_yield_receipt` in [`queue.py`](../src/experiment_queue/queue.py); legacy project code writes it | Extracted `schema_version: 1` generic-progress and Flowers W&B-extension shapes remain compatibility-only | `test_yield_receipt_rejects_invalid_generic_progress`, `test_yield_checkpoints_reserves_old_gpu_and_resumes_at_priority_front`, and `test_generic_zero_row_progress_yields_and_resumes` in [`test_queue.py`](../tests/test_queue.py) |
-| `CooperativeYieldReceipt/v1` | Library implemented; schema-v5 wiring pending | Typed writer/parser and validator in [`cooperative_yield.py`](../src/experiment_queue/cooperative_yield.py) | Strict ready/failed shapes with hashed artifacts, typed progress, opaque resume context, and complete continuation binding | Receipt, corruption, progress, and artifact conformance tests in [`test_cooperative_yield.py`](../tests/test_cooperative_yield.py) |
+| Protocol identity | Primary v5 support | Owner | Compatibility and evidence |
+| --- | --- | --- | --- |
+| `Database/v1` | Offline legacy input | Immutable reader/importer in [`legacy_state.py`](../src/experiment_queue/legacy_state.py) and [`migrate_v5.py`](../src/experiment_queue/migrate_v5.py) | Accepted only as an authentic whole-state offline copy; version-owned missing-column defaults are recorded. The deprecated v4 store retains its historical explicit v1→v4 chain. Exhaustive success/refusal coverage is in [`test_migrate_v5.py`](../tests/test_migrate_v5.py). |
+| `Database/v2` | Offline legacy input | Same as v1 | Same copy-only rule; reservations and all historical rows/high-water values are preserved field-for-field. |
+| `Database/v3` | Offline legacy input | Same as v1 | Same copy-only rule; continuation defaults/evidence are verified without fabricating typed identity. |
+| `Database/v4` | Offline legacy input; explicit legacy read/write | V5 importer plus deprecated `QueueStore` in [`queue.py`](../src/experiment_queue/queue.py) | `experiment-queue-legacy-v4` is the only v4 write surface. Primary startup refuses v4; importer reads a quiescent copy only. V4 startup refuses v5 before mutation. |
+| `Database/v5` | Current read/write | [`database_v5.py`](../src/experiment_queue/database_v5.py), typed repositories, and services | Fresh creation occurs only through explicit first Project registration; import is a separate command. V5 refuses v1-v4 and unknown schemas without startup migration. Ownership, no-cascade, trigger, and version-refusal evidence is in [`test_database_v5.py`](../tests/test_database_v5.py). |
+| `Project/v1` | Current input and persisted evidence | Strict loader/schema models plus trusted Git resolver and Project repository | Unknown fields/majors, invalid namespaces, environments, logical roots, and extension schemas fail closed. Registration stores exact Git blob and normalized evidence in an immutable ProjectRevision. Tests span [`test_authoring.py`](../tests/test_authoring.py), [`test_git_resolver.py`](../tests/test_git_resolver.py), [`test_project_lifecycle.py`](../tests/test_project_lifecycle.py), and wheel verification. |
+| `ExperimentCard/v1` | Current input and persisted admission | Strict loader/schema models, [`admission.py`](../src/experiment_queue/admission.py), Git resolver, and v5 repository | No Markdown fallback, implicit sibling-job submission, or interpolation. Every admission selects one job and stores exact pinned source/resolution evidence. |
+| `LegacyMarkdownCard/v0` | Imported compatibility input/runtime | Exact parser in [`legacy.py`](../src/experiment_queue/legacy.py), importer, and v5 compatibility dispatcher | Only the exact `## Exact Manual Command On Mutton2` contract and exact historical worktree transform are accepted. Primary v5 does not create new legacy admissions. Golden parser and importer tests prevent heuristic growth. |
+| `RunnerManifest/v1` | Current read/write | [`runner.py`](../src/experiment_queue/runner.py) | New documents carry typed identity. Existing exact untagged `schema_version: 1` manifests remain readable for continuation compatibility. |
+| `RunnerReceipt/v1` | Current read/write | Runner writer, typed reader, and scheduler service | Atomic per-segment JSON is authoritative; a present malformed receipt fails closed and never falls back to stdout. Success, partial-write, restart, and end-to-end evidence is in [`test_runner.py`](../tests/test_runner.py) and [`test_scheduler_service_v5.py`](../tests/test_scheduler_service_v5.py). |
+| `RunnerReceipt/v0` | Legacy fallback | Narrow human-log parser in the deprecated queue | Read only for exact imported/legacy jobs when a structured receipt is absent. It recognizes only the historical final labeled lines and never guesses. |
+| `QueueExport/v0` | Legacy output only | Deprecated v4 `export_receipt` | Historical JSON couples `schema_version` to Database/v4. It remains named v0 so it cannot be mistaken for a database-independent export. |
+| `QueueExport/v1` | Current read/write | [`queue_export.py`](../src/experiment_queue/queue_export.py) and `receipt --json` | One bounded RFC 8785 document carries package version, Database/v5 instance identity, export actor/time, Project/revision/item/event/artifact evidence, historical GPU assignment plus `runtimeGpuLeaseHeld`/`runtimeGpuLeaseReleasedAt`, and exact deterministic typed cooperative-yield sources. Typed Project/extension Git blob IDs are recomputed from their exact embedded bytes. Event actor/failure scope remain explicit. Because Database/v5 does not retain exact ExecutorReceipt bytes, the envelope truthfully records their absence and never reconstructs them. |
+| `QueueMigrationReceipt/v1` | Current read/write | [`migration_receipt.py`](../src/experiment_queue/migration_receipt.py) and offline importer | One strict receipt identifies a dry run or real copy-only import, source/destination identity, row/sequence comparison, path inventory, checks, and result. A failed receipt never authorizes cutover. See [`test_migration_receipt.py`](../tests/test_migration_receipt.py) and [`test_migrate_v5.py`](../tests/test_migrate_v5.py). |
+| `CooperativeYieldRequest/v0` | Imported legacy compatibility only | Deprecated v4 queue and the bounded adapter in [`legacy_continuation_v0.py`](../src/experiment_queue/legacy_continuation_v0.py) | Historical `schema_version: 1` request shape. V5 may emit the exact frozen bytes only for an imported, already-preemptible LegacyMarkdownCard/v0 item; new/typed admissions never use it. |
+| `CooperativeYieldReceipt/v0` | Imported legacy compatibility only | Bounded v5 adapter plus project-owned historical writer | Historical generic-progress and Flowers extension shapes are accepted only for the matching persisted imported-v0 request. Checkpoint/metadata roots, bytes, hashes, progress, runner identity, PID/PGID, and compare-and-set requeue are revalidated; the receipt is never treated as typed v1. |
+| `CooperativeYieldRequest/v1` | Current read/write | [`cooperative_yield.py`](../src/experiment_queue/cooperative_yield.py) and [`continuation_v5.py`](../src/experiment_queue/continuation_v5.py) | Emitted only for a structured admission with declared capability, explicit operator authorization, and complete spec/revision/Git/run/prior-receipt identity. Request state is persisted before file publication and signaling. |
+| `CooperativeYieldReceipt/v1` | Current read/write | Project helper/writer plus typed continuation validator/repository | Strict ready/failed shapes carry typed progress, opaque resume context, and path-bound hashes for every admitted checkpoint artifact. Ready requeues one next segment. Ambiguous evidence retains the yielding runtime lease; rejection after authenticated executor exit records terminal failure with the lease still held, and either case isolates only its Project. Conformance and scheduler coverage is in [`test_cooperative_yield.py`](../tests/test_cooperative_yield.py), [`test_continuation_v5.py`](../tests/test_continuation_v5.py), and the [cooperative example](../examples/cooperative-preemption). |
 
 ## Ownership rules
 
 - Database changes belong to the storage/migration layer and never advance
   another protocol automatically.
-- Project and ExperimentCard schemas own portable authoring documents; runtime
-  Submission state is not part of either document.
-- `AdmissionSnapshot` is a frozen internal evidence model, not a new protocol
-  identity. Database v5 may decompose it into strict columns and blobs but must
-  retain its exact bytes and hashes without reinterpretation.
-- The runner owns RunnerManifest and RunnerReceipt emission. The scheduler owns
-  receipt admission, path authorization, and the bounded v0 stdout fallback.
-- QueueExport versions describe the export envelope, not the database that was
-  exported.
-- Cooperative-yield request and receipt versions are separate identities. The
-  generic queue owns their envelope and verification; projects own opaque
-  checkpoint/resume content.
-- A supported major cannot be removed until its compatibility policy permits
-  removal and its fixture is retained for migration/regression coverage.
+- Project and ExperimentCard schemas own portable authoring documents. Mutable
+  Submission priority, holds, dependencies, operator, and device assignment are
+  not part of either document.
+- `AdmissionSnapshot` and ExecutorReceipt are internal authenticated evidence
+  models, not public protocol identities. Database v5 may decompose them only
+  while retaining exact bytes, hashes, and ownership.
+- The runner owns RunnerManifest/RunnerReceipt emission. The scheduler owns
+  receipt admission, path authorization, process identity, and the bounded v0
+  fallback.
+- QueueExport versions describe an export envelope, not its database version.
+  Diagnostic CLI/web JSON does not acquire a protocol identity accidentally.
+- QueueMigrationReceipt versions describe importer/verifier evidence, not the
+  source or destination database protocol.
+- Cooperative-yield request and receipt versions are independent. The queue
+  owns envelope identity and verification; projects own checkpoint semantics
+  and opaque resume content.
+- A supported major is removed only under
+  [the deprecation threshold](release-policy.md#legacy-removal-threshold), and
+  its fixtures remain for history/import regression even after new writes end.

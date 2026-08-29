@@ -11,132 +11,156 @@ evidence.
 
 ## Current Phase
 
-The project is in the standalone-foundation phase. The history-preserving
-extraction from `flowers-3d-helmholtz` is complete at commit `09dbe41`. The
-original extracted baseline passed `82` tests plus `22` subtests. The protocol,
-structured-receipt, strict-serialization, bundled-schema, and generic
-cooperative-yield foundations are now implemented and independently versioned.
-Typed immutable Project/v1 and ExperimentCard/v1 models, offline project-owned
-extension validation, mutable Submission separation, and immutable admission
-snapshot compilation are also implemented as storage-neutral library APIs.
+The repository is locally ready for schema-v5 release and offline migration
+preparation. The standalone multi-project database, pinned-revision admission,
+typed execution,
+reservations, manual cooperative preemption, termination, web/CLI control,
+offline v1-v4 importer, destination-owned legacy runtime, recovery controls,
+examples, compatibility fixtures, packaging, and operator documentation are
+implemented locally. Schema v5 is the primary standalone entrypoint;
+schema-v4 and `LegacyMarkdownCard/v0` are explicitly bounded compatibility
+surfaces.
 
-The executable implementation is intentionally still schema-v4,
-single-project compatibility code. It accepts an explicit operator-selected
-state directory but still binds one database to one `--repo-root`, parses
-legacy Flowers Markdown commands, and uses Flowers-specific shared-worktree
-paths. New runner segments emit and ingest atomic typed receipts; a narrowly
-bounded human-log parser remains only for legacy jobs. The typed yield protocol
-is not yet wired into scheduler admission/failure isolation. The executable is
-not ready to replace the operational Flowers queue.
+No production migration has occurred. Local release-candidate verification is
+complete. Publication and Linux CI plus the remaining operator-supplied
+offline cutover evidence are still required. The cutover procedure is copy-only
+and receipt-driven; startup never upgrades a database in place.
 
-The current objective is to accept the Project/Enrollment/ProjectRevision
-lifecycle contract, add first-class projects and explicit database-v5 storage,
-and bind the pure admission compiler to exact blobs read from a pinned Git tree
-before any snapshot can become persistent queue state.
+## Verified Local Evidence
 
-## Verified Baseline
-
-- Source Flowers commit:
-  `0082945b4d2771dcc1ed93de1c55552df5761f72`.
-- Filtered pre-reorganization head:
-  `39c29fbc59abe9f71f991a4ced5362024b70a54b`.
-- Standalone extraction commit: `09dbe41`.
 - Runtime/development version: Python 3.14.4; declared support is `>=3.14`.
-- Package entry points: `experiment-queue`, `experiment-queue-web`, and
-  `run-experiment`.
-- State selection: absolute `--state-dir` takes precedence over
-  `EXPERIMENT_QUEUE_STATE_DIR`; missing/relative state fails safely.
-- Current generic suite: `409` tests and `26` subtests pass in the standalone
-  `.venv`.
-- The current wheel builds successfully; its isolated import includes the typed
-  authoring/admission modules, authenticates compiler provenance against wheel
-  metadata, and authenticates both bundled schema resources, pinned canonical
-  digests, and editor exports.
+- Package entry points: primary `experiment-queue` and `experiment-queue-web`,
+  offline `experiment-queue-migrate-v5`, rollback-only
+  `experiment-queue-legacy-v4` and `experiment-queue-web-legacy-v4`, and
+  scientific runner `run-experiment`.
+- Focused process/executor verification: `29 passed, 1 skipped`.
+- Focused scheduler-service verification: `59 passed` within the final combined
+  process-control run.
+- Focused CLI/web verification: `35 passed`.
+- Focused controller/runtime verification: `39 passed`.
+- Combined focused controller/runtime/executor/CLI/web verification:
+  `103 passed, 1 skipped`.
+- Focused runner/executor/attempt/scheduler-service verification after
+  process-group signal hardening: `120 passed, 1 skipped, 12 subtests passed`.
+- Focused legacy-v0 continuation verification: `7 passed`.
+- Final full Python 3.14.4 suite: `1004 passed, 1 skipped, 32 subtests passed`
+  in `183.93 s`; exit code `0`, with no warnings or failures.
+- Final wheel:
+  `experiment_queue-0.2.0-py3-none-any.whl`, SHA-256
+  `0b25ad880f25fea57ebf48d23a7c969dc072deb9f3c39249b590aad061b07683`;
+  isolated verification authenticated all runtime modules, all six entry-point
+  help surfaces, metadata/license identity, and bundled schema resources.
+- Final audit: independent code review found no remaining actionable issue;
+  the migration procedure re-audit resolved all findings; all `85` local
+  Markdown targets and `5` local fragment anchors resolve (`9` external URLs
+  were inventory-counted but not availability-checked); all `197` argparse
+  options have actionable help; Python compilation and `git diff --check` pass.
+- `origin` is configured as
+  `https://github.com/davidMis/experiment-queue.git`; local `main` and
+  `origin/main` both resolve to
+  `353cbfeb2e264fcc83a87d9b8f8034d20a84fc30` before the uncommitted readiness
+  work.
+- The Linux CI workflow exists locally but is untracked and therefore has not
+  run remotely.
 
-## Accepted Product Decisions
+## Accepted Product And Safety Decisions
 
-- Repository/distribution: `experiment-queue`; import package:
-  `experiment_queue`; primary CLI: `experiment-queue`.
-- Project keys are immutable lowercase hyphenated slugs, at most 63 characters.
-- Portable manifests/cards will use a strict YAML 1.2 subset validated by
-  bundled JSON Schema plus version-owned semantic checks, with a maximum tree
-  depth of 64, and will be stored as canonical JSON at admission.
-- New RunnerManifest/v1 and RunnerReceipt/v1 documents carry independent typed
-  identities; exact RunnerReceipt/v0 stdout parsing is legacy-only.
-- CooperativeYieldRequest/v1 and CooperativeYieldReceipt/v1 use hashed regular
-  files, typed progress, opaque resume bytes, and immutable continuation
-  evidence. Schema-v4 yield shapes remain explicitly named v0 compatibility.
-- Priority is global across projects and mutable, but never causes automatic
-  preemption. Manual cooperative preemption remains explicit.
-- Initial scheduling supports one NVIDIA GPU per independent job. Gang/DDP
-  preemption is out of scope.
-- The service stays dependency-light and never imports scientific project code.
-- Database, Project, ExperimentCard, runner manifest/receipt, export, and yield
-  protocols have independent version lineages.
-- ADR 0008 fixes validated-only immutable authoring models, one project-owned
-  extension namespace/schema, mutable Submission separation, whole-value
-  bindings without interpolation, and frozen admission evidence. Compiler
-  provenance comes only from installed package metadata.
+- Database/v5 stores immutable canonical `database_instance_id` identity;
+  exports and successful migration receipts bind source and destination
+  database identities exactly.
+- Queue items bind an immutable project revision, canonical admission snapshot,
+  logical mounts, artifact roots, declared resources, and one independently
+  schedulable NVIDIA GPU.
+- Priority is global but never authorizes automatic preemption. Manual yield is
+  explicit and durable. Signal senders are at-least-once across crash recovery;
+  each executor coalesces scientific broadcasts to at most one `SIGINT` and one
+  `SIGTERM` per segment.
+- Graceful signals reach the complete scientific process group. Terminal
+  evidence and GPU release wait for authenticated process-group exit and fresh
+  GPU telemetry. Ambiguous attempts remain assigned, host-paused, and
+  project-quarantined until guarded operator reconciliation.
+- The executor control module starts in isolated Python mode. The scientific
+  child still receives its validated environment; imported legacy v0 jobs
+  intentionally inherit the minimal, non-secret service environment for v4
+  compatibility.
+- Immutable launch/exit receipts use no-clobber durable publication. Recovery
+  confirms same-inode staging residue by fsyncing the directory before trust,
+  and fails closed on staging-only or mismatched evidence.
+- Project cleanup never deletes scientific artifacts. Runtime-worktree cleanup
+  refuses any ignored, untracked, or shared compatibility content.
+- `serve --once` is reconciliation/recovery-only and never dispatches new work.
+- Version 1 retains host-admin/reservation authorization. Named multi-team
+  principals and gang/DDP scheduling remain future designs, not migration
+  prerequisites.
 
 ## Ownership And Operational Boundary
 
-- This repository owns all future generic queue, runner, web, schema,
-  migration, compatibility, and onboarding development.
-- `flowers-3d-helmholtz` owns its scientific cards, checkpoint behavior,
-  experiment evidence, and the legacy queue operation until cutover.
-- David owns remote execution, GPU allowlists, credentials, live-state backup,
-  publication-remote selection, and production cutover authorization.
-- Codex implements and verifies locally and does not access `mutton2`.
+- This repository owns generic queue, runner, web, schema, migration,
+  compatibility, release, and onboarding development.
+- `flowers-3d-helmholtz` owns its scientific cards, historical evidence, and
+  legacy operational state. Live Flowers card classification must come from an
+  operator-supplied offline inventory; Codex has not inspected Flowers state.
+- David is the sole operator of `mutton2`. Codex does not connect to, inspect,
+  launch on, monitor, or synchronize with that machine.
+- David owns remote service control, GPU allowlists, credentials, production
+  backup/copy creation, external-path inventory, and final cutover
+  authorization. Codex supplies reproducible commands and evaluates only local
+  or operator-supplied artifacts.
 
-## Blockers And External Gates
+## Satisfied Gates
 
-- There is no blocker to local protocol, schema, database, scheduler, UX, test,
-  or documentation development.
-- On 2026-08-27, David explicitly confirmed that SPECFEM dataset generation and
-  synchronized evidence closeout are complete and authorized work toward
-  cutover. The scientific gate is satisfied.
-- Production migration from the Flowers schema-v4 queue remains blocked on the
-  standalone implementation, copied-state importer verification, an idle
-  legacy queue with both database writers stopped, and a consistent backup plus
-  external-path inventory.
-- David waived a distinct production-state dress rehearsal because this is a
-  single-operator queue. Comprehensive copied fixtures and a fresh two-project
-  smoke remain required; the cutover itself still requires a consistent
-  backup and offline copy-only, dry-run/receipt-verified migration.
-- The repository has no configured publication remote. Local development can
-  proceed; remote CI/publication waits for David's choice.
+- David confirmed that SPECFEM dataset generation is complete.
+- David confirmed synchronized scientific evidence closeout is complete.
+- David waived a separate production-state dress rehearsal because this is a
+  single-operator queue. Copied fixtures, local two-project integration, exact
+  migration receipts, and the production offline checks remain required.
+- The publication remote is configured.
+- Authoritative local tests, wheel construction/verification, documentation
+  and CLI audits, and independent adversarial review are complete.
+
+## Open Publication And Operator Gates
+
+- Commit and push the readiness work; publish the local Linux CI workflow and
+  obtain a clean remote run; then create the approved release commit/tag.
+- Obtain an operator-supplied offline Flowers database/card/external-path
+  inventory. Do not infer live classification from this repository.
+- At cutover, prove the legacy queue is idle, stop and disable every legacy
+  database writer and automatic restart path, create a consistent backup and
+  writer-free source copy, and retain the source/code read-only for rollback.
+- Run dry-run and build migration against copies, validate exact receipts and
+  inventories, and obtain David's explicit cutover authorization before
+  starting exactly one schema-v5 scheduler/web deployment.
 
 ## Active Risks
 
-- A migration could corrupt or reinterpret live history if it is automatic or
-  performed in place.
-- Legacy and standalone schedulers could contend for the same GPUs if cutover
-  does not enforce a single writer.
-- Project mounts, scratch roots, logs, or symlinks could disclose or mutate
-  another project's files without strict resolved-path authorization.
-- Mutable project configuration could change admitted execution unless every
-  job pins an immutable revision and normalized specification.
-- The storage-neutral admission compiler cannot prove its input bytes came from
-  the claimed commit; the trusted ProjectRevision/Git resolver must satisfy that
-  contract before database-v5 persistence accepts a snapshot.
-- Flowers-specific W&B and checkpoint assumptions could leak into the generic
-  core unless continuation context becomes opaque and versioned.
-- A broken highest-priority project could head-of-line block healthy work unless
-  failure quarantine and candidate selection are project-aware.
+- The readiness implementation and CI workflow are uncommitted/unpublished;
+  local evidence is not a substitute for remote Linux CI or a published,
+  immutable release artifact.
+- Scheduler-owned GPU flocks are not continuous across a scheduler crash while
+  a durable executor survives. Restart reconciliation fails closed if it cannot
+  reacquire the lock, but cross-version exclusion still relies on stopping and
+  disabling legacy services and running exactly one v5 service under an
+  authoritative service manager.
+- Live external paths, historical card classifications, and source-writer state
+  cannot be established without David's offline inventory and cutover checks.
+- macOS is a development, migration-rehearsal, and unit-test platform only;
+  production GPU dispatch and process telemetry require the documented Linux
+  environment.
+- Any ambiguous process, receipt, cleanup, or GPU-telemetry state deliberately
+  pauses/quarantines instead of guessing. Operators must use the guarded
+  recovery commands and preserve scientific evidence.
 
 ## Next Authorized Actions
 
-1. Accept the Project/Enrollment/ProjectRevision lifecycle ADR, then implement
-   its typed lifecycle models and schema-v5 project-aware storage.
-2. Implement the trusted pinned-Git source resolver and require its evidence at
-   the database admission boundary.
-3. Wire typed cooperative-yield continuation validation into scheduler
-   admission and project-scoped holds without blocking unrelated work.
-4. Implement the explicit offline v1-v4 importer and exhaustive fixtures, then
-   prove isolation with two temporary repositories before Flowers cutover.
-
-Detailed dependencies and completion gates are in `llm/todo.md`; the durable
-phase plan is `docs/implementation-plan.md`.
+1. Commit/push the candidate, publish/pass Linux CI, and create the approved
+   release commit/tag.
+2. Collect the operator-supplied offline inventory and writer-free source copy,
+   then execute the exact dry-run/build/verify checklist in
+   `docs/migrations/flowers-v4.md`.
+3. Await David's explicit cutover authorization. Do not start migration against
+   production state or activate the production scheduler/web deployment before
+   it. The migration guide's bounded foreground web-only review against the
+   destination copy remains an authorized pre-cutover verification step.
 
 ## Explicitly Out Of Scope
 
@@ -145,5 +169,5 @@ phase plan is `docs/implementation-plan.md`.
 - Gang scheduling and coordinated DDP/multi-GPU preemption.
 - Non-NVIDIA accelerators, distributed queue instances, and containerization as
   a security sandbox.
-- A general workflow DAG or matrix/template engine before explicit multi-job
-  cards are proven.
+- Named multi-team principals and a general workflow DAG/matrix engine before a
+  separately accepted design.

@@ -35,6 +35,7 @@ from experiment_queue.protocols import (
 
 YIELD_REQUEST_ENV: Final = "EXPERIMENT_QUEUE_YIELD_REQUEST_PATH"
 YIELD_RECEIPT_ENV: Final = "EXPERIMENT_QUEUE_YIELD_RECEIPT_PATH"
+CONTINUATION_RECEIPT_ENV: Final = "EXPERIMENT_QUEUE_CONTINUATION_RECEIPT_PATH"
 
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
 _GIT_COMMIT_PATTERN = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
@@ -1550,6 +1551,30 @@ def validate_ready_continuation(
     )
 
 
+def read_continuation_receipt_from_environment(
+    environment: Mapping[str, str] | None = None,
+) -> CooperativeYieldReceipt | None:
+    """Read the authenticated prior ready receipt exposed to a resumed segment."""
+
+    values = os.environ if environment is None else environment
+    raw = values.get(CONTINUATION_RECEIPT_ENV)
+    if raw is None:
+        return None
+    if not raw:
+        raise YieldDocumentError(f"{CONTINUATION_RECEIPT_ENV} must not be empty")
+    path = Path(raw)
+    if not path.is_absolute():
+        raise YieldDocumentError(
+            f"{CONTINUATION_RECEIPT_ENV} must name an absolute scheduler-owned file"
+        )
+    receipt = read_yield_receipt(path)
+    if receipt.status is not YieldReceiptStatus.READY:
+        raise YieldDocumentError(
+            f"{CONTINUATION_RECEIPT_ENV} must contain a ready receipt"
+        )
+    return receipt
+
+
 @dataclass(frozen=True, slots=True)
 class CooperativeYieldHelper:
     """Optional project-side helper for polling and responding without dependencies."""
@@ -1681,6 +1706,7 @@ class CooperativeYieldHelper:
 
 
 __all__ = [
+    "CONTINUATION_RECEIPT_ENV",
     "CheckpointArtifact",
     "ContinuationIdentity",
     "CooperativeYieldError",
@@ -1697,6 +1723,7 @@ __all__ = [
     "YieldReceiptStatus",
     "YieldRequestKind",
     "read_yield_receipt",
+    "read_continuation_receipt_from_environment",
     "read_yield_request",
     "sha256_bytes",
     "sha256_file",

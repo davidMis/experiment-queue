@@ -1,0 +1,18 @@
+# Portable manifest for the minimal ordinary example.
+apiVersion: experiment-queue/v1
+kind: Project
+metadata:
+  key: ordinary-example
+  displayName: "Ordinary example"
+spec:
+  cardRoots: [cards]
+  volumes:
+    - name: artifacts
+      access: readWrite
+      required: true
+  environments:
+    - name: python
+  environmentPolicy:
+    inherit: none
+    allowVariables: []
+  supportedProtocols: []

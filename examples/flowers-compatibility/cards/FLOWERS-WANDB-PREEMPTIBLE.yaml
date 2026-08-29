@@ -1,0 +1,46 @@
+# Representative tracker-aware typed continuation; no credential is stored here.
+apiVersion: experiment-queue/v1
+kind: ExperimentCard
+metadata:
+  projectKey: flowers-3d-helmholtz
+  experimentId: FLOWERS-WANDB-PREEMPTIBLE
+  title: "Flowers tracked cooperative compatibility job"
+spec:
+  parameters: {}
+  jobs:
+    - id: train
+      role: independent
+      environment: scientific
+      command:
+        type: argv
+        argv: [python, scripts/tracked_fixture.py]
+      resources:
+        gpus: 1
+      artifacts:
+        - name: checkpoint
+          root: scratch
+          path: compatibility/FLOWERS-WANDB-PREEMPTIBLE/checkpoint.json
+          type: file
+          required: false
+        - name: result
+          root: outputs
+          path: compatibility/FLOWERS-WANDB-PREEMPTIBLE/result.json
+          type: file
+          required: true
+      capabilities:
+        cooperativeYield:
+          requestProtocol:
+            apiVersion: experiment-queue/v1
+            kind: CooperativeYieldRequest
+          receiptProtocol:
+            apiVersion: experiment-queue/v1
+            kind: CooperativeYieldReceipt
+          checkpointArtifacts: [checkpoint]
+      extensions:
+        flowers-3d-helmholtz:
+          tracker: wandb
+          solver: python
+          elastic: true
+extensions:
+  flowers-3d-helmholtz:
+    family: tracked

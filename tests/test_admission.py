@@ -15,7 +15,9 @@ from experiment_queue.admission import (
     SchemaEvidence,
     Submission,
     SubmissionPolicy,
+    admission_snapshot_to_stored_evidence,
     compile_admission,
+    rehydrate_admission_snapshot,
 )
 from experiment_queue.schema_registry import (
     EXPERIMENT_CARD_V1_SCHEMA,
@@ -685,6 +687,12 @@ def test_dependencies_are_unique_positive_queue_item_ids(
         compile_fixture(submitted=submission(dependencies=dependencies))
 
 
+def test_dependencies_are_canonicalized_as_an_ascending_global_id_set() -> None:
+    snapshot = compile_fixture(submitted=submission(dependencies=[5, 2]))
+    assert snapshot.submission_policy.dependencies == (2, 5)
+    assert snapshot.submission_policy.to_document()["dependencies"] == [2, 5]
+
+
 @pytest.mark.parametrize("priority", [True, -(2**63) - 1, 2**63])
 def test_priority_is_a_non_boolean_signed_64_bit_integer(priority: object) -> None:
     with pytest.raises(AdmissionError, match="signed 64-bit integer"):
@@ -931,3 +939,92 @@ def test_extension_schema_source_rejects_mutable_bytearray() -> None:
             git_commit=GIT_COMMIT,
             extension_schema_source=bytearray(schema_source),  # type: ignore[arg-type]
         )
+
+
+def test_stored_admission_round_trip_preserves_recorded_package_version(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    snapshot = compile_fixture()
+    evidence = admission_snapshot_to_stored_evidence(snapshot)
+    monkeypatch.setattr(
+        admission_module,
+        "package_version_for",
+        lambda _distribution: "99.0.0-current",
+    )
+
+    loaded = rehydrate_admission_snapshot(evidence)
+
+    assert loaded == snapshot
+    assert loaded.package_version == PACKAGE_VERSION
+    assert loaded.resolved_document["compiler"]["version"] == PACKAGE_VERSION
+
+
+def test_stored_extension_admission_round_trip_revalidates_exact_schema() -> None:
+    reference, schema_source = extension_schema_fixture()
+    snapshot = compile_fixture(
+        project=project_document(
+            extension_schema=reference,
+            extensions={PROJECT_KEY: {"dataset": "dataset-v1"}},
+        ),
+        card=card_document(
+            card_extensions={PROJECT_KEY: {"campaign": "baseline"}},
+            job_extensions={PROJECT_KEY: {"tracker": "run-001"}},
+        ),
+        extension_schema_source=schema_source,
+    )
+
+    loaded = rehydrate_admission_snapshot(
+        admission_snapshot_to_stored_evidence(snapshot)
+    )
+
+    assert loaded == snapshot
+    assert loaded.extension_schema is not None
+    assert loaded.extension_schema.source == schema_source
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "project_source",
+        "project_normalized_json",
+        "card_source",
+        "card_normalized_json",
+        "resolved_json",
+        "command_json",
+        "policy_bindings_json",
+        "policy_dependencies_json",
+        "policy_json",
+    ],
+)
+def test_stored_admission_corrupt_blobs_fail_closed(field_name: str) -> None:
+    evidence = admission_snapshot_to_stored_evidence(compile_fixture())
+    value = evidence[field_name]
+    assert isinstance(value, bytes)
+    evidence[field_name] = value + b" "
+
+    with pytest.raises(AdmissionError, match="recomputing SHA-256|canonical"):
+        rehydrate_admission_snapshot(evidence)
+
+
+def test_stored_admission_denormalized_policy_and_partial_extension_fail_closed() -> None:
+    evidence = admission_snapshot_to_stored_evidence(compile_fixture())
+    evidence["policy_priority"] = 999
+    with pytest.raises(
+        AdmissionError,
+        match="policy_(?:json|priority).*does not match",
+    ):
+        rehydrate_admission_snapshot(evidence)
+
+    evidence = admission_snapshot_to_stored_evidence(compile_fixture())
+    evidence["extension_schema_source_name"] = "schemas/partial.json"
+    with pytest.raises(AdmissionError, match="extension-schema evidence is partial"):
+        rehydrate_admission_snapshot(evidence)
+
+
+def test_stored_admission_requires_the_exact_evidence_field_set() -> None:
+    evidence = admission_snapshot_to_stored_evidence(compile_fixture())
+    del evidence["resolved_sha256"]
+    evidence["invented"] = "value"
+
+    with pytest.raises(AdmissionError, match="missing fields.*unknown fields"):
+        rehydrate_admission_snapshot(evidence)

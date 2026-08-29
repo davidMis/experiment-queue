@@ -15,6 +15,7 @@ import pytest
 
 import experiment_queue.cooperative_yield as cooperative_yield
 from experiment_queue.cooperative_yield import (
+    CONTINUATION_RECEIPT_ENV,
     CheckpointArtifact,
     ContinuationIdentity,
     CooperativeYieldHelper,
@@ -29,6 +30,7 @@ from experiment_queue.cooperative_yield import (
     YieldReceiptStatus,
     YieldRequestKind,
     read_yield_receipt,
+    read_continuation_receipt_from_environment,
     read_yield_request,
     sha256_bytes,
     sha256_file,
@@ -284,6 +286,20 @@ def test_project_helper_writes_small_failed_receipt(tmp_path: Path) -> None:
     assert "checkpoint_artifacts" not in wire
     assert "resume_context" not in wire
     validate_receipt_for_request(parsed, request)
+
+
+def test_resumed_segment_reads_prior_ready_receipt_from_queue_environment(
+    tmp_path: Path,
+) -> None:
+    """Project code gets exact prior continuation evidence, never an inferred path."""
+
+    _request, receipt, _checkpoint = ready_receipt(tmp_path)
+    receipt_path = tmp_path / "prior-receipt.json"
+    write_yield_receipt(receipt_path, receipt)
+    assert read_continuation_receipt_from_environment(
+        {CONTINUATION_RECEIPT_ENV: str(receipt_path)}
+    ) == receipt
+    assert read_continuation_receipt_from_environment({}) is None
 
 
 @pytest.mark.parametrize("failed", [False, True])

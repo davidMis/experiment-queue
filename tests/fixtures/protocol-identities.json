@@ -12,6 +12,7 @@
   {"constant": "RUNNER_RECEIPT_V1", "apiVersion": "experiment-queue/v1", "kind": "RunnerReceipt"},
   {"constant": "LEGACY_DATABASE_COUPLED_QUEUE_EXPORT_V0", "apiVersion": "experiment-queue/v0", "kind": "QueueExport"},
   {"constant": "QUEUE_EXPORT_V1", "apiVersion": "experiment-queue/v1", "kind": "QueueExport"},
+  {"constant": "QUEUE_MIGRATION_RECEIPT_V1", "apiVersion": "experiment-queue/v1", "kind": "QueueMigrationReceipt"},
   {"constant": "LEGACY_COOPERATIVE_YIELD_REQUEST_V0", "apiVersion": "experiment-queue/v0", "kind": "CooperativeYieldRequest"},
   {"constant": "COOPERATIVE_YIELD_REQUEST_V1", "apiVersion": "experiment-queue/v1", "kind": "CooperativeYieldRequest"},
   {"constant": "LEGACY_COOPERATIVE_YIELD_RECEIPT_V0", "apiVersion": "experiment-queue/v0", "kind": "CooperativeYieldReceipt"},

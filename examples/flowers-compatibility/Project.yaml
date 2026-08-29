@@ -1,0 +1,38 @@
+# Portable Flowers integration contract; host paths live only in Enrollment.
+apiVersion: experiment-queue/v1
+kind: Project
+metadata:
+  key: flowers-3d-helmholtz
+  displayName: "Flowers 3D Helmholtz"
+  description: "Local compatibility fixture for standalone queue cutover."
+spec:
+  cardRoots: [cards]
+  volumes:
+    - name: datasets
+      access: readOnly
+      required: true
+    - name: outputs
+      access: readWrite
+      required: true
+    - name: scratch
+      access: readWrite
+      required: true
+  environments:
+    - name: scientific
+  environmentPolicy:
+    inherit: allowlist
+    allowVariables: [LANG]
+  supportedProtocols:
+    - apiVersion: experiment-queue/v1
+      kind: RunnerManifest
+    - apiVersion: experiment-queue/v1
+      kind: RunnerReceipt
+    - apiVersion: experiment-queue/v1
+      kind: CooperativeYieldRequest
+    - apiVersion: experiment-queue/v1
+      kind: CooperativeYieldReceipt
+  extensionSchema:
+    path: schemas/flowers-extension.schema.json
+extensions:
+  flowers-3d-helmholtz:
+    integration: local-cutover-fixture

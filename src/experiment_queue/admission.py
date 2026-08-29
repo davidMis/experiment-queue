@@ -7,6 +7,7 @@ never consults later source-file or ``Submission`` mutations.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from importlib.metadata import PackageNotFoundError, version as package_version_for
 import json
@@ -480,7 +481,10 @@ def _copy_dependencies(value: object) -> tuple[int, ...]:
             )
         seen.add(dependency)
         copied.append(dependency)
-    return tuple(copied)
+    # Dependencies are a semantic set.  A single ascending global-item order
+    # binds the snapshot, database edges, events, and QueueExport regardless of
+    # the operator/CLI argument order.
+    return tuple(sorted(copied))
 
 
 def _json_member_path(path: str, key: str) -> str:
@@ -687,6 +691,33 @@ def compile_admission(
     project_source_name: str = "project.yaml",
     card_source_name: str | None = None,
 ) -> AdmissionSnapshot:
+    """Compile sources with authenticated provenance from installed metadata."""
+
+    return _compile_admission_with_version(
+        project_source=project_source,
+        card_source=card_source,
+        submission=submission,
+        project_revision=project_revision,
+        git_commit=git_commit,
+        extension_schema_source=extension_schema_source,
+        project_source_name=project_source_name,
+        card_source_name=card_source_name,
+        compiler_version=_package_version(),
+    )
+
+
+def _compile_admission_with_version(
+    *,
+    project_source: bytes,
+    card_source: bytes,
+    submission: Submission,
+    project_revision: str,
+    git_commit: str,
+    compiler_version: str,
+    extension_schema_source: bytes | None = None,
+    project_source_name: str = "project.yaml",
+    card_source_name: str | None = None,
+) -> AdmissionSnapshot:
     """Compile exact authoring bytes and mutable policy into frozen evidence.
 
     The compiler deliberately reparses trusted model inputs on every call.
@@ -747,7 +778,11 @@ def compile_admission(
         maximum=_MAX_REVISION_CHARACTERS,
     )
     commit = _full_git_commit(git_commit)
-    compiler_version = _package_version()
+    compiler_version = _require_bounded_text(
+        compiler_version,
+        field_name="package_version",
+        maximum=_MAX_PACKAGE_VERSION_CHARACTERS,
+    )
 
     project = Project.from_yaml(project_source, source_name=project_source_name)
     card = ExperimentCard.from_yaml(card_source, source_name=card_source_name)
@@ -867,6 +902,403 @@ def compile_admission(
     )
 
 
+_STORED_ADMISSION_FIELDS: Final = frozenset(
+    {
+        "project_revision_label",
+        "git_commit",
+        "project_source_name",
+        "project_source",
+        "project_source_sha256",
+        "project_normalized_json",
+        "project_normalized_sha256",
+        "project_schema_api_version",
+        "project_schema_kind",
+        "project_schema_id",
+        "project_schema_sha256",
+        "card_source_name",
+        "card_source",
+        "card_source_sha256",
+        "card_normalized_json",
+        "card_normalized_sha256",
+        "card_schema_api_version",
+        "card_schema_kind",
+        "card_schema_id",
+        "card_schema_sha256",
+        "extension_schema_source_name",
+        "extension_schema_reference_path",
+        "extension_schema_source",
+        "extension_schema_source_sha256",
+        "extension_schema_canonical_json",
+        "extension_schema_canonical_sha256",
+        "extension_schema_id",
+        "resolved_json",
+        "resolved_sha256",
+        "command_kind",
+        "command_json",
+        "command_sha256",
+        "package_version",
+        "policy_project_key",
+        "policy_card_path",
+        "policy_job_id",
+        "policy_priority",
+        "policy_hold_reason",
+        "policy_operator",
+        "policy_preemption_authorized",
+        "policy_bindings_json",
+        "policy_bindings_sha256",
+        "policy_dependencies_json",
+        "policy_dependencies_sha256",
+        "policy_json",
+        "policy_sha256",
+    }
+)
+
+
+def admission_snapshot_to_stored_evidence(
+    snapshot: AdmissionSnapshot,
+) -> dict[str, object]:
+    """Decompose one snapshot into independently hashed storage evidence.
+
+    This function does not authenticate how the snapshot was produced.  A
+    persistence boundary must separately require ``GitResolvedAdmission`` and
+    should pass this record through :func:`rehydrate_admission_snapshot` before
+    mutation.  Recomputing command and policy hashes here avoids trusting any
+    caller-provided denormalized storage values.
+    """
+
+    if type(snapshot) is not AdmissionSnapshot:
+        raise TypeError(
+            f"snapshot must be exactly AdmissionSnapshot, got "
+            f"{type(snapshot).__name__}"
+        )
+    command_json = canonical_json_bytes(snapshot.command.to_document())
+    policy = snapshot.submission_policy
+    dependencies_json = canonical_json_bytes(list(policy.dependencies))
+    policy_json = canonical_json_bytes(policy.to_document())
+    extension = snapshot.extension_schema
+    return {
+        "project_revision_label": snapshot.project_revision,
+        "git_commit": snapshot.git_commit,
+        "project_source_name": snapshot.project_source_name,
+        "project_source": snapshot.project_source,
+        "project_source_sha256": snapshot.project_source_sha256,
+        "project_normalized_json": snapshot.project_normalized_json,
+        "project_normalized_sha256": snapshot.project_normalized_sha256,
+        "project_schema_api_version": snapshot.project_schema.api_version,
+        "project_schema_kind": snapshot.project_schema.kind,
+        "project_schema_id": snapshot.project_schema.schema_id,
+        "project_schema_sha256": snapshot.project_schema.sha256,
+        "card_source_name": snapshot.card_source_name,
+        "card_source": snapshot.card_source,
+        "card_source_sha256": snapshot.card_source_sha256,
+        "card_normalized_json": snapshot.card_normalized_json,
+        "card_normalized_sha256": snapshot.card_normalized_sha256,
+        "card_schema_api_version": snapshot.card_schema.api_version,
+        "card_schema_kind": snapshot.card_schema.kind,
+        "card_schema_id": snapshot.card_schema.schema_id,
+        "card_schema_sha256": snapshot.card_schema.sha256,
+        "extension_schema_source_name": (
+            None if extension is None else extension.source_name
+        ),
+        "extension_schema_reference_path": (
+            None if extension is None else extension.reference_path
+        ),
+        "extension_schema_source": None if extension is None else extension.source,
+        "extension_schema_source_sha256": (
+            None if extension is None else extension.source_sha256
+        ),
+        "extension_schema_canonical_json": (
+            None if extension is None else extension.canonical_json
+        ),
+        "extension_schema_canonical_sha256": (
+            None if extension is None else extension.canonical_sha256
+        ),
+        "extension_schema_id": None if extension is None else extension.schema_id,
+        "resolved_json": snapshot.resolved_json,
+        "resolved_sha256": snapshot.resolved_sha256,
+        "command_kind": snapshot.command.type,
+        "command_json": command_json,
+        "command_sha256": sha256_bytes(command_json),
+        "package_version": snapshot.package_version,
+        "policy_project_key": policy.project_key,
+        "policy_card_path": policy.card_path,
+        "policy_job_id": policy.job_id,
+        "policy_priority": policy.priority,
+        "policy_hold_reason": policy.hold_reason,
+        "policy_operator": policy.operator,
+        "policy_preemption_authorized": policy.preemption_authorized,
+        "policy_bindings_json": policy.bindings_json,
+        "policy_bindings_sha256": sha256_bytes(policy.bindings_json),
+        "policy_dependencies_json": dependencies_json,
+        "policy_dependencies_sha256": sha256_bytes(dependencies_json),
+        "policy_json": policy_json,
+        "policy_sha256": sha256_bytes(policy_json),
+    }
+
+
+def _stored_bytes(
+    evidence: Mapping[str, object],
+    field_name: str,
+    *,
+    optional: bool = False,
+) -> bytes | None:
+    value = evidence[field_name]
+    if optional and value is None:
+        return None
+    if type(value) is not bytes:
+        qualifier = "bytes or null" if optional else "bytes"
+        raise AdmissionError(
+            f"stored admission {field_name} must be {qualifier}, got "
+            f"{type(value).__name__}"
+        )
+    return value
+
+
+def _stored_text(
+    evidence: Mapping[str, object],
+    field_name: str,
+    *,
+    optional: bool = False,
+) -> str | None:
+    value = evidence[field_name]
+    if optional and value is None:
+        return None
+    if type(value) is not str:
+        qualifier = "text or null" if optional else "text"
+        raise AdmissionError(
+            f"stored admission {field_name} must be {qualifier}, got "
+            f"{type(value).__name__}"
+        )
+    return value
+
+
+def _verify_stored_hash(
+    evidence: Mapping[str, object],
+    *,
+    bytes_field: str,
+    hash_field: str,
+) -> None:
+    source = _stored_bytes(evidence, bytes_field)
+    digest = _stored_text(evidence, hash_field)
+    assert source is not None and digest is not None
+    actual = sha256_bytes(source)
+    if digest != actual:
+        raise AdmissionError(
+            f"stored admission {hash_field} is {digest!r}, but recomputing "
+            f"SHA-256 over {bytes_field} gives {actual}; restore an uncorrupted "
+            "snapshot row"
+        )
+
+
+def _decode_stored_canonical_json(
+    source: bytes,
+    *,
+    field_name: str,
+) -> JSONValue:
+    try:
+        value = cast(JSONValue, json.loads(source.decode("utf-8", errors="strict")))
+        encoded = canonical_json_bytes(value)
+    except (UnicodeDecodeError, json.JSONDecodeError, CanonicalJSONError) as exc:
+        raise AdmissionError(
+            f"stored admission {field_name} is not valid bounded canonical JSON: "
+            f"{exc}"
+        ) from exc
+    if encoded != source:
+        raise AdmissionError(
+            f"stored admission {field_name} is valid JSON but not its exact RFC "
+            "8785 canonical encoding; restore the original evidence bytes"
+        )
+    return value
+
+
+def rehydrate_admission_snapshot(
+    evidence: Mapping[str, object],
+) -> AdmissionSnapshot:
+    """Rebuild and authenticate one persisted admission snapshot.
+
+    The stored package version is treated as immutable evidence and is used to
+    regenerate ``resolved_json``.  The currently installed package version is
+    deliberately never substituted, so snapshots created by an older release
+    either round-trip exactly or fail closed on a real protocol mismatch.
+    """
+
+    if not isinstance(evidence, Mapping):
+        raise TypeError(
+            f"evidence must be a mapping of stored admission fields, got "
+            f"{type(evidence).__name__}"
+        )
+    non_text_keys = [key for key in evidence if type(key) is not str]
+    if non_text_keys:
+        raise AdmissionError(
+            f"stored admission evidence keys must be strings, got "
+            f"{non_text_keys!r}"
+        )
+    fields = set(cast(Mapping[str, object], evidence))
+    missing = sorted(_STORED_ADMISSION_FIELDS - fields)
+    unknown = sorted(fields - _STORED_ADMISSION_FIELDS)
+    if missing or unknown:
+        details: list[str] = []
+        if missing:
+            details.append(f"missing fields {missing}")
+        if unknown:
+            details.append(f"unknown fields {unknown}")
+        raise AdmissionError(
+            "stored admission evidence has an invalid field set: "
+            + "; ".join(details)
+        )
+    stored = cast(Mapping[str, object], evidence)
+
+    for bytes_field, hash_field in (
+        ("project_source", "project_source_sha256"),
+        ("project_normalized_json", "project_normalized_sha256"),
+        ("card_source", "card_source_sha256"),
+        ("card_normalized_json", "card_normalized_sha256"),
+        ("resolved_json", "resolved_sha256"),
+        ("command_json", "command_sha256"),
+        ("policy_bindings_json", "policy_bindings_sha256"),
+        ("policy_dependencies_json", "policy_dependencies_sha256"),
+        ("policy_json", "policy_sha256"),
+    ):
+        _verify_stored_hash(
+            stored,
+            bytes_field=bytes_field,
+            hash_field=hash_field,
+        )
+
+    extension_fields = (
+        "extension_schema_source_name",
+        "extension_schema_reference_path",
+        "extension_schema_source",
+        "extension_schema_source_sha256",
+        "extension_schema_canonical_json",
+        "extension_schema_canonical_sha256",
+    )
+    extension_present = [stored[name] is not None for name in extension_fields]
+    if any(extension_present) and not all(extension_present):
+        raise AdmissionError(
+            "stored admission extension-schema evidence is partial; source name, "
+            "reference path, source/canonical bytes, and both hashes must be all "
+            "present or all null"
+        )
+    extension_source: bytes | None = None
+    if all(extension_present):
+        extension_source = cast(
+            bytes,
+            _stored_bytes(stored, "extension_schema_source"),
+        )
+        _verify_stored_hash(
+            stored,
+            bytes_field="extension_schema_source",
+            hash_field="extension_schema_source_sha256",
+        )
+        _verify_stored_hash(
+            stored,
+            bytes_field="extension_schema_canonical_json",
+            hash_field="extension_schema_canonical_sha256",
+        )
+        canonical_extension = cast(
+            bytes,
+            _stored_bytes(stored, "extension_schema_canonical_json"),
+        )
+        _decode_stored_canonical_json(
+            canonical_extension,
+            field_name="extension_schema_canonical_json",
+        )
+    elif stored["extension_schema_id"] is not None:
+        raise AdmissionError(
+            "stored admission extension_schema_id must be null when no extension "
+            "schema evidence is present"
+        )
+
+    for canonical_field in (
+        "project_normalized_json",
+        "card_normalized_json",
+        "resolved_json",
+        "command_json",
+        "policy_bindings_json",
+        "policy_dependencies_json",
+        "policy_json",
+    ):
+        source = cast(bytes, _stored_bytes(stored, canonical_field))
+        _decode_stored_canonical_json(source, field_name=canonical_field)
+
+    bindings_value = _decode_stored_canonical_json(
+        cast(bytes, _stored_bytes(stored, "policy_bindings_json")),
+        field_name="policy_bindings_json",
+    )
+    if type(bindings_value) is not dict:
+        raise AdmissionError(
+            "stored admission policy_bindings_json must encode one JSON object"
+        )
+    dependencies_value = _decode_stored_canonical_json(
+        cast(bytes, _stored_bytes(stored, "policy_dependencies_json")),
+        field_name="policy_dependencies_json",
+    )
+    if type(dependencies_value) is not list:
+        raise AdmissionError(
+            "stored admission policy_dependencies_json must encode one JSON array"
+        )
+    priority = stored["policy_priority"]
+    if type(priority) is not int:
+        raise AdmissionError(
+            f"stored admission policy_priority must be an integer, got "
+            f"{type(priority).__name__}"
+        )
+    preemption_value = stored["policy_preemption_authorized"]
+    if type(preemption_value) is bool:
+        preemption_authorized = preemption_value
+    elif type(preemption_value) is int and preemption_value in (0, 1):
+        preemption_authorized = bool(preemption_value)
+    else:
+        raise AdmissionError(
+            "stored admission policy_preemption_authorized must be boolean or "
+            "SQLite integer 0/1"
+        )
+    hold_reason = _stored_text(stored, "policy_hold_reason", optional=True)
+    submission = Submission(
+        project_key=cast(str, _stored_text(stored, "policy_project_key")),
+        card_path=cast(str, _stored_text(stored, "policy_card_path")),
+        job_id=cast(str, _stored_text(stored, "policy_job_id")),
+        operator=cast(str, _stored_text(stored, "policy_operator")),
+        bindings=cast(dict[str, JSONValue], bindings_value),
+        priority=priority,
+        hold_reason=hold_reason,
+        dependencies=cast(list[int], dependencies_value),
+        preemption_authorized=preemption_authorized,
+    )
+    rebuilt = _compile_admission_with_version(
+        project_source=cast(bytes, _stored_bytes(stored, "project_source")),
+        card_source=cast(bytes, _stored_bytes(stored, "card_source")),
+        submission=submission,
+        project_revision=cast(
+            str,
+            _stored_text(stored, "project_revision_label"),
+        ),
+        git_commit=cast(str, _stored_text(stored, "git_commit")),
+        compiler_version=cast(str, _stored_text(stored, "package_version")),
+        extension_schema_source=extension_source,
+        project_source_name=cast(
+            str,
+            _stored_text(stored, "project_source_name"),
+        ),
+        card_source_name=cast(
+            str,
+            _stored_text(stored, "card_source_name"),
+        ),
+    )
+    expected = admission_snapshot_to_stored_evidence(rebuilt)
+    normalized_stored = dict(stored)
+    normalized_stored["policy_preemption_authorized"] = preemption_authorized
+    for field_name in sorted(_STORED_ADMISSION_FIELDS):
+        if normalized_stored[field_name] != expected[field_name]:
+            raise AdmissionError(
+                f"stored admission {field_name} does not match evidence regenerated "
+                "from the exact sources, policy, revision, commit, and recorded "
+                "package version"
+            )
+    return rebuilt
+
+
 __all__ = [
     "AdmissionError",
     "AdmissionSnapshot",
@@ -874,5 +1306,7 @@ __all__ = [
     "SchemaEvidence",
     "Submission",
     "SubmissionPolicy",
+    "admission_snapshot_to_stored_evidence",
     "compile_admission",
+    "rehydrate_admission_snapshot",
 ]

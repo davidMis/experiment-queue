@@ -23,6 +23,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 from experiment_queue.runner import (  # noqa: E402
     DEFAULT_USE_PTY,
     RUNNER_RECEIPT_ENV,
+    YIELD_RECEIPT_ENV,
     ExperimentError,
     ExperimentRequest,
     _create_run_dir,
@@ -650,6 +651,26 @@ class ExperimentRunnerTests(unittest.TestCase):
                 with self.subTest(mode=mode, signal=signum), tempfile.TemporaryDirectory() as temp_dir:
                     self._assert_signal_records_interrupted(mode, signum, Path(temp_dir))
 
+    @unittest.skipIf(os.name != "posix", "process-group signals are POSIX-specific")
+    def test_queue_group_signal_is_not_duplicated_by_runner_cleanup(self) -> None:
+        for mode in ("--no-pty", "--pty"):
+            for signum in (signal.SIGINT, signal.SIGTERM):
+                with self.subTest(mode=mode, signal=signum), tempfile.TemporaryDirectory() as temp_dir:
+                    self._assert_queue_group_signal_is_not_duplicated(
+                        mode,
+                        signum,
+                        Path(temp_dir),
+                    )
+
+    @unittest.skipIf(os.name != "posix", "process-group signals are POSIX-specific")
+    def test_queue_group_sigint_preserves_cooperative_yield_exit(self) -> None:
+        for mode in ("--no-pty", "--pty"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temp_dir:
+                self._assert_queue_group_sigint_preserves_yield(
+                    mode,
+                    Path(temp_dir),
+                )
+
     def _assert_signal_records_interrupted(
         self, mode: str, signum: int, root: Path
     ) -> None:
@@ -689,6 +710,165 @@ class ExperimentRunnerTests(unittest.TestCase):
         manifest = json.loads(manifests[0].read_text(encoding="utf-8"))
         self.assertEqual(manifest["run"]["status"], "interrupted")
         self.assertEqual(manifest["run"]["return_code"], 130)
+
+    def _assert_queue_group_signal_is_not_duplicated(
+        self,
+        mode: str,
+        signum: int,
+        root: Path,
+    ) -> None:
+        output_root = root / "outputs"
+        signal_log = root / "child-signals.jsonl"
+        child_ready = root / "child-ready"
+        runner_receipt = root / "queue-runner-receipt.json"
+        runner = REPO_ROOT / "scripts" / "run_experiment.py"
+        child_source = (
+            "import json, os, signal, time\n"
+            f"log = {str(signal_log)!r}\n"
+            f"ready = {str(child_ready)!r}\n"
+            "def handle(signum, _frame):\n"
+            "    fd = os.open(log, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)\n"
+            "    try:\n"
+            "        os.write(fd, (json.dumps({'signal': signum}) + '\\n').encode())\n"
+            "    finally:\n"
+            "        os.close(fd)\n"
+            "    signal.signal(signum, signal.SIG_DFL)\n"
+            "    os.kill(os.getpid(), signum)\n"
+            "signal.signal(signal.SIGINT, handle)\n"
+            "signal.signal(signal.SIGTERM, handle)\n"
+            "open(ready, 'x').close()\n"
+            "while True:\n"
+            "    time.sleep(60)\n"
+        )
+        environment = os.environ.copy()
+        environment["EXPERIMENT_QUEUE_RUNNER_RECEIPT_PATH"] = str(runner_receipt)
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                str(runner),
+                "--output-root",
+                str(output_root),
+                mode,
+                "--",
+                sys.executable,
+                "-c",
+                child_source,
+            ],
+            cwd=root,
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            manifests = list(output_root.glob("*/manifest.json"))
+            if manifests and child_ready.exists():
+                break
+            if process.poll() is not None:
+                stdout, stderr = process.communicate()
+                self.fail(f"runner exited before child readiness: {stdout!r} {stderr!r}")
+            time.sleep(0.05)
+        else:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait()
+            self.fail("queue runner child did not become signal-ready")
+
+        os.killpg(process.pid, signum)
+        stdout, stderr = process.communicate(timeout=15)
+
+        self.assertEqual(process.returncode, 128 + signum, (stdout, stderr))
+        observed = [
+            json.loads(line)["signal"]
+            for line in signal_log.read_text(encoding="utf-8").splitlines()
+        ]
+        self.assertEqual(observed, [signum])
+        manifest = json.loads(manifests[0].read_text(encoding="utf-8"))
+        self.assertEqual(manifest["run"]["status"], "failed")
+        self.assertEqual(manifest["run"]["return_code"], -signum)
+
+    def _assert_queue_group_sigint_preserves_yield(
+        self,
+        mode: str,
+        root: Path,
+    ) -> None:
+        output_root = root / "outputs"
+        signal_log = root / "yield-child-signals.jsonl"
+        child_ready = root / "yield-child-ready"
+        yield_receipt = root / "yield-receipt.json"
+        runner_receipt = root / "queue-runner-receipt.json"
+        runner = REPO_ROOT / "scripts" / "run_experiment.py"
+        child_source = (
+            "import json, os, signal, time\n"
+            f"log = {str(signal_log)!r}\n"
+            f"ready = {str(child_ready)!r}\n"
+            f"receipt = {str(yield_receipt)!r}\n"
+            "def handle(signum, _frame):\n"
+            "    fd = os.open(log, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)\n"
+            "    try:\n"
+            "        os.write(fd, (json.dumps({'signal': signum}) + '\\n').encode())\n"
+            "    finally:\n"
+            "        os.close(fd)\n"
+            "    with open(receipt, 'x', encoding='utf-8') as stream:\n"
+            "        json.dump({'status': 'ready'}, stream)\n"
+            "    raise SystemExit(75)\n"
+            "signal.signal(signal.SIGINT, handle)\n"
+            "open(ready, 'x').close()\n"
+            "while True:\n"
+            "    time.sleep(60)\n"
+        )
+        environment = os.environ.copy()
+        environment[RUNNER_RECEIPT_ENV] = str(runner_receipt)
+        environment[YIELD_RECEIPT_ENV] = str(yield_receipt)
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                str(runner),
+                "--output-root",
+                str(output_root),
+                mode,
+                "--",
+                sys.executable,
+                "-c",
+                child_source,
+            ],
+            cwd=root,
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            manifests = list(output_root.glob("*/manifest.json"))
+            if manifests and child_ready.exists():
+                break
+            if process.poll() is not None:
+                stdout, stderr = process.communicate()
+                self.fail(f"runner exited before yield readiness: {stdout!r} {stderr!r}")
+            time.sleep(0.05)
+        else:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait()
+            self.fail("queue runner yield child did not become signal-ready")
+
+        os.killpg(process.pid, signal.SIGINT)
+        stdout, stderr = process.communicate(timeout=15)
+
+        self.assertEqual(process.returncode, 75, (stdout, stderr))
+        observed = [
+            json.loads(line)["signal"]
+            for line in signal_log.read_text(encoding="utf-8").splitlines()
+        ]
+        self.assertEqual(observed, [signal.SIGINT])
+        receipt = json.loads(runner_receipt.read_text(encoding="utf-8"))
+        self.assertEqual(receipt["status"], "yielded")
+        self.assertEqual(receipt["return_code"], 75)
+        manifest = json.loads(manifests[0].read_text(encoding="utf-8"))
+        self.assertEqual(manifest["run"]["status"], "yielded")
+        self.assertEqual(manifest["run"]["return_code"], 75)
 
 
 if __name__ == "__main__":

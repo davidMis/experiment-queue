@@ -1,0 +1,24 @@
+# One explicit transformation with a directory result.
+apiVersion: experiment-queue/v1
+kind: ExperimentCard
+metadata:
+  projectKey: data-pipeline-example
+  experimentId: PIPE-001
+  title: "Transform an input inventory"
+spec:
+  parameters: {}
+  jobs:
+    - id: transform
+      role: independent
+      environment: tools
+      command:
+        type: argv
+        argv: [python, pipeline.py]
+      resources:
+        gpus: 1
+      artifacts:
+        - name: transformed
+          root: artifacts
+          path: runs/PIPE-001/transformed
+          type: directory
+          required: true
