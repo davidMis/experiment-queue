@@ -21,13 +21,15 @@ host queue instance
     └── attempts, continuation segments, events, and artifacts
 ```
 
-A portable Project manifest is committed in each scientific repository. Host
-Enrollment maps its logical names to one canonical checkout, disjoint mount and
-artifact roots, and executable-search directories without committing host paths
-or secrets. Registration and every later revision resolve a full Git commit and
-authenticate exact Project, card, extension-schema, and wrapper blobs from that
-tree. Runtime consumes the stored snapshot; it does not reparse current working
-files.
+A portable Project manifest is committed in each scientific repository. Every
+revision freezes a host Enrollment, but the ordinary trusted-project path
+derives it automatically for `volumes: []`: no mounts and one checkout-local
+`.venv/bin`.
+Projects may opt into logical mounts and artifact roots when they want named
+path injection or queue-observed artifacts. Registration and every later
+revision resolve a full Git commit and authenticate exact Project, card,
+extension-schema, and wrapper blobs from that tree. Runtime consumes the stored
+snapshot; it does not reparse current working files.
 
 Experiment identity and attempt uniqueness are Project-scoped. Queue item IDs,
 GPU resources, reservation IDs, priority order, and the scheduler lease remain
@@ -76,8 +78,8 @@ never migrates state.
 
 ## Execution and environment boundary
 
-For ExperimentCard/v1, the queue starts a child environment empty, constructs `PATH` from the admitted
-environment binding, copies only the intersection of portable and host-local
+For ExperimentCard/v1, the queue starts a child environment empty, constructs
+`PATH` from the admitted environment binding, copies only the intersection of portable and host-local
 ambient allowlists, and injects service-owned values last. These include exact
 Project/revision/Git/item/attempt identities, `CUDA_VISIBLE_DEVICES`, logical
 mount paths as `EXPERIMENT_QUEUE_MOUNT_<NAME>`, declared output paths as
@@ -147,7 +149,7 @@ production invariant across the scheduler crash gap.
 
 The explicit state directory contains the v5 database, instance identity,
 lease, internal worktrees, service logs, and control receipts. It may not
-overlap a checkout, mount, artifact root, or environment root. Version 1 also
+overlap a checkout, declared mount, artifact root, or environment root. Version 1 also
 rejects equality or ancestor/descendant overlap between Projects. Authorized
 paths are canonicalized at revision creation and resolved again at use time so
 traversal and changed symlink targets fail closed.
@@ -170,7 +172,7 @@ Every open compares the complete application-owned `sqlite_schema` surface
 internal objects, with the immutable v5 DDL; metadata claiming the expected DDL
 digest cannot conceal a missing, changed, or extra schema object.
 
-General artifacts may be large, so terminal observation records declared name,
+Artifact declaration is optional. When used, terminal observation records declared name,
 type, root, relative and absolute path, presence, and regular-file size without
 hashing content. Cooperative checkpoint artifacts are separate protocol
 evidence and are always hashed. Archival, migration, queue removal, and

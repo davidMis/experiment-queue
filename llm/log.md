@@ -370,3 +370,120 @@ Open:
   verify annotated tag `v0.2.0`.
 - Build and retain the exact tag wheel before beginning the writer-free
   production-copy gate.
+
+## 2026-08-29 - Select Fresh Schema-v5 Deployment
+
+Goal: replace the legacy-database migration plan with the minimal fresh-state
+startup selected by David.
+
+Decision:
+
+- David confirmed that no queue experiments are running, the legacy scheduler
+  and web service are stopped, and the legacy database does not need to be
+  migrated.
+- The new deployment will initialize an absent schema-v5 database through
+  first-Project registration. Legacy inventory, backup/copy, importer, receipt,
+  and migrated-item comparison steps are no longer active work.
+- David selected the existing cloned GitHub checkout as the production source;
+  the retained wheel remains release verification evidence and will not be the
+  installation path.
+- David selected `/home/sdm11/experiment-queue` for the source clone and
+  `/home/sdm11/srv/experiment-queue` for mutable service data. These disjoint
+  roots keep the state directory outside the checkout.
+
+Result:
+
+- Verified the published remote annotated tag `v0.2.0`: tag object
+  `9fa5860bc47b8b30092eba7d2f2cbacd5c6f443e` dereferences to reviewed release
+  commit `9a146a5cfa51125ff13b45cf9211358d2ad2e64e`.
+- Built from a temporary detached worktree at that exact tag, passed the full
+  wheel verifier, and retained
+  `dist/experiment_queue-0.2.0-py3-none-any.whl` with SHA-256
+  `5ff574c3201c8f7a50ee2103f9c2c19af0190d3b262ed0dd81831ebad75b12b8`.
+- Closed `EQ-RELEASE-003`; the release artifact is ready to install.
+- Replaced the five-step Flowers migration/cutover TODO with three fresh
+  deployment tasks: prepare the typed Project and Enrollment, initialize state,
+  and activate/smoke the services.
+- Updated current status and operator-facing documentation so the inactive
+  import checklist is no longer presented as a production prerequisite.
+- Recorded the supported pinned-checkout startup: a repository-local Python
+  3.14 `.venv`, editable installation from `pyproject.toml`, and the thin queue
+  and web wrappers under `scripts/`.
+- No queue code, Flowers repository, legacy database, or remote service state
+  changed.
+
+Verification:
+
+- `git diff --check` passes for the documentation-only change set.
+- The retained tagged wheel passes `scripts/verify_wheel.py`; no product code
+  changed, so the already successful release CI remains the code verification.
+
+Open:
+
+- Pin and prepare the production clone, then register the committed Flowers
+  Project into fresh state, add the GPU, initialize web credentials, start the
+  v5 services, and submit one typed card.
+
+## 2026-08-29 - Simplify Trusted-Project Onboarding
+
+Goal: remove unnecessary path and environment setup from the fresh Flowers
+startup while retaining useful queue identity and the explicit advanced model.
+
+Decisions:
+
+- Treat registered scientific projects as trusted service-account code. Empty
+  volume declarations do not restrict filesystem access, and ordinary jobs do
+  not need dataset/output/scratch inventories or artifact declarations.
+- Keep scientific environments inside their project roots. The normal workflow
+  binds one existing checkout-local `.venv/bin` automatically and requires no
+  operator-authored Enrollment file.
+- Keep exact committed Project/card admission and pinned worktrees, but do not
+  claim absolute reproducibility as the product goal.
+- Continue with a fresh schema-v5 database; legacy import remains inactive.
+
+Result:
+
+- Changed the default Project scaffold to `volumes: []`; its generated card has
+  no artifacts.
+- Made `--enrollment` optional for register and append. Automatic mode requires
+  `volumes: []` plus one environment, freezes Enrollment/v1 with no mounts, and
+  uses `<checkout>/.venv/bin` by default.
+- Added `--environment-bin` for an alternate venv root, bin directory, or
+  executable. Relative values resolve beneath the checkout. A symlinked Python
+  is normalized before target resolution, fixing the reported uv-style path
+  failure.
+- Automatic mode authenticates the complete checkout-local `.venv` against the
+  pinned commit's `.gitignore`, rather than proving only its `bin` subdirectory.
+  Explicit Enrollment remains backward compatible for advanced mounts,
+  artifacts, multiple environments, and checkpointing.
+- Added accepted ADR 0012 and revised the README, security boundary, architecture,
+  implementation plan, onboarding, operator guidance, examples, changelog, and
+  current records. Package version is prepared as `0.2.1`.
+- Drafted six concise public wiki pages for installation, adding a project,
+  daily operations, troubleshooting, navigation, and the wiki home. Publication
+  remains pending action-time confirmation and a public code revision that
+  contains the documented behavior.
+- No Flowers repository, queue state, legacy database, or `mutton2` service was
+  inspected or changed.
+
+Verification:
+
+- Independent implementation and documentation reviews found the version-pin,
+  whole-venv proof, optional-volume admission, executable normalization, CLI
+  exclusivity, environment-policy, relative-output, and command-name issues;
+  each applicable finding was corrected.
+- Focused CLI/operator/example suite: `48 passed` in `19.62 s`.
+- Full Python 3.14.4 suite: `1011 passed, 1 skipped, 32 subtests passed` in
+  `182.82 s`.
+- `experiment_queue-0.2.1-py3-none-any.whl` passes the complete verifier;
+  SHA-256 is
+  `92ab165b3b45f29ee0f1a948a43e48baba0d5d6dc0083651a38f8309d6f8f658`.
+- Python compilation, `git diff --check`, all `80` local Markdown targets, and
+  all links among the six wiki drafts pass.
+
+Open:
+
+- With David's confirmation, publish the reviewed `0.2.1` code/release, require
+  successful Linux CI, and publish the public wiki pages.
+- Tomorrow, update the `mutton2` source clone and perform the documented fresh
+  registration and one-job smoke run without an Enrollment file or importer.

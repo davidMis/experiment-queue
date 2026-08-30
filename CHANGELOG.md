@@ -6,6 +6,22 @@ Release, compatibility, deprecation, and support rules are defined in
 
 ## Unreleased
 
+## 0.2.1 - 2026-08-30
+
+### Changed
+
+- The default Project scaffold now declares no volumes or artifacts. Trusted
+  project code retains the service account's normal filesystem access.
+- Project registration and revision append can derive Enrollment/v1
+  automatically for `volumes: []` from one checkout-local `.venv`, eliminating
+  the ordinary host-path inventory and Enrollment-file workflow. Explicit
+  Enrollment remains available for advanced mounts, artifacts, and multiple
+  environments.
+- Flowers deployment now starts with a fresh schema-v5 database because no
+  legacy jobs are running, the legacy services are stopped, and the legacy
+  database does not need to be imported. The legacy import checklist remains
+  available but is not part of the active deployment.
+
 ## 0.2.0 - 2026-08-29
 
 ### Added

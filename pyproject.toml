@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "experiment-queue"
-version = "0.2.0"
+version = "0.2.1"
 description = "A durable, operator-controlled queue for scientific GPU experiments."
 readme = "README.md"
 requires-python = ">=3.14"

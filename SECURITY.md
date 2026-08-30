@@ -5,6 +5,11 @@ Registering a project authorizes arbitrary code from its admitted Git commits to
 run with the queue service account's filesystem, process, network, and credential
 access.
 
+Logical volumes and declared artifacts are optional provenance features. Their
+absence does not restrict project code to the checkout: the process retains the
+service account's ordinary host access. Use Unix ownership and permissions—not
+Project.yaml—as the containment boundary.
+
 Production deployments should:
 
 - use a dedicated non-root service account with least privilege;

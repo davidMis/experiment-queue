@@ -314,6 +314,7 @@ def test_project_scaffold_and_validation_explain_are_deterministic() -> None:
     assert first == second
     project = Project.from_yaml(first, source_name="Project.yaml")
     assert project.key == "example-project"
+    assert project.volumes == ()
     report = validate_project_source(
         source=first,
         source_name="Project.yaml",
@@ -324,6 +325,16 @@ def test_project_scaffold_and_validation_explain_are_deterministic() -> None:
     assert report["source"]["sha256"] == sha256_bytes(first)  # type: ignore[index]
     assert report["explanation"]["cardRoots"] == ["experiments"]  # type: ignore[index]
     assert report["schema"]["kind"] == "Project"  # type: ignore[index]
+
+    card = ExperimentCard.from_yaml(
+        experiment_card_scaffold(
+            project=project,
+            experiment_id="SIMPLE-001",
+            title="Simple trusted job",
+        ),
+        source_name="experiments/SIMPLE-001.yaml",
+    )
+    assert card.jobs[0].artifacts == ()
 
 
 def test_card_validate_and_explain_cover_cross_project_job_contract(

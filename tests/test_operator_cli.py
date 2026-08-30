@@ -18,7 +18,6 @@ from experiment_queue.operator_services import project_manifest_scaffold
 from experiment_queue.project_lifecycle import (
     Enrollment,
     EnvironmentBinding,
-    MountBinding,
 )
 
 
@@ -58,13 +57,11 @@ def make_cli_fixture(tmp_path: Path) -> CLIFixture:
 
     repository = tmp_path / "repository"
     state = tmp_path / "state"
-    artifacts = tmp_path / "artifacts"
     executable_root = tmp_path / "bin"
     for directory in (
         repository,
         repository / "experiments",
         state,
-        artifacts,
         executable_root,
     ):
         directory.mkdir(parents=True, exist_ok=True)
@@ -95,14 +92,6 @@ def make_cli_fixture(tmp_path: Path) -> CLIFixture:
                     "environment": "python",
                     "command": {"type": "argv", "argv": ["python", "run.py"]},
                     "resources": {"gpus": 1},
-                    "artifacts": [
-                        {
-                            "name": "result",
-                            "root": "artifacts",
-                            "path": "cli/result.json",
-                            "type": "file",
-                        }
-                    ],
                 }
             ],
         },
@@ -121,13 +110,7 @@ def make_cli_fixture(tmp_path: Path) -> CLIFixture:
         project=project,
         checkout_directory=repository,
         project_manifest_path="Project.yaml",
-        mounts=[
-            MountBinding.create(
-                name="artifacts",
-                path=artifacts,
-                access="readWrite",
-            )
-        ],
+        mounts=[],
         environments=[
             EnvironmentBinding.create(
                 name="python",

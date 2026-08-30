@@ -12,6 +12,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
+import os
 from pathlib import Path, PurePosixPath
 import sys
 from typing import cast
@@ -55,6 +56,8 @@ from experiment_queue.reservation_v5 import (
     V5ReservationService,
 )
 from experiment_queue.project_lifecycle import (
+    Enrollment,
+    EnvironmentBinding,
     LifecycleValidationError,
     ProjectLifecycle,
     ProjectRevision,
@@ -186,13 +189,25 @@ def _revision_input_arguments(parser: argparse.ArgumentParser) -> None:
             "(default: Project.yaml); absolute paths and traversal are refused."
         ),
     )
-    parser.add_argument(
+    environment_source = parser.add_mutually_exclusive_group()
+    environment_source.add_argument(
         "--enrollment",
-        required=True,
         type=Path,
         help=(
-            "Path to the complete host Enrollment document. Every declared "
-            "required mount/environment must be bound; the file is never changed."
+            "Optional advanced host Enrollment document. Omit it for the trusted "
+            "single-environment workflow: no volumes are bound and the declared "
+            "environment uses CHECKOUT/.venv/bin."
+        ),
+    )
+    environment_source.add_argument(
+        "--environment-bin",
+        type=Path,
+        help=(
+            "Executable directory for automatic enrollment (default: "
+            "CHECKOUT/.venv/bin). A venv root or Python executable is also "
+            "accepted and normalized. Relative paths are resolved beneath "
+            "CHECKOUT, and the selected path must already exist. Cannot be "
+            "combined with --enrollment."
         ),
     )
     parser.add_argument(
@@ -349,7 +364,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     register = project_actions.add_parser(
         "register",
-        help="Register one strict Enrollment and resolver-verified first revision.",
+        help=(
+            "Register one resolver-verified first revision; automatic trusted "
+            "enrollment is the default."
+        ),
     )
     _revision_input_arguments(register)
     _reason_argument(register, action="registration")
@@ -422,7 +440,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     append = project_actions.add_parser(
         "append-revision",
-        help="Append a strict resolver-verified ProjectRevision and normally activate it.",
+        help=(
+            "Append a resolver-verified ProjectRevision, deriving trusted enrollment "
+            "when omitted, and normally activate it."
+        ),
     )
     _project_selector(append)
     _revision_input_arguments(append)
@@ -1287,6 +1308,69 @@ def _checkout_source(checkout: Path, relative: str, *, purpose: str) -> bytes:
     return _read_bytes(resolved, purpose=purpose)
 
 
+def _automatic_environment_directory(
+    *,
+    checkout: Path,
+    requested: Path | None,
+) -> Path:
+    """Normalize the trusted-project venv root, bin directory, or executable."""
+
+    candidate = Path(".venv/bin") if requested is None else requested
+    if not candidate.is_absolute():
+        candidate = checkout / candidate
+    # Inspect the spelling before resolving: venv Python executables are often
+    # symlinks to a uv/CPython installation outside the checkout, while their
+    # parent bin directory is the PATH entry the scientific child needs.
+    if candidate.is_file():
+        if not os.access(candidate, os.X_OK):
+            raise OperatorServiceError(
+                f"automatic project environment executable {candidate} is not "
+                "executable; pass a venv root, its bin directory, or an "
+                "executable Python path"
+            )
+        candidate = candidate.parent
+    elif candidate.is_dir() and (candidate / "pyvenv.cfg").is_file():
+        candidate = candidate / "bin"
+    try:
+        resolved = candidate.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise OperatorServiceError(
+            f"automatic project environment {candidate} cannot be resolved: {exc}; "
+            "create the project .venv or pass --environment-bin"
+        ) from exc
+    if not resolved.is_dir():
+        raise OperatorServiceError(
+            f"automatic project environment {candidate} resolves to {resolved}, "
+            "which is not an executable-search directory; pass a venv root, its "
+            "bin directory, or a Python executable"
+        )
+    return resolved
+
+
+def _automatic_environment_ignore_root(
+    *,
+    checkout: Path,
+    environment_directory: Path,
+    requested: Path | None,
+) -> Path | None:
+    """Return the checkout-local mutable root that must be Git-ignored."""
+
+    if checkout not in environment_directory.parents:
+        return None
+    venv_root = environment_directory.parent
+    default_venv = (
+        requested is None
+        and environment_directory == (checkout / ".venv" / "bin").resolve()
+    )
+    if environment_directory.name == "bin" and (
+        default_venv or (venv_root / "pyvenv.cfg").is_file()
+    ):
+        # Prove the whole environment mutable, including pyvenv.cfg and
+        # site-packages, while retaining only its bin directory on PATH.
+        return venv_root
+    return environment_directory
+
+
 def _services(
     args: argparse.Namespace,
     *,
@@ -1346,22 +1430,73 @@ def _build_revision(
         source_name=manifest_path,
         extension_schema_source=extension_source,
     )
-    enrollment = load_enrollment_document(
-        source=_read_bytes(args.enrollment, purpose="Enrollment"),
-        source_name=str(args.enrollment),
-        project=project,
-        state_directory=store.state_dir,
-        occupied_roots=operator.occupied_roots(
-            exclude_project_id=exclude_project_id
-        ),
-        git_ignore_verifier=lambda descendants: (
-            verify_git_ignored_checkout_descendants(
+    if args.enrollment is None:
+        declared_volumes = sorted(volume.name for volume in project.volumes)
+        if declared_volumes:
+            raise OperatorServiceError(
+                "automatic trusted-project enrollment requires Project "
+                f"volumes: [], but found {declared_volumes}; remove those "
+                "declarations when jobs use ordinary host paths, or pass "
+                "--enrollment for explicit mounts"
+            )
+        if len(project.environments) != 1:
+            raise OperatorServiceError(
+                "automatic trusted-project enrollment requires exactly one declared "
+                f"environment, got {[value.name for value in project.environments]}; "
+                "declare one environment or pass --enrollment"
+            )
+        environment_path = _automatic_environment_directory(
+            checkout=checkout,
+            requested=args.environment_bin,
+        )
+        ignored_descendants: tuple[Path, ...] = ()
+        ignored_root = _automatic_environment_ignore_root(
+            checkout=checkout,
+            environment_directory=environment_path,
+            requested=args.environment_bin,
+        )
+        if ignored_root is not None:
+            ignored_descendants = verify_git_ignored_checkout_descendants(
                 repository_root=checkout,
                 git_commit=args.git_commit,
-                descendants=descendants,
+                descendants=(ignored_root,),
             )
-        ),
-    )
+        environment = project.environments[0]
+        enrollment = Enrollment.create(
+            project=project,
+            checkout_directory=checkout,
+            project_manifest_path=manifest_path,
+            mounts=(),
+            environments=(
+                EnvironmentBinding.create(
+                    name=environment.name,
+                    executable_search_directories=(environment_path,),
+                    inherit_variables=project.environment_policy.allow_variables,
+                ),
+            ),
+            state_directory=store.state_dir,
+            git_ignored_checkout_descendants=ignored_descendants,
+            occupied_roots=operator.occupied_roots(
+                exclude_project_id=exclude_project_id
+            ),
+        )
+    else:
+        enrollment = load_enrollment_document(
+            source=_read_bytes(args.enrollment, purpose="Enrollment"),
+            source_name=str(args.enrollment),
+            project=project,
+            state_directory=store.state_dir,
+            occupied_roots=operator.occupied_roots(
+                exclude_project_id=exclude_project_id
+            ),
+            git_ignore_verifier=lambda descendants: (
+                verify_git_ignored_checkout_descendants(
+                    repository_root=checkout,
+                    git_commit=args.git_commit,
+                    descendants=descendants,
+                )
+            ),
+        )
     if enrollment.checkout_directory != checkout:
         raise OperatorServiceError(
             f"Enrollment checkout {enrollment.checkout_directory} differs from "

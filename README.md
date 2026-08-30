@@ -19,14 +19,14 @@ explicit `experiment-queue-legacy-v4` and
 `experiment-queue-web-legacy-v4` compatibility entry points. Do not run a v4
 and v5 scheduler concurrently against the same GPU pool.
 
-David confirmed on 2026-08-27 that Flowers SPECFEM generation and synchronized
-evidence closeout are complete. He also waived a separate production-state
-dress rehearsal for this single-operator queue. That does not authorize a
-production migration by itself: cutover still requires an idle writer-free v4
-queue, a consistent offline copy, an operator-supplied external-path and card
-inventory, successful dry-run and real migration receipts, and David's explicit
-cutover authorization. See the exact
-[Flowers cutover and rollback checklist](docs/migrations/flowers-v4.md).
+David confirmed that Flowers SPECFEM generation and evidence closeout are
+complete, no legacy jobs are running, and the legacy scheduler and web service
+are stopped. The production deployment will start with a fresh schema-v5
+database; it will not import the legacy database. Follow the
+[project onboarding guide](docs/project-onboarding.md) and
+[operator guide](docs/operator-guide.md). The old
+[Flowers migration checklist](docs/migrations/flowers-v4.md) is retained only
+as an inactive reference for the importer capability.
 
 Live implementation state belongs in [`llm/status.md`](llm/status.md); the
 durable delivery and rollback model belongs in
@@ -50,12 +50,17 @@ dispatch.
 ## Explicit state and project selection
 
 Every stateful command requires an operator-selected absolute state directory.
-Pass it directly or set it in the service environment:
+Pass it directly or set it in the service environment. The command examples
+below assume the queue checkout's environment is active:
 
 ```bash
-export EXPERIMENT_QUEUE_STATE_DIR=/srv/experiment-queue/state
+source /home/sdm11/experiment-queue/.venv/bin/activate
+export EXPERIMENT_QUEUE_STATE_DIR=/home/sdm11/srv/experiment-queue/state
 experiment-queue project list
 ```
+
+Those two `/home/sdm11` paths are the current `mutton2` deployment layout;
+other hosts may use different absolute paths.
 
 There is no current-directory fallback for state. Outside the separate offline
 importer, only explicit first-project registration may create fresh schema-v5
@@ -65,9 +70,34 @@ Project from the current directory only when that canonical path is inside
 exactly one current registered checkout. Use `--project PROJECT-KEY` whenever
 there could be ambiguity.
 
-The [project onboarding guide](docs/project-onboarding.md) walks through a
-fresh repository, Enrollment, exact revision registration, validation, dry run,
-submission, and dispatch. Runnable portable examples cover
+## Simple trusted-project setup
+
+The queue is not a filesystem sandbox. A normal project does not declare
+dataset, output, or scratch directories and does not need a hand-authored
+Enrollment file. Initialize a minimal Project with `volumes: []`, keep the
+project's existing `.venv` ignored by Git, commit the Project/card files, and
+register it directly:
+
+```bash
+experiment-queue project init \
+  --key my-project --display-name "My Project" --output Project.yaml
+
+git add Project.yaml .gitignore experiments
+git commit -m "Add experiment queue configuration"
+
+experiment-queue project register "$PWD" \
+  --git-commit "$(git rev-parse HEAD)" \
+  --reason "initial registration" --actor "$USER"
+```
+
+With `volumes: []` and one declared environment, registration automatically
+binds `$PWD/.venv/bin`. A virtual-environment root, bin directory, or Python
+executable can be selected with `--environment-bin`. Explicit Enrollment,
+logical volumes, and artifact declarations remain available for projects that
+want those advanced provenance features.
+
+The [project onboarding guide](docs/project-onboarding.md) walks through exact
+revision registration, validation, submission, and dispatch. Runnable portable examples cover
 [ordinary](examples/ordinary), [Python training](examples/python-training),
 [data pipeline](examples/data-pipeline), and
 [cooperative preemption](examples/cooperative-preemption) projects. The
@@ -96,12 +126,13 @@ contracts, not legacy Markdown admission.
 
 Registering a scientific project authorizes committed code from admitted Git
 objects to execute as the queue service account. The queue is orchestration and
-provenance, not a sandbox. Keep project environments separate from the service,
-use a dedicated non-root account, keep state private, and read
+provenance, not a sandbox. The scientific environment may be the project's
+ordinary checkout-local `.venv`; keep only the queue service's own environment
+separate. Use a dedicated non-root account, keep state private, and read
 [`SECURITY.md`](SECURITY.md) before deployment.
 
-Project manifests contain logical names only. Host paths live in immutable
-Enrollment evidence, and child jobs receive authorized paths through
+Project manifests contain logical names only. Optional host paths live in immutable
+Enrollment evidence, and child jobs receive declared paths through
 `EXPERIMENT_QUEUE_MOUNT_<NAME>` and `EXPERIMENT_QUEUE_ARTIFACT_<NAME>`
 variables. Details are in the [operator guide](docs/operator-guide.md).
 

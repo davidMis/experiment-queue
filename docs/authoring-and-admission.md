@@ -75,6 +75,12 @@ volume. A cooperative-yield capability may use only protocol identities listed
 by the Project. `CUDA_VISIBLE_DEVICES` and all `EXPERIMENT_QUEUE_*` variables
 are service-owned and cannot be inherited through Project policy.
 
+Volumes and artifacts are optional. A trusted project may declare
+`volumes: []` and omit `job.artifacts`; this does not create a filesystem
+sandbox or prevent its process from using ordinary host paths. Declared volumes
+exist only for named path injection, observed artifact evidence, and typed
+checkpoint contracts.
+
 ExperimentCard/v1 deliberately has no template engine. Submission bindings
 replace only complete values of existing top-level `spec.parameters` keys.
 They never interpolate argv, wrapper, path, or shell text. `$binding` objects

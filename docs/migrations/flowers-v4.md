@@ -1,12 +1,18 @@
 # Flowers schema-v4 to schema-v5 cutover and rollback
 
+> **Inactive for the current Flowers deployment.** David selected a fresh
+> schema-v5 database on 2026-08-29 because no legacy jobs are running, the
+> legacy services are stopped, and the legacy database does not need to be
+> imported. Do not run this procedure for the fresh deployment. It remains as
+> the exact operator procedure only if legacy import is deliberately revived.
+
 This is the operator checklist for the one production migration from the
 deprecated Flowers queue. It does not authorize Codex or this repository to
 inspect or change the Flowers checkout, live state, or `mutton2`. All live
 paths, service names, card classifications, and external-path dispositions must
 come from David through an operator-supplied offline inventory.
 
-## Recorded decisions and remaining gates
+## Prerequisites if legacy import is revived
 
 David confirmed on 2026-08-27 that SPECFEM dataset generation and synchronized
 scientific evidence closeout are complete. That scientific gate is satisfied.

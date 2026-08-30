@@ -1,10 +1,13 @@
 # Example projects
 
-These four portable repositories demonstrate the complete Project/v1 and
-ExperimentCard/v1 surface without Flowers paths or scheduler plugins. Copy one
-directory into its own Git repository, create host-local Enrollment bindings,
-commit the files, then use `experiment-queue project register`, `project doctor`,
-and `submit --dry-run` before admission.
+These four portable repositories demonstrate the advanced Project/v1 and
+ExperimentCard/v1 surface without Flowers paths or scheduler plugins. They use
+logical mounts, observed artifacts, or cooperative preemption and therefore
+need explicit host-local Enrollment bindings.
+
+For an ordinary trusted project, start with `experiment-queue project init`
+instead. Its `volumes: []` scaffold registers automatically against the
+project's checkout-local `.venv` without an Enrollment file.
 
 - `ordinary`: one direct process and one required result artifact;
 - `python-training`: a training-shaped job with logical data and artifact mounts;

@@ -12,8 +12,17 @@ import subprocess
 import pytest
 
 from experiment_queue.authoring import Project
-from experiment_queue.cli_v5 import build_arg_parser, main
+from experiment_queue.cli_v5 import (
+    _automatic_environment_directory,
+    build_arg_parser,
+    main,
+)
 from experiment_queue.database_v5 import V5QueueStore
+from experiment_queue.operator_services import (
+    OperatorServiceError,
+    experiment_card_scaffold,
+    project_manifest_scaffold,
+)
 from experiment_queue.project_lifecycle import (
     Enrollment,
     EnvironmentBinding,
@@ -230,6 +239,347 @@ def test_register_authenticates_checkout_local_root_at_pinned_commit(
     assert main(fixture.register_arguments(commit=commit)) == 0
     output = _json_output(capsys)
     assert output["project"]["currentRevision"]["gitCommit"] == commit  # type: ignore[index]
+
+
+def test_register_automatically_uses_ignored_checkout_venv(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The trusted-project path needs no mount inventory or Enrollment file."""
+
+    state = (tmp_path / "state").resolve()
+    state.mkdir()
+    checkout = (tmp_path / "checkout").resolve()
+    checkout.mkdir()
+    _git(checkout, "init", "--quiet")
+    (checkout / "Project.yaml").write_bytes(
+        project_manifest_scaffold(
+            key="simple-project",
+            display_name="Simple Project",
+        )
+    )
+    (checkout / ".gitignore").write_text("/.venv/\n", encoding="utf-8")
+    environment = checkout / ".venv"
+    environment_bin = environment / "bin"
+    environment_bin.mkdir(parents=True)
+    (environment / "pyvenv.cfg").write_text("home = /python\n", encoding="utf-8")
+    python = environment_bin / "python3.14"
+    python.write_text("#!/bin/sh\n", encoding="utf-8")
+    python.chmod(0o755)
+    experiments = checkout / "experiments"
+    experiments.mkdir()
+    project = Project.from_yaml(
+        (checkout / "Project.yaml").read_bytes(),
+        source_name="Project.yaml",
+    )
+    (experiments / "SIMPLE-001.yaml").write_bytes(
+        experiment_card_scaffold(
+            project=project,
+            experiment_id="SIMPLE-001",
+            title="Simple trusted job",
+        )
+    )
+    _git(
+        checkout,
+        "add",
+        "--",
+        "Project.yaml",
+        ".gitignore",
+        "experiments/SIMPLE-001.yaml",
+    )
+    _git(
+        checkout,
+        "-c",
+        "user.name=CLI Tests",
+        "-c",
+        "user.email=cli@example.invalid",
+        "commit",
+        "--quiet",
+        "-m",
+        "simple trusted project",
+    )
+    commit = _git(checkout, "rev-parse", "HEAD")
+
+    assert main(
+        [
+            "--state-dir",
+            str(state),
+            "project",
+            "register",
+            str(checkout),
+            "--git-commit",
+            commit,
+            "--actor",
+            "cli:test",
+            "--reason",
+            "simple registration",
+            "--json",
+        ]
+    ) == 0
+    assert json.loads(capsys.readouterr().out)["project"]["key"] == "simple-project"
+
+    with V5QueueStore(state).connect() as connection:
+        enrollment = json.loads(
+            bytes(
+                connection.execute(
+                    "SELECT enrollment_json FROM project_revisions WHERE id = 1"
+                ).fetchone()[0]
+            )
+        )
+    assert enrollment["mounts"] == []
+    assert enrollment["artifactRoots"] == []
+    assert enrollment["environments"] == [
+        {
+            "apiVersion": "experiment-queue/v1",
+            "kind": "EnvironmentBinding",
+            "name": "python",
+            "executableSearchDirectories": [str(environment_bin)],
+            "inheritVariables": [],
+        }
+    ]
+    assert enrollment["gitIgnoredCheckoutDescendants"] == [str(environment)]
+
+    assert main(
+        [
+            "--state-dir",
+            str(state),
+            "submit",
+            "--project",
+            "simple-project",
+            "--card-path",
+            "experiments/SIMPLE-001.yaml",
+            "--job-id",
+            "run",
+            "--operator",
+            "cli:test",
+            "--json",
+        ]
+    ) == 0
+    assert json.loads(capsys.readouterr().out)["item"]["id"] == 1
+
+    (checkout / "Project.yaml").write_bytes(
+        project_manifest_scaffold(
+            key="simple-project",
+            display_name="Simple Project Revised",
+        )
+    )
+    _git(checkout, "add", "--", "Project.yaml")
+    _git(
+        checkout,
+        "-c",
+        "user.name=CLI Tests",
+        "-c",
+        "user.email=cli@example.invalid",
+        "commit",
+        "--quiet",
+        "-m",
+        "revise simple project",
+    )
+    second_commit = _git(checkout, "rev-parse", "HEAD")
+    assert main(
+        [
+            "--state-dir",
+            str(state),
+            "project",
+            "append-revision",
+            str(checkout),
+            "--project",
+            "simple-project",
+            "--git-commit",
+            second_commit,
+            "--actor",
+            "cli:test",
+            "--json",
+        ]
+    ) == 0
+    appended = json.loads(capsys.readouterr().out)
+    assert appended["project"]["currentRevision"]["sequence"] == 2
+
+
+def test_automatic_environment_accepts_venv_root_bin_or_python(
+    tmp_path: Path,
+) -> None:
+    """Common venv spellings normalize before a Python symlink is resolved."""
+
+    checkout = (tmp_path / "checkout").resolve()
+    environment = checkout / ".venv"
+    environment_bin = environment / "bin"
+    environment_bin.mkdir(parents=True)
+    (environment / "pyvenv.cfg").write_text("home = /python\n", encoding="utf-8")
+    external_python = tmp_path / "uv-python3.14"
+    external_python.write_text("#!/bin/sh\n", encoding="utf-8")
+    external_python.chmod(0o755)
+    python = environment_bin / "python3.14"
+    python.symlink_to(external_python)
+
+    for requested in (
+        environment,
+        environment_bin,
+        python,
+        Path(".venv"),
+        Path(".venv/bin"),
+        Path(".venv/bin/python3.14"),
+    ):
+        assert _automatic_environment_directory(
+            checkout=checkout,
+            requested=requested,
+        ) == environment_bin
+
+
+def test_automatic_environment_rejects_a_non_executable_file(
+    tmp_path: Path,
+) -> None:
+    """A random file is not silently interpreted as its parent PATH entry."""
+
+    checkout = (tmp_path / "checkout").resolve()
+    checkout.mkdir()
+    ordinary_file = checkout / "requirements.txt"
+    ordinary_file.write_text("pytest\n", encoding="utf-8")
+
+    with pytest.raises(OperatorServiceError, match="is not executable"):
+        _automatic_environment_directory(
+            checkout=checkout,
+            requested=ordinary_file,
+        )
+
+
+def test_enrollment_and_environment_bin_are_parse_time_exclusive(
+    tmp_path: Path,
+) -> None:
+    """Conflicting registration modes fail before a state path can be opened."""
+
+    state = tmp_path / "absent-state"
+    with pytest.raises(SystemExit) as captured:
+        main(
+            [
+                "--state-dir",
+                str(state),
+                "project",
+                "register",
+                str(tmp_path),
+                "--enrollment",
+                str(tmp_path / "Enrollment.json"),
+                "--environment-bin",
+                str(tmp_path / ".venv"),
+                "--git-commit",
+                "0" * 40,
+                "--actor",
+                "cli:test",
+                "--reason",
+                "invalid modes",
+            ]
+        )
+    assert captured.value.code == 2
+    assert not state.exists()
+
+
+def test_automatic_enrollment_rejects_even_optional_volume_declarations(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The simple path cannot admit a card whose optional artifact is unbound."""
+
+    state = (tmp_path / "state").resolve()
+    state.mkdir()
+    checkout = (tmp_path / "checkout").resolve()
+    checkout.mkdir()
+    _git(checkout, "init", "--quiet")
+    project_document = _project_document("cli-project", "CLI Project")
+    project_document["spec"]["volumes"][0]["required"] = False  # type: ignore[index]
+    (checkout / "Project.yaml").write_bytes(_source(project_document))
+    (checkout / ".gitignore").write_text("/.venv/\n", encoding="utf-8")
+    environment = checkout / ".venv"
+    (environment / "bin").mkdir(parents=True)
+    (environment / "pyvenv.cfg").write_text("home = /python\n", encoding="utf-8")
+    _git(checkout, "add", "--", "Project.yaml", ".gitignore")
+    _git(
+        checkout,
+        "-c",
+        "user.name=CLI Tests",
+        "-c",
+        "user.email=cli@example.invalid",
+        "commit",
+        "--quiet",
+        "-m",
+        "optional volume",
+    )
+    commit = _git(checkout, "rev-parse", "HEAD")
+
+    assert main(
+        [
+            "--state-dir",
+            str(state),
+            "project",
+            "register",
+            str(checkout),
+            "--git-commit",
+            commit,
+            "--actor",
+            "cli:test",
+            "--reason",
+            "invalid automatic enrollment",
+            "--json",
+        ]
+    ) == 2
+    error = json.loads(capsys.readouterr().err)
+    assert "requires Project volumes: []" in error["message"]
+
+
+def test_automatic_enrollment_proves_the_whole_checkout_venv(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Tracked venv metadata outside bin invalidates automatic enrollment."""
+
+    state = (tmp_path / "state").resolve()
+    state.mkdir()
+    checkout = (tmp_path / "checkout").resolve()
+    checkout.mkdir()
+    _git(checkout, "init", "--quiet")
+    (checkout / "Project.yaml").write_bytes(
+        project_manifest_scaffold(
+            key="tracked-venv",
+            display_name="Tracked Venv",
+        )
+    )
+    (checkout / ".gitignore").write_text("/.venv/\n", encoding="utf-8")
+    environment = checkout / ".venv"
+    (environment / "bin").mkdir(parents=True)
+    (environment / "pyvenv.cfg").write_text("home = /python\n", encoding="utf-8")
+    _git(checkout, "add", "--", "Project.yaml", ".gitignore")
+    _git(checkout, "add", "--force", "--", ".venv/pyvenv.cfg")
+    _git(
+        checkout,
+        "-c",
+        "user.name=CLI Tests",
+        "-c",
+        "user.email=cli@example.invalid",
+        "commit",
+        "--quiet",
+        "-m",
+        "track venv metadata",
+    )
+    commit = _git(checkout, "rev-parse", "HEAD")
+
+    assert main(
+        [
+            "--state-dir",
+            str(state),
+            "project",
+            "register",
+            str(checkout),
+            "--git-commit",
+            commit,
+            "--actor",
+            "cli:test",
+            "--reason",
+            "invalid tracked venv",
+            "--json",
+        ]
+    ) == 2
+    error = json.loads(capsys.readouterr().err)
+    assert "contains tracked content" in error["message"]
+    assert str(environment) in error["message"]
 
 
 def _json_output(capsys: pytest.CaptureFixture[str]) -> dict[str, object]:

@@ -7,9 +7,10 @@ Current state belongs in `../llm/status.md`; granular forward actions belong in
 
 ## Product Goal
 
-Provide one independently maintained, dependency-light service that can safely
-schedule reproducible jobs from multiple trusted scientific Git repositories on
-an unmanaged Linux/NVIDIA host. The service must preserve exact provenance,
+Provide one independently maintained, dependency-light service that can
+conveniently schedule jobs from multiple trusted scientific Git repositories on
+an unmanaged Linux/NVIDIA host. The service preserves useful Git/command
+provenance,
 manual cooperative preemption, recovery, operator control, and historical queue
 evidence without imposing Flowers-specific paths, cards, trackers, or scientific
 policies on other projects.
@@ -30,8 +31,10 @@ policies on other projects.
 5. Dispatch remains `priority DESC, resume_front DESC, id ASC`.
 6. Priority changes never trigger preemption. Preemption is a separate explicit
    operator action using a declared, admitted, versioned cooperative protocol.
-7. Project paths, mounts, artifacts, logs, and checkpoints are resolved and
-   authorized server-side for the admitted revision.
+7. Queue-owned state and any explicitly declared mounts, artifacts, logs, and
+   checkpoints are resolved server-side for the admitted revision. Trusted
+   project code otherwise retains the service account's ordinary filesystem
+   access; the queue is not a path sandbox.
 8. The queue owns orchestration and provenance. Projects own scientific code,
    domain checkpoints, experiment status, and result interpretation.
 9. Project registration grants code-execution authority to committed project
@@ -79,8 +82,11 @@ card roots, logical volume declarations, supported protocols, environment
 policy, and optional extension-schema reference. It contains no checkout path,
 absolute scratch path, sync destination, credential, or secret.
 
-Host enrollment maps logical declarations to canonical absolute paths and a
-project runtime environment. Queue-reserved variables and
+Host Enrollment always records the checkout and project runtime environment.
+The common single-environment form is derived automatically from the
+checkout-local `.venv`; optional logical-volume declarations map to canonical
+absolute paths only when the operator wants named injection or artifact
+observation. Queue-reserved variables and
 `CUDA_VISIBLE_DEVICES` cannot be overridden. Cards may refer only to declared
 environment names; literal secrets are rejected from core fields.
 EnvironmentBinding/v1 may only narrow the portable ambient-name allowlist and

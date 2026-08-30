@@ -2,16 +2,49 @@
 
 This guide operates the project-aware schema-v5 service. The deprecated v4
 rollback surface is named explicitly as `experiment-queue-legacy-v4`; never run
-it concurrently with the v5 scheduler on the same GPU pool. Production Flowers
-cutover uses the separate
-[`migrations/flowers-v4.md`](migrations/flowers-v4.md) checklist.
+it concurrently with the v5 scheduler on the same GPU pool. A fresh deployment
+starts here with first-Project registration. Use
+[`migrations/flowers-v4.md`](migrations/flowers-v4.md) only if an operator has
+separately chosen to import legacy state.
+
+## Running from the cloned checkout
+
+The service can run directly from the cloned repository. Update `main`, create
+the queue service's own environment inside that clone, install it editable, and
+activate it:
+
+```bash
+cd /home/sdm11/experiment-queue
+git switch main
+git pull --ff-only origin main
+python3.14 -m venv .venv
+.venv/bin/python -m pip install -e .
+source .venv/bin/activate
+```
+
+The editable install is required even when using the thin checkout wrappers:
+the durable executor starts the same interpreter in isolated mode and must be
+able to import the authenticated queue package without checkout-only
+`PYTHONPATH` behavior. The rest of this guide assumes that environment remains
+active. Equivalent checkout-wrapper smoke checks are:
+
+```bash
+.venv/bin/python scripts/run_experiment_queue.py --help
+.venv/bin/python scripts/run_experiment_queue_web.py --help
+```
+
+For the current Flowers deployment, the source checkout is
+`/home/sdm11/experiment-queue` and mutable service data is under
+`/home/sdm11/srv/experiment-queue`. In particular, do not place the state
+directory inside the cloned repository; checkout/state overlap is rejected
+during registration.
 
 ## State and identity
 
 Select one absolute state directory in the service environment:
 
 ```bash
-export EXPERIMENT_QUEUE_STATE_DIR=/srv/experiment-queue/state
+export EXPERIMENT_QUEUE_STATE_DIR=/home/sdm11/srv/experiment-queue/state
 experiment-queue project list
 ```
 
@@ -44,22 +77,33 @@ scripts.
 
 ## Project lifecycle
 
-Registration binds a committed Project/v1 manifest to one complete host-local
-Enrollment and a full Git commit:
+Registration binds a committed Project/v1 manifest to a full Git commit and
+freezes an Enrollment. In the normal trusted-project workflow, the CLI creates
+that Enrollment automatically with no mounts and the Project's single
+environment bound to its existing `.venv/bin`:
 
 ```bash
-experiment-queue project register /srv/projects/my-project \
+experiment-queue project register /home/sdm11/3D_Helmholtz \
   --manifest Project.yaml \
-  --enrollment /srv/experiment-queue/enrollments/my-project.json \
   --git-commit FULL_COMMIT_OBJECT_ID \
   --reason "initial host enrollment" \
-  --actor david
+  --actor "$USER"
 ```
 
-The resolver reads exact blobs from the commit tree and refuses mutable names,
-working-tree-only content, unsupported Git modes, or incomplete Enrollment.
-Use the [onboarding guide](project-onboarding.md) to create the portable files
-and Enrollment.
+This convenience path requires `volumes: []` and exactly one declared
+environment. It accepts the default checkout-local `.venv/bin`, a
+different venv root/bin directory, or a Python executable selected with
+`--environment-bin`. For a checkout-local environment, the CLI automatically
+authenticates its ordinary committed `.gitignore` rule.
+
+The resolver still reads exact blobs from the commit tree and refuses mutable
+Git names, working-tree-only Project/card content, and unsupported Git modes.
+Jobs retain the service account's ordinary filesystem access whether or not
+volumes are declared; the queue is not a sandbox.
+
+Advanced projects can pass `--enrollment FILE` to bind multiple environments,
+logical mounts, and queue-observed artifact roots explicitly. Use the
+[onboarding guide](project-onboarding.md) for both workflows.
 
 Useful read-only checks are:
 
@@ -75,10 +119,9 @@ pinned to their old revision.
 
 ```bash
 experiment-queue project append-revision --project my-project \
-  /srv/projects/my-project \
-  --enrollment /srv/experiment-queue/enrollments/my-project.json \
+  /home/sdm11/3D_Helmholtz \
   --git-commit FULL_NEW_COMMIT_OBJECT_ID \
-  --actor david
+  --actor "$USER"
 ```
 
 `--no-activate` appends a later revision without selecting it. Activation may
@@ -86,7 +129,7 @@ move only forward:
 
 ```bash
 experiment-queue project activate-revision --project my-project REVISION_ID \
-  --actor david
+  --actor "$USER"
 ```
 
 Lifecycle and runtime health are separate. Pause blocks only new dispatch for
@@ -96,11 +139,11 @@ explicitly with `repair`. Neither operation changes other Projects.
 
 ```bash
 experiment-queue project pause --project my-project \
-  --reason "maintenance" --actor david
+  --reason "maintenance" --actor "$USER"
 experiment-queue project repair --project my-project \
-  --reason "mount restored and verified" --actor david
+  --reason "mount restored and verified" --actor "$USER"
 experiment-queue project resume --project my-project \
-  --reason "maintenance complete" --actor david
+  --reason "maintenance complete" --actor "$USER"
 ```
 
 Archive is permanent in version 1. It requires a paused Project, no queued,
@@ -109,7 +152,7 @@ all database history and scientific artifacts.
 
 ```bash
 experiment-queue project archive --project my-project \
-  --reason "project retired" --actor david
+  --reason "project retired" --actor "$USER"
 ```
 
 ## Admission and queue inspection
@@ -148,11 +191,11 @@ Pending-item controls preserve history and never delete scientific artifacts:
 
 ```bash
 experiment-queue item hold ITEM_ID --project my-project \
-  --reason "awaiting input" --actor david
-experiment-queue item release ITEM_ID --project my-project --actor david
-experiment-queue item priority ITEM_ID 50 --project my-project --actor david
+  --reason "awaiting input" --actor "$USER"
+experiment-queue item release ITEM_ID --project my-project --actor "$USER"
+experiment-queue item priority ITEM_ID 50 --project my-project --actor "$USER"
 experiment-queue item remove ITEM_ID --project my-project \
-  --reason "superseded" --actor david
+  --reason "superseded" --actor "$USER"
 ```
 
 ## GPU and scheduler control
@@ -161,18 +204,18 @@ GPU allowlist identity is the full UUID resolved from live `nvidia-smi`
 telemetry:
 
 ```bash
-experiment-queue gpu add 0 --actor david
+experiment-queue gpu add 0 --actor "$USER"
 experiment-queue gpu show
-experiment-queue gpu drain GPU-UUID --actor david
-experiment-queue gpu undrain GPU-UUID --actor david
+experiment-queue gpu drain GPU-UUID --actor "$USER"
+experiment-queue gpu undrain GPU-UUID --actor "$USER"
 ```
 
 Enable/disable and drain/undrain affect only future dispatch; they never signal
 a running item. Host pause is likewise a dispatch gate:
 
 ```bash
-experiment-queue host pause --reason "host maintenance" --actor david
-experiment-queue host resume --actor david
+experiment-queue host pause --reason "host maintenance" --actor "$USER"
+experiment-queue host resume --actor "$USER"
 ```
 
 Run the scheduler in the foreground under the host service manager:
@@ -219,9 +262,9 @@ reconciliation expires it.
 
 ```bash
 experiment-queue reservation request GPU-UUID \
-  --duration-hours 4 --note "interactive analysis" --actor david
+  --duration-hours 4 --note "interactive analysis" --actor "$USER"
 experiment-queue reservation list --open-only
-experiment-queue reservation release RESERVATION_ID --actor david
+experiment-queue reservation release RESERVATION_ID --actor "$USER"
 ```
 
 Release is explicit for pending or active reservations. Completed reservation
@@ -235,7 +278,7 @@ declared CooperativeYield/v1 and whose Submission used
 
 ```bash
 experiment-queue item preempt ITEM_ID --project my-project \
-  --note "release one GPU for higher-priority work" --actor david
+  --note "release one GPU for higher-priority work" --actor "$USER"
 ```
 
 For a typed admission, the service commits the v1 request before publishing its
@@ -271,7 +314,7 @@ without a checkpoint-and-requeue promise.
 
 ```bash
 experiment-queue item terminate ITEM_ID --project my-project \
-  --reason "operator cancellation" --actor david
+  --reason "operator cancellation" --actor "$USER"
 ```
 
 The transaction persists intent first, then sends `SIGINT` to the authenticated
@@ -290,7 +333,7 @@ confirmation is deliberate:
 
 ```bash
 experiment-queue item force-kill ITEM_ID --project my-project \
-  --reason "runaway process" --actor david --confirm FORCE-KILL
+  --reason "runaway process" --actor "$USER" --confirm FORCE-KILL
 ```
 
 Requests and recovery are at-least-once for a persisted stage because no
@@ -318,7 +361,7 @@ obtains current GPU telemetry and requires that assigned UUID to be idle:
 ```bash
 experiment-queue item resolve-abandoned-launch ITEM_ID --project my-project \
   --gpu-uuid GPU-UUID --reason "verified executor group and GPU are idle" \
-  --actor david --confirm RESOLVE-ABANDONED-LAUNCH
+  --actor "$USER" --confirm RESOLVE-ABANDONED-LAUNCH
 ```
 
 The command refuses an active authenticated executor, any extant database- or
@@ -353,8 +396,8 @@ as separate explicit decisions:
 
 ```bash
 experiment-queue project repair --project my-project \
-  --reason "abandoned attempt reviewed" --actor david
-experiment-queue host resume --actor david
+  --reason "abandoned attempt reviewed" --actor "$USER"
+experiment-queue host resume --actor "$USER"
 ```
 
 ## Child environment and authorized paths

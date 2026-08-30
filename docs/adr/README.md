@@ -19,6 +19,7 @@ and compatibility evidence are indexed separately in the
 | [0009](0009-project-lifecycle-enrollment-and-revision-ownership.md) | Accepted, 2026-08-28 | Registered Project lifecycle, frozen Enrollment, immutable revisions, paths, environments, and dependency scope |
 | [0010](0010-database-v5-and-offline-import-boundary.md) | Accepted, 2026-08-28 | Separate schema-v5 store, exact legacy preservation, copy-only importer, and migration receipt |
 | [0011](0011-durable-runtime-gpu-lease-and-telemetry-release.md) | Accepted, 2026-08-28 | Historical GPU assignment, durable runtime lease, telemetry-gated release, and crash recovery |
+| [0012](0012-trusted-project-convenience-registration.md) | Accepted, 2026-08-29 | Optional volumes/artifacts, inferred checkout-local environments, and no-file trusted-project enrollment |
 
 New records use the next four-digit number. Their title, status, and supersedes
 relationship must be added here when the record is accepted.
