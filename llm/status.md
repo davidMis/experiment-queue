@@ -11,10 +11,10 @@ evidence.
 
 ## Current Phase
 
-The locally verified `0.2.1` candidate simplifies fresh deployment for trusted
-scientific projects. The implementation and documentation are not yet
-published. Published tag `v0.2.0` predates this convenience workflow and must
-not be used for the `mutton2` startup.
+Release `v0.2.1` is published from Linux-CI-passing commit
+`2eb6028be4e2bd2851d14beccf5c086718615432`. It contains the simplified
+trusted-project workflow selected for the fresh `mutton2` startup. Published
+tag `v0.2.0` predates that workflow and must not be used for this deployment.
 
 David confirmed that no legacy queue jobs are running, the legacy scheduler and
 web service are stopped, and the legacy database does not need to be imported.
@@ -57,8 +57,12 @@ rehearsal is part of this deployment.
 
 ## Verification State
 
-- Published `v0.2.0` remains verified historical release evidence; it is not
-  the selected deployment revision.
+- Remote annotated tag `v0.2.1` resolves through tag object
+  `071cd8adad5157a89b5332c1fcb8292f14fc776b` to release commit
+  `2eb6028be4e2bd2851d14beccf5c086718615432`.
+- GitHub Actions run `33317278646` completed successfully on Linux/Python 3.14:
+  clean installation, the complete suite, wheel build/verification, and all
+  installed command-help checks passed.
 - The simplified code has focused CLI/operator coverage, including automatic
   registration, submission, revision append, whole-venv Git-ignore proof,
   uv-style symlinked Python normalization, parse-time option exclusivity, and
@@ -71,8 +75,9 @@ rehearsal is part of this deployment.
   This is verification evidence; the deployment remains an editable clone.
 - Python compilation, `git diff --check`, and all `80` local Markdown targets
   pass. The six wiki drafts have no unresolved wiki links.
-- The GitHub repository is public and its wiki feature is enabled but has not
-  yet been initialized. Six concise wiki pages are drafted locally.
+- The GitHub repository and simplified source are public. Its wiki feature is
+  enabled but has not yet been initialized. Six concise pages are drafted; the
+  available browser is waiting for David to complete GitHub sign-in.
 
 ## Active Risks
 
@@ -93,9 +98,9 @@ rehearsal is part of this deployment.
 
 ## Blocking And Next Authorized Actions
 
-1. With David's action-time confirmation, publish the reviewed code/release and
-   the drafted public GitHub wiki pages.
-2. Update the `mutton2` clone from the published revision, create the
+1. After David completes GitHub sign-in in the opened browser panel, initialize
+   and publish the six approved wiki pages.
+2. Update the `mutton2` clone to `v0.2.1`, create the
    queue clone's editable `.venv`, and prepare a minimal committed Flowers
    Project/card plus its existing project-local `.venv`.
 3. Register into fresh state under `/home/sdm11/srv/experiment-queue`, run

@@ -489,3 +489,32 @@ Open:
   successful Linux CI, and publish the public wiki pages.
 - Tomorrow, update the `mutton2` source clone and perform the documented fresh
   registration and one-job smoke run without an Enrollment file or importer.
+
+## 2026-08-30 - Publish Release 0.2.1
+
+Goal: publish the simplified implementation only after its exact public commit
+passes Linux CI, then publish the approved public wiki.
+
+Result:
+
+- Published implementation commit
+  `55b4aa07a0d59ce27d7ae3110ae4ab3d7db0afbc` to `main`.
+- Before tagging, reconciled the package SPDX expression and wheel verifier
+  with the authoritative BSD-2-Clause `LICENSE`, then published corrective
+  commit `2eb6028be4e2bd2851d14beccf5c086718615432`.
+- GitHub Actions run `33317278646` passed on Linux/Python 3.14, including clean
+  installation, the full suite, wheel construction/verification, and installed
+  command-help checks.
+- Published annotated tag `v0.2.1`; remote tag object
+  `071cd8adad5157a89b5332c1fcb8292f14fc776b` dereferences to the exact passing
+  corrective commit.
+- The final local wheel verifier passes with SHA-256
+  `8b613662895b2bee5e87b4c16bd02d9eef25513d9da8bdbb8ccdf281babd89f1`.
+
+Open:
+
+- GitHub has not initialized the wiki repository because the available browser
+  session is signed out. The sign-in page is open for David; after sign-in,
+  publish and verify the six approved pages.
+- Update the `mutton2` clone to `v0.2.1` and perform the fresh registration and
+  one-job smoke run without an Enrollment file or importer.

@@ -5,14 +5,13 @@ This file contains forward-looking work only. Current state and risks live in
 
 Each item has a stable ID, owner, dependencies, and completion criterion.
 
-## Simplified Trusted-Project Release
+## Public Wiki
 
-- [ ] **EQ-SIMPLIFY-001 — Codex with David's publication confirmation:**
-  publish release `0.2.1`, require successful Linux CI, and publish the drafted
-  public wiki. Depends on the completed local implementation, documentation,
-  and verification. Complete when the public source/release contains the
-  automatic `volumes: []` plus project-local `.venv` workflow, CI passes, and
-  the wiki pages are visible.
+- [ ] **EQ-WIKI-001 — Codex after David signs in to GitHub:** initialize the
+  public repository wiki and publish the six reviewed pages. Depends on the
+  published `v0.2.1` behavior now documented by those pages. Complete when the
+  wiki home, installation, project setup, daily operations, troubleshooting,
+  and sidebar pages are publicly visible.
 
 ## Fresh Flowers Startup
 
@@ -20,8 +19,9 @@ Each item has a stable ID, owner, dependencies, and completion criterion.
   `/home/sdm11/experiment-queue` to the published simplified revision, create
   its repository-local Python 3.14 `.venv`, install the clone editable, and
   prepare a minimal committed Flowers Project/v1 and ExperimentCard/v1 with
-  `volumes: []`. Depends on `EQ-SIMPLIFY-001`. Complete when validation passes
-  and `/home/sdm11/3D_Helmholtz/.venv` exists under a committed ignore rule.
+  `volumes: []`. Depends on published release `v0.2.1`. Complete when
+  validation passes and `/home/sdm11/3D_Helmholtz/.venv` exists under a
+  committed ignore rule.
 - [ ] **EQ-DEPLOY-002 — David with Codex instructions:** register the exact
   Flowers commit into fresh state under `/home/sdm11/srv/experiment-queue`, run
   `project doctor`, add the intended GPU, and initialize web credentials.
