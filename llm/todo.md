@@ -8,11 +8,12 @@ Each item has a stable ID, owner, dependencies, and completion criterion.
 
 ## Release Candidate Verification And Publication
 
-- [ ] **EQ-RELEASE-003 — David with Codex support:** create the approved release
-  commit/tag and retain its wheel digest and changelog. Depends on the pushed
-  corrective commit and successful Linux CI recorded in `llm/status.md` and
-  `llm/log.md`. Complete when the cutover checklist names an immutable,
-  remotely verified release artifact rather than an untagged checkout.
+- [ ] **EQ-RELEASE-003 — David with Codex support:** publish and verify tag
+  `v0.2.0` from the approved release commit, then retain its exact tag-built
+  wheel digest and changelog. Depends on the pushed corrective commit and
+  successful Linux CI recorded in `llm/status.md` and `llm/log.md`. Complete
+  when the cutover checklist names an immutable, remotely verified release
+  artifact rather than an untagged checkout.
 
 ## Flowers Offline Inventory And Cutover
 

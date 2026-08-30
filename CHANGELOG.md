@@ -6,7 +6,7 @@ Release, compatibility, deprecation, and support rules are defined in
 
 ## Unreleased
 
-## 0.2.0 - 2026-08-28
+## 0.2.0 - 2026-08-29
 
 ### Added
 

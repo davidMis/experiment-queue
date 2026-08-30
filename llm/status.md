@@ -23,8 +23,10 @@ surfaces.
 
 No production migration has occurred. The readiness candidate and its
 test-harness portability correction are committed and pushed, and the complete
-Linux CI workflow passes. An approved release commit/tag plus the remaining
-operator-supplied offline cutover evidence are still required. The cutover
+Linux CI workflow passes. The approved release identity is `v0.2.0`; release
+publication remains incomplete until that tag identifies the reviewed release
+commit and the exact tag-built wheel digest is retained. The remaining
+operator-supplied offline cutover evidence is also still required. The cutover
 procedure is copy-only and receipt-driven; startup never upgrades a database
 in place.
 
@@ -127,8 +129,8 @@ in place.
 
 ## Open Publication And Operator Gates
 
-- Create the approved release commit/tag and retain its immutable wheel digest
-  and changelog evidence.
+- Publish and verify tag `v0.2.0` from the reviewed release commit, then retain
+  the exact tag-built wheel digest and changelog evidence.
 - Obtain an operator-supplied offline Flowers database/card/external-path
   inventory. Do not infer live classification from this repository.
 - At cutover, prove the legacy queue is idle, stop and disable every legacy
@@ -140,8 +142,9 @@ in place.
 
 ## Active Risks
 
-- The readiness candidate is published and Linux CI passes, but no approved
-  release commit/tag or published immutable release artifact exists yet.
+- The readiness candidate is published and Linux CI passes, but release
+  publication remains incomplete until tag `v0.2.0` and its exact immutable
+  wheel artifact are both retained.
 - Scheduler-owned GPU flocks are not continuous across a scheduler crash while
   a durable executor survives. Restart reconciliation fails closed if it cannot
   reacquire the lock, but cross-version exclusion still relies on stopping and
@@ -158,8 +161,8 @@ in place.
 
 ## Next Authorized Actions
 
-1. Create the approved release commit/tag and retain the release wheel digest
-   and changelog evidence.
+1. Publish and verify tag `v0.2.0` from the reviewed release commit, then retain
+   the release wheel digest and changelog evidence.
 2. Collect the operator-supplied offline inventory and writer-free source copy,
    then execute the exact dry-run/build/verify checklist in
    `docs/migrations/flowers-v4.md`.

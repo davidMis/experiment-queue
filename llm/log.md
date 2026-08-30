@@ -349,3 +349,24 @@ Open:
   and changelog evidence.
 - Obtain the operator-supplied Flowers inventory and writer-free source copy
   before running the exact offline migration procedure.
+
+## 2026-08-29 - Prepare Release 0.2.0
+
+Goal: create the clean reviewed release commit that will own tag `v0.2.0`
+after its own Linux CI run succeeds.
+
+Result:
+
+- Updated the `0.2.0` changelog date to the actual release date, 2026-08-29.
+- Recorded the successful corrective Linux CI gate and selected immutable
+  release identity `v0.2.0`.
+- Kept `EQ-RELEASE-003` open through exact tag verification and retention of
+  the tag-built wheel digest; a tag alone does not authorize production
+  migration or scheduler activation.
+
+Open:
+
+- Push this release commit, require its Linux CI run to pass, then publish and
+  verify annotated tag `v0.2.0`.
+- Build and retain the exact tag wheel before beginning the writer-free
+  production-copy gate.
