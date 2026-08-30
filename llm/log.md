@@ -327,3 +327,25 @@ Open:
   CI rerun before creating the release tag.
 - The operator-controlled inventory, writer-free copy, receipt review, and
   explicit production cutover authorization remain unchanged.
+
+## 2026-08-29 - Confirm Corrective Linux CI
+
+Goal: verify the pushed correction remotely and advance the release gate only
+after every Linux CI step completed successfully.
+
+Result and verification:
+
+- Local `main` and `origin/main` both name corrective commit
+  `1a3765f30f59f61a2b17919df9bbb140d8b1368f`.
+- GitHub Actions run `33262155259` completed successfully on Ubuntu 24.04 with
+  Python 3.14. Checkout, dependency installation, the complete suite, wheel
+  construction/verification, and all six installed command-help checks passed.
+- Removed completed `EQ-RELEASE-002` from the forward TODO. No queue source,
+  protocol, migration procedure, Flowers state, or `mutton2` state changed.
+
+Open:
+
+- Create the approved release commit/tag and retain its immutable wheel digest
+  and changelog evidence.
+- Obtain the operator-supplied Flowers inventory and writer-free source copy
+  before running the exact offline migration procedure.

@@ -21,12 +21,12 @@ implemented locally. Schema v5 is the primary standalone entrypoint;
 schema-v4 and `LegacyMarkdownCard/v0` are explicitly bounded compatibility
 surfaces.
 
-No production migration has occurred. The readiness candidate is committed and
-pushed, but its first Linux CI run exposed test-harness portability assumptions.
-The corrective test-only patch is locally verified and remains uncommitted;
-a clean rerun plus the remaining operator-supplied offline cutover evidence are
-still required. The cutover procedure is copy-only and receipt-driven; startup
-never upgrades a database in place.
+No production migration has occurred. The readiness candidate and its
+test-harness portability correction are committed and pushed, and the complete
+Linux CI workflow passes. An approved release commit/tag plus the remaining
+operator-supplied offline cutover evidence are still required. The cutover
+procedure is copy-only and receipt-driven; startup never upgrades a database
+in place.
 
 ## Verified Local Evidence
 
@@ -60,13 +60,13 @@ never upgrades a database in place.
   were inventory-counted but not availability-checked); all `197` argparse
   options have actionable help; Python compilation and `git diff --check` pass.
 - `origin` is `https://github.com/davidMis/experiment-queue.git`; local `main`
-  and `origin/main` both resolve to pushed readiness commit
-  `ad6e2d5c1edb757f2e8d5ef83818868b1c85e095`.
-- GitHub Actions run `33255737427` used Ubuntu 24.04 and Python 3.14.7. It
-  failed `12` tests: `10` direct
-  executor tests did not model the production `start_new_session=True`
-  process-group boundary, and `2` deep-JSON assertions overfit Python 3.14.4
-  parser behavior. No production source change was required.
+  and `origin/main` both resolve to corrective commit
+  `1a3765f30f59f61a2b17919df9bbb140d8b1368f`.
+- GitHub Actions run `33262155259` completed successfully on Ubuntu 24.04 and
+  Python 3.14: checkout, dependency installation, the complete suite, wheel
+  construction/verification, and all six installed command-help checks passed.
+  It supersedes failed run `33255737427`; that failure was confined to portable
+  test-harness expectations and required no production source change.
 
 ## Accepted Product And Safety Decisions
 
@@ -122,11 +122,13 @@ never upgrades a database in place.
 - The publication remote is configured.
 - Authoritative local tests, wheel construction/verification, documentation
   and CLI audits, and independent adversarial review are complete.
+- The corrective candidate is pushed and the complete Linux Python 3.14 CI
+  workflow passes.
 
 ## Open Publication And Operator Gates
 
-- Commit and push the locally verified CI portability correction, obtain a
-  clean remote Linux run, then create the approved release commit/tag.
+- Create the approved release commit/tag and retain its immutable wheel digest
+  and changelog evidence.
 - Obtain an operator-supplied offline Flowers database/card/external-path
   inventory. Do not infer live classification from this repository.
 - At cutover, prove the legacy queue is idle, stop and disable every legacy
@@ -138,10 +140,8 @@ never upgrades a database in place.
 
 ## Active Risks
 
-- The readiness candidate is published, but its first Linux CI run failed and
-  the locally verified correction is uncommitted. Local evidence is not a
-  substitute for a clean remote rerun or a published, immutable release
-  artifact.
+- The readiness candidate is published and Linux CI passes, but no approved
+  release commit/tag or published immutable release artifact exists yet.
 - Scheduler-owned GPU flocks are not continuous across a scheduler crash while
   a durable executor survives. Restart reconciliation fails closed if it cannot
   reacquire the lock, but cross-version exclusion still relies on stopping and
@@ -158,8 +158,8 @@ never upgrades a database in place.
 
 ## Next Authorized Actions
 
-1. Commit/push the CI portability correction, obtain a clean Linux CI rerun,
-   and create the approved release commit/tag.
+1. Create the approved release commit/tag and retain the release wheel digest
+   and changelog evidence.
 2. Collect the operator-supplied offline inventory and writer-free source copy,
    then execute the exact dry-run/build/verify checklist in
    `docs/migrations/flowers-v4.md`.

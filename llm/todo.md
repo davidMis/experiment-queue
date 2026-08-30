@@ -8,17 +8,11 @@ Each item has a stable ID, owner, dependencies, and completion criterion.
 
 ## Release Candidate Verification And Publication
 
-- [ ] **EQ-RELEASE-002 — David with Codex support:** commit and push the
-  locally verified Linux CI portability correction, then rerun the published
-  Python 3.14 workflow. Depends on the completed local readiness verification
-  and failed-run analysis recorded in `llm/status.md` and `llm/log.md`.
-  Complete when the remote branch names the corrective commit and clean
-  install, tests, packaging, and CLI smoke pass remotely without GPUs or
-  operator state.
 - [ ] **EQ-RELEASE-003 — David with Codex support:** create the approved release
-  commit/tag and retain its wheel digest and changelog. Depends on
-  `EQ-RELEASE-002`. Complete when the cutover checklist names an immutable,
-  remotely verified release artifact rather than an uncommitted checkout.
+  commit/tag and retain its wheel digest and changelog. Depends on the pushed
+  corrective commit and successful Linux CI recorded in `llm/status.md` and
+  `llm/log.md`. Complete when the cutover checklist names an immutable,
+  remotely verified release artifact rather than an untagged checkout.
 
 ## Flowers Offline Inventory And Cutover
 
