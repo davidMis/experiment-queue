@@ -165,9 +165,9 @@ if len(wheel_distributions) != 1:
     )
 wheel_version = wheel_distributions[0].version
 metadata = wheel_distributions[0].metadata
-if metadata.get("License-Expression") != "MIT":
+if metadata.get("License-Expression") != "BSD-2-Clause":
     raise SystemExit(
-        "wheel metadata must declare the exact SPDX License-Expression MIT"
+        "wheel metadata must declare the exact SPDX License-Expression BSD-2-Clause"
     )
 if metadata.get_all("License-File") != ["LICENSE"]:
     raise SystemExit(

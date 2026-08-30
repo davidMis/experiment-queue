@@ -459,6 +459,8 @@ Result:
 - Added accepted ADR 0012 and revised the README, security boundary, architecture,
   implementation plan, onboarding, operator guidance, examples, changelog, and
   current records. Package version is prepared as `0.2.1`.
+- Corrected the package SPDX expression and wheel verifier from MIT to
+  BSD-2-Clause so they match the repository's authoritative `LICENSE` file.
 - Drafted six concise public wiki pages for installation, adding a project,
   daily operations, troubleshooting, navigation, and the wiki home. Publication
   remains pending action-time confirmation and a public code revision that
@@ -477,7 +479,7 @@ Verification:
   `182.82 s`.
 - `experiment_queue-0.2.1-py3-none-any.whl` passes the complete verifier;
   SHA-256 is
-  `92ab165b3b45f29ee0f1a948a43e48baba0d5d6dc0083651a38f8309d6f8f658`.
+  `8b613662895b2bee5e87b4c16bd02d9eef25513d9da8bdbb8ccdf281babd89f1`.
 - Python compilation, `git diff --check`, all `80` local Markdown targets, and
   all links among the six wiki drafts pass.
 

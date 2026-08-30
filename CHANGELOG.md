@@ -22,6 +22,11 @@ Release, compatibility, deprecation, and support rules are defined in
   database does not need to be imported. The legacy import checklist remains
   available but is not part of the active deployment.
 
+### Fixed
+
+- Package metadata now declares BSD-2-Clause, matching the repository's
+  authoritative `LICENSE` file.
+
 ## 0.2.0 - 2026-08-29
 
 ### Added

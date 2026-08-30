@@ -8,7 +8,7 @@ version = "0.2.1"
 description = "A durable, operator-controlled queue for scientific GPU experiments."
 readme = "README.md"
 requires-python = ">=3.14"
-license = "MIT"
+license = "BSD-2-Clause"
 license-files = ["LICENSE"]
 dependencies = [
   "jsonschema>=4.26.0,<5",

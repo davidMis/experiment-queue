@@ -67,7 +67,7 @@ rehearsal is part of this deployment.
 - The complete Python 3.14.4 suite passes: `1011 passed, 1 skipped, 32 subtests
   passed` in `182.82 s`.
 - The candidate wheel passes the complete verifier and has SHA-256
-  `92ab165b3b45f29ee0f1a948a43e48baba0d5d6dc0083651a38f8309d6f8f658`.
+  `8b613662895b2bee5e87b4c16bd02d9eef25513d9da8bdbb8ccdf281babd89f1`.
   This is verification evidence; the deployment remains an editable clone.
 - Python compilation, `git diff --check`, and all `80` local Markdown targets
   pass. The six wiki drafts have no unresolved wiki links.
